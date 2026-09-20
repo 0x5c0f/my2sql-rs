@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 7 已完成**（DECIMAL 解码 decimal.rs；`cargo test` 76+3/79 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 8 已完成**（JSON 二进制→紧凑文本 json.rs；`cargo test` 93+3/96 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -221,6 +221,59 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   (65,30) 探针插入字面量小数 28 位→存储尾组 "…900" 形态保留于 fixture
   （验证的是编码往返，非任意值全覆盖）；T15 差分若启用 useDecimal=false
   路径，本实现即 go-mysql 字符串分支输出。
+
+### Task 8: JSON 二进制 → 紧凑文本（json_binary_to_text）
+
+- 做了什么：新增 `src/binlog/json.rs`——`json_binary_to_text(&[u8]) ->
+  Result<String, BinlogError>`（无空格紧凑 JSON 文本，手工渲染、零新依赖，
+  serde_json 未引入）。结构/算式逐字镜像 go-mysql
+  `replication/json_binary.go`（decodeJsonBinary/decodeValue/
+  decodeObjectOrArray/isInlineValue/decodeLiteral/decodeInt*/decodeOpaque/
+  decodeDecimal/decodeTime/decodeDateTime/decodeVariableLength），
+  容器解析用**显式栈 Frame 迭代**（非递归）。TDD：先写 17 个失败测试
+  （RED：17 failed, todo!()），实现后 93+3 全绿。类型字节全覆盖：
+  0x00/0x01 小/大对象、0x02/0x03 小/大数组、0x04 字面量(null/true/false)、
+  0x05-0x0a 五档整型、0x0b double、0x0c 字符串、0x0f opaque
+  （NEWDECIMAL→复用 T7 `decode_decimal`；DATE/TIME/DATETIME/TIMESTAMP→
+  8B LE i64 位域解码；其余按严格 UTF-8 字符串）。
+- 真机回验：docker mysql:8.0.46(t7cap)+5.7.44(t7cap57) ROW binlog 抓包
+  j_probe/d_probe/t_probe 共 60+ 条 JSON 列原文（对象/数组/转义/UTF-8/整型
+  边界/大对象 100KB/全部 opaque 类型/时间零值/28+6 组 double 位↔文本对），
+  12 行公共样本两版本**逐字节一致**；double 渲染规则另以独立 Python 镜像
+  对全部 bit↔text 对核验后才作 fixture。
+- 简报偏差（权威=go-mysql+真机，均已按权威实现并实证）：
+  1. 偏移/计数宽度非 u8/u16 二态，而是随类型字节 small=u16/large=u32；
+     **KEY 长度恒 u16**（go:184，id13 100KB 大对象实抓证实）。
+  2. 键序：简报称保持原文插入序——实为服务器按 **(字节长度, memcmp)** 重排，
+     `{"b":1,"aa":"x"}` 真机输出 b 在前（现实优先，见 fixture id4）。
+  3. double：简报称 12→"12"——真机恒带 `.0`（"12.0"）；科学计数当且仅当
+     定位点 pp>15 或 pp<-14，格式 `d[.ddd]e{n}`（无 +、无零填充）；
+     NaN/±Inf MySQL 不落盘，本实现报 InvalidData。
+  4. opaque 布局简报未提长度字节：实为 `[内部类型1B][varint长][payload]`
+     （id14/15/16 顶层 opaque 解码核实）。
+  5. 嵌套容器子值在值偏移处**不含类型字节**（类型在值表项中，go:225）。
+- 加固偏差（相对 go-mysql，均为 brief 硬性要求）：① 显式栈+深度上限
+  `MAX_DEPTH=100`（超限 InvalidData，go 无上限递归）；② 全量边界校验，
+  任何截断/畸形输入 → TooShort/InvalidData，**无 panic 路径**（go 的
+  decodeDecimal 无守卫取下标、varint 截断等已封堵；size>data_len、
+  header>size、key_offset<header_size、key 区越界均显式拒绝）；③ 严格
+  UTF-8：键与字符串非法字节 → InvalidData（go 用 hack.String lossy）；
+  ④ 空输入 → `Ok("")`（与 go decodeJsonBinary:76 一致，brief 未提，
+  从权威）。
+- 与 MySQL 渲染语义的已核实细节：转义仅 `"` `\` 与 <0x20（\b\f\n\r\t，
+  其余 `\u00xx` 小写 hex）；DEL/<>&/UTF-8 原样输出（id7 实抓）；TIME v==0
+  → "00:00:00.000000"、DATETIME 零值 → "0000-00-00 00:00:00.000000"、
+  DATE 恒只渲染日期段（含零值 "0000-00-00"）——go-mysql 这三处输出
+  "00:00:00"/"0000-00-00 00:00:00"/完整 datetime 串，**均与真机不符**，
+  本实现从真机（T15 差分白名单素材）。
+- 服务器怪癖备案（非本层缺陷）：文本 999999999999999.9 入库即 1e15 位型；
+  TIME 838:59:59 经 JSON 往返显示 630:59:59、532:10:20→404:10:20；
+  `CAST(x AS TIMESTAMP)` 非法（JSON 内时间戳只能经列隐式转）。
+- 关键接口（Task 9/10 消费）：`json_binary_to_text` 收 JSON 列的 binlog
+  原字节（即 T9 分发到 Json 变体的 Vec<u8> 全量），输出即最终 SQL 文本。
+- 遗留：json.rs 顶部 `#![allow(dead_code)]`（T9 消费后移除）；深度 100
+  上限、严格 UTF-8、非有限 double 报错是对 go-mysql 的行为差异，
+  T15 差分需列入白名单。
 
 ## 环境事实
 
