@@ -1,7 +1,8 @@
 //! EventHeader（公共 19 字节头）解码 + crc32 checksum 剥离/校验。
 //!
 //! 行为对照 go-mysql-org/go-mysql replication/event.go 的 `EventHeader.Decode`
-//! （commonHeader 19 字节，全小端；且要求 `event_size >= 19`）。
+//! （commonHeader 19 字节，全小端；body 长度非空 → 要求 `event_size > 19`，
+//! 对齐上游 my2sql-go base/file.go:162 对 `<=19` 的 fatal 判定，T14 Step-0）。
 
 // 骨架阶段本模块尚未接入 main 管道（Task 12+ 消费），参照 Task 1 对 config 的处理。
 #![allow(dead_code)]
@@ -71,10 +72,11 @@ pub fn parse_header(buf: &[u8]) -> Result<EventHeader, BinlogError> {
         log_pos: le32(13),
         flags: u16::from_le_bytes(buf[17..19].try_into().unwrap()),
     };
-    // 对照 go-mysql：event_size 小于头长度视为坏数据，防止下游按错误长度切片。
-    if header.event_size < EVENT_HEADER_SIZE as u32 {
+    // 对照上游 base/file.go:162（`event_size <= 19` fatal，T14 Step-0 勘误——
+    // 原 `>= 19` 口径会放进零 body 损坏件）：必须严格大于公共头长度。
+    if header.event_size <= EVENT_HEADER_SIZE as u32 {
         return Err(BinlogError::InvalidData(format!(
-            "event_size {} < header size {EVENT_HEADER_SIZE}",
+            "event_size {} must be greater than header size {EVENT_HEADER_SIZE}",
             header.event_size
         )));
     }
@@ -89,10 +91,13 @@ pub fn strip_checksum(payload: &mut Vec<u8>, with_crc: bool) {
     }
 }
 
-/// **FDE 校验和特例**（T12 Step-0 账载项，MySQL 规范行为）：
-/// `Format_description_log_event` 的 CRC32 覆盖 `[0, size-4)` 时，公共头的
-/// **flags 字段（字节 17..19）按全零参与计算**——mysqld 在写 FDE 时先算校验、
-/// 后置 `LOG_EVENT_BINLOG_IN_USE_F`，磁盘上的 flags 含该位。真机验证：
+/// **FDE 校验和特例**（T12 Step-0 账载项 + T14 Step-0 精修，MySQL 规范行为）：
+/// `Format_description_log_event` 的 CRC32 覆盖 `[0, size-4)` 时，公共头 flags
+/// 中**仅 `LOG_EVENT_BINLOG_IN_USE_F`（bit 0）按零参与计算**
+/// （mysqld log_event.cc:1324-1338 在写 FDE 时先算校验、后置该位；其余 flags
+/// 位照常入校验——T14 前旧口径整 2 字节清零，对带其他位的 FDE 必假阴，
+/// 真机件 flags 恰为 0x01 故从未暴露，规范以 [`LOG_EVENT_BINLOG_IN_USE_F`] 为准），
+/// 真机验证：
 /// 本仓库全部 4 个 8.0.46 fixture 的 FDE（flags=0x01、log_pos=126 非零参与
 /// 计算）按本规则逐字节吻合；普通 [`crc32_ok`] 口径对其必失败
 /// （rows.rs `walk_events` 当年被迫 `type != 15` 绕行，本函数补上正解）。
@@ -101,13 +106,16 @@ pub fn strip_checksum(payload: &mut Vec<u8>, with_crc: bool) {
 /// 特例口径按 MySQL 写盘实现实证钉死（bytes 13..17 的 log_pos 参与计算由
 /// fixture log_pos=0x7E 非零事实锁定，不是整头清零）。
 pub fn fde_checksum_ok(ev: &[u8]) -> bool {
+    /// `LOG_EVENT_BINLOG_IN_USE_F`（log_event.h，值 1；小端下落在 flags 低字节）。
+    const LOG_EVENT_BINLOG_IN_USE_F: u8 = 0x01;
     if ev.len() < EVENT_HEADER_SIZE + 4 {
         return false;
     }
     let split = ev.len() - 4;
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&ev[..17]);
-    hasher.update(&[0u8; 2]); // flags 置零（规范特例）
+    // 仅掩 IN_USE 位（T14 Step-0 精修；旧口径整 flags 字段清零）
+    hasher.update(&[ev[17] & !LOG_EVENT_BINLOG_IN_USE_F, ev[18]]);
     hasher.update(&ev[EVENT_HEADER_SIZE..split]);
     hasher.finalize() == u32::from_le_bytes(ev[split..].try_into().unwrap())
 }
@@ -161,9 +169,56 @@ mod tests {
     #[test]
     fn event_size_smaller_than_header_is_invalid() {
         // 对照 go-mysql：event_size 必须 >= 19，否则视为坏数据。
-        let mut b = known_header_bytes();
+        let mut b = known_header_bytes(); // 对照 go-mysql：event_size 必须 > 19（见下）。
         b[9..13].copy_from_slice(&18u32.to_le_bytes()); // event_size = 18
         assert!(matches!(parse_header(&b), Err(BinlogError::InvalidData(_))));
+    }
+
+    #[test]
+    fn event_size_equal_header_size_is_rejected_too() {
+        // T14 Step-0 账载（上游 base/file.go:162 对 `<= 19` 判死）：size==19 的
+        // 「零体事件」上游 fatal，本层同拒——空 body 事件在 MySQL 落盘侧不存在，
+        // 接受只会把损坏件放进下游切片逻辑。
+        let mut b = known_header_bytes();
+        b[9..13].copy_from_slice(&(EVENT_HEADER_SIZE as u32).to_le_bytes()); // = 19
+        assert!(matches!(
+            parse_header(&b),
+            Err(BinlogError::InvalidData(m)) if m.contains("event_size")
+        ));
+        // 20（最小合法体 1B）必须仍然通过
+        b[9..13].copy_from_slice(&20u32.to_le_bytes());
+        assert!(parse_header(&b).is_ok());
+    }
+
+    #[test]
+    fn fde_checksum_masks_only_binlog_in_use_bit() {
+        // T14 Step-0 账载（log_event.cc:1324-1338）：FDE 校验输入只把
+        // LOG_EVENT_BINLOG_IN_USE_F（bit 0）置零，其余 flags 位照常参与——
+        // 整 2 字节清零的旧口径对带其他位的 FDE 必假阴。
+        let mut ev = vec![0u8; EVENT_HEADER_SIZE + 40 + 4];
+        let split = ev.len() - 4;
+        ev[9..13].copy_from_slice(&((EVENT_HEADER_SIZE + 40 + 4) as u32).to_le_bytes());
+        ev[17] = 0x01; // IN_USE
+        ev[18] = 0x02; // 另一个任意位（非 IN_USE）：必须保留参与校验
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&ev[..17]);
+        hasher.update(&[0x00, 0x02]); // 仅掩 bit 0
+        hasher.update(&ev[EVENT_HEADER_SIZE..split]);
+        let crc = hasher.finalize();
+        ev[split..].copy_from_slice(&crc.to_le_bytes());
+        assert!(
+            fde_checksum_ok(&ev),
+            "只 bit0 置零口径必须过（整 flags 清零必 RED）"
+        );
+        // bit0 未置位的普通 FDE 同口径自洽
+        ev[17] = 0x00;
+        let mut h2 = crc32fast::Hasher::new();
+        h2.update(&ev[..17]);
+        h2.update(&[0x00, 0x02]);
+        h2.update(&ev[EVENT_HEADER_SIZE..split]);
+        let crc2 = h2.finalize();
+        ev[split..].copy_from_slice(&crc2.to_le_bytes());
+        assert!(fde_checksum_ok(&ev));
     }
 
     #[test]

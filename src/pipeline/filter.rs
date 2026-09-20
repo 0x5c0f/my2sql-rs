@@ -7,8 +7,11 @@
 //!   currentBinlog, Pos: header.LogPos}`（事件尾），随后
 //!   `myPos.Compare(StartFilePos) == -1 → continue`（尾部还没到 start 就跳过）、
 //!   `myPos.Compare(StopFilePos) >= 0 → break`（尾部到达/超过 stop 即停，
-//!   **等号也停**：恰好以 stop_pos 结束的事件被排除）。文件名次序按字符串
-//!   字典序（mysql.Position.Compare 先比 Name）。本层照此实现（T15 差分口径）。
+//!   **等号也停**：恰好以 stop_pos 结束的事件被排除）。文件名次序 = **基础名
+//!   字典序 + 末尾 `.` 后数字后缀按整数比较**（vendored go-mysql
+//!   `mysql.Position.Compare`/`CompareBinlogFileName`，position.go:39-80——
+//!   纯字典序在 999999→1000000 进位处失序，T12 审阅勘误、本层 T14 Step-0
+//!   复刻，含空名特例）。本层照此实现（T15 差分口径）。
 //! - **时间窗口**：com.go:63-74 —— `ts < start_dt → continue`；
 //!   `ts >= stop_dt → break`（stop 等号排除）。unix 秒直接比较。
 //! - **db/table 白黑名单只作用于 rows 事件**（com.go:119-140，QUERY/XID 等直接
@@ -30,12 +33,48 @@ use crate::binlog::table_map::TableMapEvent;
 use crate::config::{Config, Dml};
 use crate::pipeline::source::{RawEvent, RawKind};
 
-/// binlog 位点 (文件名, 偏移)：字典序比较（先名字后偏移，mysql.Position.Compare 同构）。
+/// 位点比较：先文件名（[`binlog_name_cmp`]），同名再比偏移
+/// （vendored mysql.Position.Compare，position.go:17-29 同构）。
 fn pos_cmp(name: &str, pos: u32, bound: (&str, u32)) -> Ordering {
-    match name.cmp(bound.0) {
-        Ordering::Equal => pos.cmp(&bound.1),
-        o => o,
+    binlog_name_cmp(name, bound.0).then_with(|| pos.cmp(&bound.1))
+}
+
+/// 复刻 vendored go-mysql `mysql.CompareBinlogFileName`（position.go:39-80）：
+/// 基础名（最后一个 `.` 之前）字典序 + 尾部十进制后缀**按整数**比较——
+/// 字典序在 `999999 → 1000000` 进位处给出反序（`"…9…"` > `"…1…"`），
+/// 整数序修正之。空名特例照抄（双空=等、空<非空、非空>空）。
+/// 与 go-mysql 的一处有意偏差：非数字后缀上游 `panic`（position.go:66-68），
+/// 本层按无 `.` 分支同款回退 `(整名, 0)`（D5 立场：敌意输入报错/降级，不 panic）。
+fn binlog_name_cmp(a: &str, b: &str) -> Ordering {
+    if a.is_empty() || b.is_empty() {
+        return match (a.is_empty(), b.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        };
     }
+    let (a_base, a_seq) = split_binlog_name(a);
+    let (b_base, b_seq) = split_binlog_name(b);
+    a_base.cmp(b_base).then_with(|| a_seq.cmp(&b_seq))
+}
+
+/// `name[.seq]` 拆分：后缀必须**非空且全为 ASCII 数字**才按整数计
+/// （Go `strconv.Atoi` 能吃 `+5`/`-5`/`1_2` 之类，binlog 文件名不会出现，
+/// 本层以「全数字」口径避免 Rust `parse` 的下划线分隔宽容造成误判）；
+/// 否则整名作基础名、序号 0（= go-mysql 无 `.` 兼容分支）。
+fn split_binlog_name(n: &str) -> (&str, u64) {
+    if let Some(i) = n.rfind('.')
+        && let Some(suffix) = n.get(i + 1..)
+        && !suffix.is_empty()
+        && suffix.bytes().all(|c| c.is_ascii_digit())
+    {
+        // 全 ASCII 数字且来自 u32 时代位点上下文：长度封顶防御性取 0 兜底。
+        if let Ok(seq) = suffix.parse::<u64>() {
+            return (&n[..i], seq);
+        }
+    }
+    (n, 0)
 }
 
 /// 事件过滤器集合（空列表 = 不过滤；`None` 窗口 = 未设）。
@@ -302,7 +341,7 @@ mod tests {
         };
         assert!(!f.pos_stopped("F", 199, 0));
         assert!(f.pos_stopped("F", 200, 0));
-        // 文件名字典序主导：更早文件的尾位点再大也 pending；更晚文件直接 stopped
+        // 文件名次序主导：更早文件的尾位点再大也 pending；更晚文件直接 stopped
         let f = Filters {
             start: Some(("mysql-bin.000002".into(), 500)),
             stop: Some(("mysql-bin.000002".into(), 900)),
@@ -339,6 +378,52 @@ mod tests {
         assert!(f.pos_stopped("F", u32::MAX, 2000));
     }
 
+    // ---------- 文件名整数后缀序（T14 Step-0 账载：position.go:39-80 复刻） ----------
+
+    #[test]
+    fn binlog_name_cmp_uses_numeric_suffix_not_lexicographic() {
+        use crate::binlog::file_reader::FileReader;
+        type F = FileReader<std::fs::File>;
+        let lo = "mysql-bin.999999";
+        // next_binlog_name 的 %06d 进位产物（7 位）：字典序判它「更小」，整数序必须判「更大」
+        let hi = F::next_binlog_name(lo).unwrap();
+        assert_eq!(hi, "mysql-bin.1000000");
+        assert_eq!(pos_cmp(&hi, 4, (lo, 4)), Ordering::Greater);
+        assert_eq!(pos_cmp(lo, u32::MAX, (hi.as_str(), 4)), Ordering::Less);
+        // 前导零同一整数（000010 == 9+1 的下一档）
+        assert_eq!(pos_cmp("x.000010", 4, ("x.000009", 4)), Ordering::Greater);
+        // ""-name 特例（position.go:41-47：双空等、空为最小）
+        assert_eq!(pos_cmp("", 0, ("", 0)), Ordering::Equal);
+        assert_eq!(
+            pos_cmp("", u32::MAX, ("mysql-bin.000001", 4)),
+            Ordering::Less
+        );
+        assert_eq!(
+            pos_cmp("mysql-bin.000001", 4, ("", u32::MAX)),
+            Ordering::Greater
+        );
+        // 非数字后缀：上游 panic，本层回退 (整名,0)（无 '.' 分支同款，注释已录）
+        assert_eq!(pos_cmp("abcd", 5, ("abcd", 4)), Ordering::Greater);
+        assert_eq!(pos_cmp("a.b", 4, ("a", u32::MAX)), Ordering::Greater); // base "a.b"(seq0) > "a"
+        // 基础名不同 → 后缀不越权
+        assert_eq!(
+            pos_cmp("mysql-bin.000001", 4, ("mysqld.999999", 4)),
+            Ordering::Less
+        );
+        // 接受面（accept 粒度）：跨 999999→1000000 进位窗口不误判 pending
+        let f = Filters {
+            start: Some((lo.into(), 100)),
+            ..Filters::none()
+        };
+        assert!(!f.pos_pending(&hi, 200, 0), "字典序误判会在此 RED");
+        assert!(!f.pos_pending(lo, 200, 0));
+        let g = Filters {
+            stop: Some((hi, 100)),
+            ..Filters::none()
+        };
+        assert!(!g.pos_stopped(lo, 200, 0));
+    }
+
     // ---------- Config 映射 ----------
 
     #[test]
@@ -369,7 +454,7 @@ mod tests {
         ])
         .unwrap();
         let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args);
+        let cfg = Config::validate(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(
             f.start.as_ref().map(|(n, p)| (n.as_str(), *p)),
@@ -405,7 +490,7 @@ mod tests {
         ])
         .unwrap();
         let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args);
+        let cfg = Config::validate(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(f.stop, Some(("mysql-bin.000002".to_string(), 5000)));
     }
@@ -428,7 +513,7 @@ mod tests {
         ])
         .unwrap();
         let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args);
+        let cfg = Config::validate(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(f.stop_ts, Some(1767225600)); // 2026-01-01T00:00:00Z
     }

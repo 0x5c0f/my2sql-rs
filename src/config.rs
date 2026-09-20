@@ -154,11 +154,6 @@ pub struct Config {
     pub threads: usize,
 }
 
-fn die(msg: String) -> ! {
-    eprintln!("error: {msg}");
-    exit(2)
-}
-
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
 fn parse_time_zone(raw: Option<&str>) -> Result<FixedOffset, String> {
     let Some(s) = raw else {
@@ -183,40 +178,43 @@ fn parse_datetime(raw: &str, tz: FixedOffset) -> Result<DateTime<FixedOffset>, S
 }
 
 impl Config {
-    /// 解析命令行 → 校验 → 产出 `Config`。校验失败打印错误并以退出码 2 结束。
+    /// 解析命令行 → 校验 → 产出 `Config`。**进程级失败出口唯一**：校验错误
+    /// 打印 `error: …` 并 `exit(2)`（T14 Step-0 重构：`validate` 本身返回
+    /// `Result`，退出决策留在这里，测试不再被 `die` 连坐）。
     pub fn from_args() -> Config {
         let cli = Cli::parse();
         match cli.cmd {
-            Command::ToSql(args) => Config::validate(args),
+            Command::ToSql(args) => Config::validate(args).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                exit(2)
+            }),
         }
     }
 
-    /// 校验并归一化 `to-sql` 参数 → `Config`（T12 起对 `Filters` 等消费方可见；
-    /// 校验失败 `die` 直接退出进程，与 `from_args` 同路径）。
-    pub fn validate(args: ToSqlArgs) -> Config {
+    /// 校验并归一化 `to-sql` 参数 → `Config`；失败返回人类可读错误串
+    /// （由调用方决定展示/退出——`from_args` 走 `exit(2)`，测试直接 `unwrap_err`）。
+    pub fn validate(args: ToSqlArgs) -> Result<Config, String> {
         if args.threads == 0 {
-            die("--threads must be >= 1".into());
+            return Err("--threads must be >= 1".into());
         }
         if args.uri.is_none() && args.schema_file.is_none() {
-            die("table schema source required: pass --uri or --schema-file".into());
+            return Err("table schema source required: pass --uri or --schema-file".into());
         }
-        let time_zone = parse_time_zone(args.time_zone.as_deref()).unwrap_or_else(|e| die(e));
+        let time_zone = parse_time_zone(args.time_zone.as_deref())?;
         let start_datetime = args
             .start_datetime
             .as_deref()
             .map(|s| parse_datetime(s, time_zone))
-            .transpose()
-            .unwrap_or_else(|e| die(e));
+            .transpose()?;
         let stop_datetime = args
             .stop_datetime
             .as_deref()
             .map(|s| parse_datetime(s, time_zone))
-            .transpose()
-            .unwrap_or_else(|e| die(e));
+            .transpose()?;
         if let (Some(s), Some(e)) = (start_datetime, stop_datetime)
             && s >= e
         {
-            die(format!(
+            return Err(format!(
                 "start_datetime ({s}) must be earlier than stop_datetime ({e})"
             ));
         }
@@ -228,13 +226,13 @@ impl Config {
                 .as_deref()
                 .is_none_or(|f| f == args.start_file);
             if same_file && stop_pos <= args.start_pos {
-                die(format!(
+                return Err(format!(
                     "stop_pos ({stop_pos}) must be greater than start_pos ({})",
                     args.start_pos
                 ));
             }
         }
-        Config {
+        Ok(Config {
             binlog_dir: args.binlog_dir,
             start_file: args.start_file,
             start_pos: args.start_pos,
@@ -262,12 +260,54 @@ impl Config {
             insert_batch: args.insert_batch,
             time_zone,
             threads: args.threads,
-        }
+        })
     }
 
     /// 该 DML 类型是否需要处理（空 dml 列表 = 全部）。
     #[allow(dead_code)] // Task 12 过滤器接入后移除
     pub fn dml_enabled(&self, d: Dml) -> bool {
         self.dml.is_empty() || self.dml.contains(&d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn args(extra: &[&str]) -> ToSqlArgs {
+        let mut v = vec![
+            "my2sql-rs",
+            "to-sql",
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "f.000001",
+        ];
+        v.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(v).unwrap();
+        match cli.cmd {
+            Command::ToSql(a) => a,
+        }
+    }
+
+    #[test]
+    fn validate_returns_err_instead_of_killing_process() {
+        // T14 Step-0 账载（HANDOVER T12「地雷」）：缺 schema 源必须是 Err 值，
+        // 旧 die()→exit(2) 形态下本测试会杀掉整个测试进程。
+        let e = Config::validate(args(&[])).unwrap_err();
+        assert!(e.contains("schema source"), "{e}");
+        assert!(
+            Config::validate(args(&["--uri", "mysql://x@y"])).is_ok(),
+            "带 --uri 应通过"
+        );
+        // 其余校验分支同样走 Result
+        let e = Config::validate(args(&["--uri", "mysql://x@y", "--threads", "0"])).unwrap_err();
+        assert!(e.contains("threads"), "{e}");
+        let e = Config::validate(args(&["--uri", "mysql://x@y", "--time-zone", "Kathmandu"]))
+            .unwrap_err();
+        assert!(e.contains("time-zone"), "{e}");
+        let e = Config::validate(args(&["--uri", "mysql://x@y", "--stop-pos", "3"])).unwrap_err();
+        assert!(e.contains("stop_pos"), "{e}");
     }
 }

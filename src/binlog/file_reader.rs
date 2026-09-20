@@ -46,6 +46,13 @@ use crate::pipeline::source::{EventSource, RawEvent, RawKind};
 /// binlog 文件魔数 `fe 'bin'`（go-mysql replication.BinLogFileHeader 同值）。
 pub const BINLOG_MAGIC: [u8; 4] = [0xfe, b'b', b'i', b'n'];
 
+/// 单事件字节上限（T14 Step-0 账载：header 谎报巨形 `event_size` 时
+/// `vec![0u8; body_len]` 预分配即 OOM）。MySQL 官方事件无此量级
+/// （max_allowed_packet 域 ≤1GB 且行事件分片）；取 2GiB（`1<<31`）为
+/// 「任何合法 binlog 事件都远小于此」的宽松天花板，超出 = 损坏/敌意 →
+/// InvalidData 硬错误，先于任何分配。
+pub const MAX_EVENT_SIZE: u32 = 1 << 31;
+
 /// 文件事件源（单文件；rotate 只改名不切文件）。
 pub struct FileReader<R: Read + Seek> {
     name: String,
@@ -253,6 +260,13 @@ impl<R: Read + Seek> EventSource for FileReader<R> {
                 return Err(BinlogError::UnexpectedEof); // 半截头 = 截断文件
             }
             let h = parse_header(&hb)?;
+            // 事件体预分配前的尺寸闸门（T14 Step-0：谎报巨形 header 不得先 alloc）
+            if h.event_size > MAX_EVENT_SIZE {
+                return Err(BinlogError::InvalidData(format!(
+                    "event_size {} exceeds cap {MAX_EVENT_SIZE} (corrupt or hostile header)",
+                    h.event_size
+                )));
+            }
             let own_start = h.log_pos.saturating_sub(h.event_size);
             // ---- stop 判定：header 之后、body 之前（简报 Step 2 / 裁定 3）----
             if self.filters.pos_stopped(&self.name, h.log_pos, h.timestamp) {
@@ -668,6 +682,31 @@ mod tests {
         s.bytes[n - 10] ^= 0x80;
         let mut r = reader(&s, Filters::none());
         assert_eq!(r.next().unwrap_err(), BinlogError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn oversized_event_header_errors_before_alloc() {
+        // T14 Step-0 账载：event_size > MAX_EVENT_SIZE（2GiB）的谎报头必须在
+        // vec![0;body_len] 之前被拒（RED 形态：旧实现先分配再 EOF 报错/卡内存）。
+        let mut bytes = b"\xfebin".to_vec();
+        let mut hb = Vec::new();
+        hb.extend_from_slice(&1u32.to_le_bytes()); // ts
+        hb.push(2); // QUERY
+        hb.extend_from_slice(&1u32.to_le_bytes()); // server_id
+        hb.extend_from_slice(&(MAX_EVENT_SIZE + 8).to_le_bytes()); // event_size 越界
+        hb.extend_from_slice(&126u32.to_le_bytes()); // log_pos
+        hb.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&hb);
+        let mut r = FileReader::new(
+            "mysql-bin.000001".into(),
+            Cursor::new(bytes),
+            Filters::none(),
+        )
+        .unwrap();
+        assert!(matches!(
+            r.next(),
+            Err(BinlogError::InvalidData(m)) if m.contains("cap")
+        ));
     }
 
     #[test]
