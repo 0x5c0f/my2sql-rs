@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 6 已完成**（时间族解码 time.rs；`cargo test` 63/63 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 7 已完成**（DECIMAL 解码 decimal.rs；`cargo test` 76+3/79 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -185,6 +185,42 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   无 24h 钳制）。
 - 遗留：time.rs 顶部 `#![allow(dead_code)]`（Task 9 消费后移除）；DATE 型在
   table_map metadata 中 meta 恒 0（真机确认），T9 分发时 date2 无需 fsp 参数。
+
+### Task 7: DECIMAL（MYSQL_TYPE_NEWDECIMAL）精确解码 → 保真文本
+
+- 做了什么：新增 `src/binlog/decimal.rs`——`decode_decimal(buf, pos, precision,
+  scale) -> Result<String, BinlogError>`，算式逐字镜像 go-mysql `row_event.go`
+  `decodeDecimal` + `decodeDecimalDecompressValue`（`compressedBytes`
+  `[0,1,1,2,2,3,3,4,4,4]`、首字节高 0x80 符号折叠、满 9 位大端 u32 组 ^mask、
+  负值**逐字节/逐组 one's complement，无 +1**——真机抓包证实，非二补码）。
+  纯 u32 组算术 + 字符串拼接，无新依赖、无浮点。TDD：先写 16 个失败测试
+  （RED：16 failed, todo!()），实现后 76+3 全绿。
+- 真机回验：docker mysql:8.0.46 + 5.7.44 ROW binlog 探针表 t.p_a..p_k
+  （DECIMAL (10,2)/(3,0)/(9,0)/(5,5)/(30,10)/(65,30)/(20,20)/(1,0)/(4,2)/
+  (18,6)/(2,1)，58 行含 ±99999999.99、全组边界、1e-30、纯小数、负零舍入等），
+  两版本抓包**逐字节一致**；再以独立 Python 镜像核对「字节→文本 == 服务器
+  存储值」58/58 全等后才作为 fixture（fixture=真机编码，非实现回声）。
+- 接缝核验（控制器要求）：T4 `table_map.rs::decode_meta` 对 NEWDECIMAL 存
+  2B **大端对**（高字节=precision），与 go-mysql 消费点 `prec=meta>>8;
+  scale=meta&0xFF` 完全一致——**无缝隙**，T9 可直接按该式传参。
+- 简报偏差（权威修正）：① tiny_int_len 表简报 9 项 vs 权威 10 项（公共部分
+  数值相同，索引 9 恒不可达），取权威；② 简报「首组 ^0x80000000」不确——
+  权威/真机是**首字节** ^0x80（符号位属于数值最高字节的最高位，无论首组是
+  余数组还是满组，(9,0) 类 `bb 9a c9 ff` 即满组带符号位）；③ 余数组读取为
+  **大端**逐字节 XOR，非 LE。
+- 负零裁定核验（权威=真机+go-mysql）：**MySQL 不落盘 -0.00**——
+  `CAST('-0.001' AS DECIMAL(10,2))` 抓包 = `80 00 00 00 00`，与 +0.00 全等
+  （舍入到零丢符号）；理论上全取反的负零字节形态（`7f ff ff ff ff`）go-mysql
+  输出 "-0.00"，本实现逐式一致（合成用例备案，真机不可达路径）。
+- 输出保真：小数恒 scale 位（尾零保留 "0.00"/"...9900"）、整数无前导零
+  （"0.05"，中间/末尾组零按 9 位补位 `0000000001`）、负值 '-' 前缀；
+  scale=0 无小数点。TooShort 时 pos 不动；precision∉1..=65 或 scale>precision
+  → InvalidData（go-mysql precision=0 会越界 panic，此处显式报错，与 T6
+  fsp>6 同口径）。
+- 遗留/挂账：decimal.rs 顶部 `#![allow(dead_code)]`（T9 消费后移除）；
+  (65,30) 探针插入字面量小数 28 位→存储尾组 "…900" 形态保留于 fixture
+  （验证的是编码往返，非任意值全覆盖）；T15 差分若启用 useDecimal=false
+  路径，本实现即 go-mysql 字符串分支输出。
 
 ## 环境事实
 

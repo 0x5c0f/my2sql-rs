@@ -2,6 +2,7 @@
 //! TABLE_MAP 解码（table_map）、定宽值解码 ColumnValue（int）、时间族字符串保真
 //! 解码（time）；后续 Task 追加 format_desc / rows 等模块。
 
+pub mod decimal;
 pub mod error;
 pub mod event;
 pub mod int;
