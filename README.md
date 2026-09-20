@@ -81,10 +81,12 @@ make compat     # 全版本矩阵：5.6/5.7/8.0/8.4 × {差分, checksum 双态,
 make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustfmt
 ```
 
-- 裁判二进制已预编译在 `tools/bin/my2sql-go`（源码 `reference/my2sql-go/`，只读，勿改动）。
+- 裁判源码在 `reference/my2sql-go/`（只读，勿改动）；`make difftest` 每次经
+  `go build` 现编到 `tools/bin/my2sql-go`（该目录不入库）——**差分测试需要本机
+  Go 工具链**（脚本假定 `go` 在 PATH，含 `/opt/go/bin` 兜底）。
 - 比较器 `tools/comparator/compare.py` 带自检（8 组正反例），语义等价判定 +
   显式白名单（每条差异都有编号与准入理由，见 `docs/HANDOVER.md` 挂账清单）。
-- 需要 docker；本机不需要 Go 工具链。
+- 需要 docker。除差分测试（`make difftest`/`make compat`）外不需要 Go 工具链。
 - 吞吐基线：`bash tools/gen-bench-binlog.sh && cargo bench --bench decode`
   （输入缺失或 debug 编译档时 bench 自动跳过，不影响 `cargo test --all-targets`）。
 
