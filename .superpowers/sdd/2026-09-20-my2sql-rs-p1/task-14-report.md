@@ -113,3 +113,46 @@ rows→T14 接缝豁免（rows.rs/file_reader.rs/store.rs/sqlopen 等）已随�
   前者限在飞作业、后者限乱序滞留结果，语义独立均按简报/spec §5.1 落地。
 - `drain_remaining` 触发 = seq 流有洞（worker 全体消亡等病理态），当前仅
   warn+强制吐出不丢数；P2 keep-trx/回滚配对将依赖 trx_id 透传字段。
+
+## T14 审阅后修复（Task-scoped follow-up，dea2f03 之后）
+
+### 变更
+
+1. **Finding 1：worker panic ⇒ 流水线永久挂死**（`src/pipeline/worker.rs`）
+   - 单作业处理抽为 `process_job(job, builder, errors) -> Vec<SqlGroup>`，
+     `worker_loop` 内以 `catch_unwind(AssertUnwindSafe(|| process_job(..)))`
+     包裹；panic 臂 = `errors.fetch_add` + `tracing::error!`（含
+     `panic_payload` 文本化载荷）+ 投 `(seq, Vec::new())`——与 Err 臂
+     （原 :96-122）**同一填洞契约**。此前 panic 使肇事线程带伤退场，seq
+     空洞 + 存活 worker 持有 sender ⇒ dispatcher 在 `res_rx.recv()` 永挂。
+   - 测试注入缝：`#[cfg(test)] PANIC_MARKER`（binlog 名等于 `"__panic__"`
+     的作业在 process_job 内 panic）——按作业内容匹配、零全局可变状态，
+     不干扰并行运行的其他测试。
+2. **Finding 2：`--file-per-table` 路径穿越**（`src/output.rs`）
+   - 新增 `sanitize_for_path`（路径面专用）：`/`、`\`、NUL → `?`；整段
+     恰为 `..` → `?`；干净名恒等映射（Cow 零拷贝快路）。`path_for` 仅在
+     `dir.join` 前消费净化值。**SqlGroup.db/table 原字节不变**——
+     extra-info 注释与反引号 SQL 文本仍走原始值（敌意输入立场下的有意
+     上游偏离；挂账 T15 白名单）。
+
+### 测试（TDD：每项先 RED 后 GREEN）
+
+- `worker_loop_panics_are_caught_and_hole_filled`——双 worker 线程复现挂死
+  形态；RED 输出 `Timeout`（recv_timeout 5s 防测试挂起）；GREEN 断言
+  `{(0,0),(1,1)}` 双结果回流 + errors==1 + join 收敛。
+- `path_for_sanitizes_traversal_names_into_dir`——RED：`parent!=dir` 且
+  `..`/`\`/NUL 原样插值；GREEN：`a/../../../evil` 留在 dir 内、`..`→`?`、
+  `a\b`→`a?b`、NUL→`?`、干净名零改动。
+- `writer_traversal_names_never_escape_output_dir`——temp root 递归清点：
+  恰好 2 文件全在 dir 内（旧行为 create_dir_all 亲手铺逃逸目录）；并断言
+  落盘文件 extra-info 行仍含原始字节 `database=a/../../evil table=x`。
+
+### 命令与输出
+
+```
+$ cargo test
+test result: ok. 239 passed (lib) + 3 + 4 (集成); 1 ignored; 0 failed
+$ cargo clippy --all-targets -- -D warnings   # Finished, 零警告
+$ cargo fmt --check                            # 通过
+```
+

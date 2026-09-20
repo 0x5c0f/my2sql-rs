@@ -16,7 +16,12 @@
 //!   终止（events.go:87 等）——本工具对**文件级**损坏（checksum/截断，源层
 //!   Err）同样终止，仅对**单事件解码/生成**错误继续；差分夹具均为良构 binlog，
 //!   两种策略在 T15 期望输出上无分歧。
+//! - **panic 亦填洞（T14 审阅 Finding 1）**：worker 侧 build 路径 panic 经
+//!   `catch_unwind` 捕获，走与 Err 完全相同的计数+空批填洞契约——否则 seq
+//!   空洞 + 存活 worker 持有 sender 会让 dispatcher 在 `recv()` 上永久挂死。
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -93,6 +98,50 @@ pub fn build_groups(job: &Job, builder: &DmlBuilder) -> Result<Vec<SqlGroup>, Sq
 /// worker 线程主循环：recv → build → 回投 `(seq, groups)`。
 /// 错误即计数 + `tracing::error!` + 投空批（空洞必须填，否则 reorder 永挂）。
 /// `job_rx` 断开（dispatcher 投递完成）→ 自然退出。
+/// 测试专用 panic 注入缝：`binlog` 等于该标记的作业在处理时 panic，
+/// 用于钉死 worker_loop 的 catch_unwind 填洞契约（Finding 1）。
+#[cfg(test)]
+pub(crate) const PANIC_MARKER: &str = "__panic__";
+
+/// 单作业处理（catch_unwind 保护区）：Ok=批；Err/panic → 计数 + error 日志 +
+/// 空批（**同一填洞契约**：res 流绝不允许出现 seq 空洞，否则 reorder/dispatcher
+/// 永挂——存活 worker 持有 sender 时 `recv()` 不会断开）。
+fn process_job(job: &Job, builder: &DmlBuilder, errors: &AtomicU64) -> Vec<SqlGroup> {
+    #[cfg(test)]
+    if job.ev.binlog == PANIC_MARKER {
+        panic!("injected worker panic (seq={})", job.seq);
+    }
+    match build_groups(job, builder) {
+        Ok(g) => g,
+        Err(e) => {
+            errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                seq = job.seq,
+                binlog = %job.ev.binlog,
+                pos = job.ev.start_pos,
+                "event skipped due to decode/SQL-build error: {e:#}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// panic 载荷 → 日志可读文本（&str/String 之外的任意载荷兜底）。
+fn panic_payload(p: &(dyn Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// worker 线程主循环：recv → build → 回投 `(seq, groups)`。
+/// 错误即计数 + `tracing::error!` + 投空批（空洞必须填，否则 reorder 永挂）。
+/// build 路径 **panic 同样捕获**并走同款填洞（Finding 1：单作业 panic 曾致
+/// 流水线永久挂死——肇事线程死后存活 worker 仍持有 sender，`recv()` 永断不了）。
+/// `job_rx` 断开（dispatcher 投递完成）→ 自然退出。
 pub fn worker_loop(
     job_rx: Receiver<Job>,
     res_tx: Sender<(u64, Vec<SqlGroup>)>,
@@ -101,15 +150,14 @@ pub fn worker_loop(
 ) {
     while let Ok(job) = job_rx.recv() {
         let seq = job.seq;
-        let groups = match build_groups(&job, &builder) {
+        let groups = match catch_unwind(AssertUnwindSafe(|| process_job(&job, &builder, &errors))) {
             Ok(g) => g,
-            Err(e) => {
+            Err(p) => {
                 errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     seq,
-                    binlog = %job.ev.binlog,
-                    pos = job.ev.start_pos,
-                    "event skipped due to decode/SQL-build error: {e:#}"
+                    "event skipped due to worker panic: {}",
+                    panic_payload(&*p)
                 );
                 Vec::new()
             }
@@ -211,5 +259,51 @@ mod tests {
         let mut j2 = rows_job(2, vec![]);
         j2.ev.kind = RawKind::Xid;
         assert!(build_groups(&j2, &DmlBuilder::default()).is_err());
+    }
+
+    /// Finding 1（RED→GREEN）：单 worker 处理作业 panic 不得留下 seq 空洞——
+    /// 与 Err 分支同款填洞契约（投 (seq, 空批) + errors 计数）。复现真实挂死
+    /// 形态：双 worker，肇事线程死亡后存活 worker 仍持有 res_tx sender，
+    /// dispatcher 侧 `res_rx.recv()` 将永无结果。recv_timeout 保证失败模式
+    /// 是 FAIL 而非测试挂起。
+    #[test]
+    fn worker_loop_panics_are_caught_and_hole_filled() {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<SqlGroup>)>();
+        let errors = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (rx, tx, e, b) = (
+                job_rx.clone(),
+                res_tx.clone(),
+                errors.clone(),
+                DmlBuilder::default(),
+            );
+            handles.push(std::thread::spawn(move || worker_loop(rx, tx, b, e)));
+        }
+        drop(job_rx);
+        drop(res_tx);
+        let mut bad = rows_job(0, write_body(7, 1));
+        bad.ev.binlog = PANIC_MARKER.into();
+        job_tx.send(bad).unwrap();
+        job_tx.send(rows_job(1, write_body(7, 2))).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let (seq, g) = res_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("dispatcher would hang forever: seq hole left by worker panic");
+            got.push((seq, g.len()));
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(0, 0), (1, 1)],
+            "panicked seq must be hole-filled"
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 1, "panic counted as error");
+        drop(job_tx);
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

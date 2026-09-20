@@ -45,13 +45,41 @@ pub fn datetime_str(ts: u32, tz: FixedOffset) -> String {
         .to_string()
 }
 
+/// **仅供路径使用**的名字净化（T14 审阅 Finding 2，敌意 TABLE_MAP 防线）：
+/// `/`、`\`、NUL → `?`；整段恰为 `..` → `?`。替换后 db/table 成为单一普通
+/// 路径段，`dir.join` 恒得 `parent()==dir`。**SqlGroup.db/table 原字节不动**
+/// ——extra-info 注释与反引号 SQL 文本仍消费原始值（净化只发生在拼 PathBuf
+/// 这一处）。与上游 my2sql 的有意偏差：上游同款插值可越界写（挂账 T15）。
+fn sanitize_for_path(s: &str) -> std::borrow::Cow<'_, str> {
+    if s != ".." && !s.contains(['/', '\\', '\0']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if s == ".." {
+        return std::borrow::Cow::Borrowed("?");
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| match c {
+                '/' | '\\' | '\0' => '?',
+                _ => c,
+            })
+            .collect(),
+    )
+}
+
 /// 输出目标路径：`to_sql.{schema.table.}<N>.sql`（file_per_table 前半段取舍），
 /// N = binlog 末段 `.` 后十进制序号（去前导零）；无数字后缀 → 0（与
 /// `filter::split_binlog_name` 同款回退，正常文件名恒带序号）。
+/// db/table 先经 `sanitize_for_path`（仅路径面，见其上注释）。
 pub fn path_for(dir: &Path, binlog: &str, db: &str, table: &str, file_per_table: bool) -> PathBuf {
     let n = binlog_index(binlog);
     if file_per_table {
-        dir.join(format!("to_sql.{db}.{table}.{n}.sql"))
+        dir.join(format!(
+            "to_sql.{}.{}.{}.sql",
+            sanitize_for_path(db),
+            sanitize_for_path(table),
+            n
+        ))
     } else {
         dir.join(format!("to_sql.{n}.sql"))
     }
@@ -236,6 +264,32 @@ mod tests {
         );
     }
 
+    /// Finding 2（RED→GREEN）：敌意 TABLE_MAP db/table 的路径穿越。净化**仅
+    /// 作用于构造 PathBuf**；SqlGroup 内 db/table 原字节（extra-info/SQL 文本
+    /// 消费面）不受影响。攻击形态：明文 `a/../../../evil/x`、`..`、反斜杠、NUL。
+    #[test]
+    fn path_for_sanitizes_traversal_names_into_dir() {
+        let d = Path::new("/out");
+        // 明文多段穿越：结果必须仍是 dir 的直接子文件（parent == dir）
+        let p = path_for(d, "mysql-bin.000003", "a/../../../evil", "x", true);
+        assert_eq!(p.parent(), Some(d), "穿越名不得逃出目录: {p:?}");
+        // `..` 独立段
+        let p = path_for(d, "mysql-bin.000003", "..", "x", true);
+        assert_eq!(p, PathBuf::from("/out/to_sql.?.x.3.sql"));
+        // 反斜杠（Windows 形）与 NUL
+        let p = path_for(d, "mysql-bin.000003", "a\\b", "c\0d", true);
+        assert_eq!(p, PathBuf::from("/out/to_sql.a?b.c?d.3.sql"));
+        // 净化后的 file_name 不含任何路径分隔符/裸 `..` 段
+        let p = path_for(d, "mysql-bin.000003", "a/../../../evil", "x", true);
+        let f = p.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(!f.contains('/') && !f.contains('\\') && !f.contains('\0'));
+        // 干净名零改动（净化对正常路径为恒等映射）
+        assert_eq!(
+            path_for(d, "mysql-bin.000003", "t10", "u", true),
+            PathBuf::from("/out/to_sql.t10.u.3.sql")
+        );
+    }
+
     #[test]
     fn datetime_uses_underscore_form_and_fixed_offset() {
         // 上游 constvar.DATETIME_FORMAT_NOSPACE = "2006-01-02_15:04:05"
@@ -294,6 +348,64 @@ mod tests {
              SELECT 1;\nSELECT 2;\n"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding 2（RED→GREEN）写盘面：穿越名经 Writer 后不得在 dir 之外创建
+    /// 任何文件/目录（旧行为：sink_for 的 create_dir_all 会亲手铺出逃逸目录），
+    /// 且 extra-info 注释保留 db/table **原始字节**（净化仅路径用）。
+    #[test]
+    fn writer_traversal_names_never_escape_output_dir() {
+        fn count_files(p: &Path) -> usize {
+            if p.is_file() {
+                1
+            } else if p.is_dir() {
+                std::fs::read_dir(p)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| count_files(&e.path()))
+                            .sum()
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        let root = std::env::temp_dir().join(format!("my2sql-t14-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("out");
+        {
+            let mut w = Writer::new(
+                dir.clone(),
+                false,
+                true,
+                true,
+                FixedOffset::east_opt(0).unwrap(),
+            );
+            w.write_group(&grp("mysql-bin.000001", "a/../../evil", "x"))
+                .unwrap();
+            w.write_group(&grp("mysql-bin.000001", "..", "..")).unwrap();
+            assert_eq!(w.finish().unwrap(), 2);
+        }
+        // 全部落盘恰好 2 个文件且都在 dir 内（root 树下无逃逸目录）
+        assert_eq!(count_files(&root), 2, "no file escaped dir");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|n| !n.contains('/') && !n.contains('\\')));
+        // 净化仅供路径：extra-info 行仍带原始穿越字节
+        let escaped = names
+            .iter()
+            .find(|n| n.starts_with("to_sql.a"))
+            .expect("sanitized traversal file exists");
+        let text = std::fs::read_to_string(dir.join(escaped)).unwrap();
+        assert!(
+            text.contains("database=a/../../evil table=x"),
+            "extra-info 保留原字节, got: {text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

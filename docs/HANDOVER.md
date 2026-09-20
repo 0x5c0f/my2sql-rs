@@ -643,6 +643,23 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   （tools/docker-mysql.sh 建成后自动化差分，本任务以 e2e fixture 为准，
   简报 Step 3 口径）；reorder `drain_remaining` 为 seq 断流病理防御，
   正常路径恒空。
+- **T14 审阅后修复（本节点追加，单提交）**：
+  ① Finding 1 worker panic 挂死——`worker_loop` 单作业处理抽为
+  `process_job` 并包 `catch_unwind(AssertUnwindSafe(..))`；panic 走与 Err
+  分支**完全相同的填洞契约**（errors 计数 + 投 (seq, 空批)）。此前单 worker
+  panic 留 seq 空洞，存活 worker 持有 sender 使 dispatcher `res_rx.recv()`
+  永久挂死。测试 `worker_loop_panics_are_caught_and_hole_filled`：双 worker +
+  `#[cfg(test)]` PANIC_MARKER 注入缝（按 binlog 名匹配，零全局态、不扰并行
+  测试），recv_timeout 保证失败模式为 FAIL 非挂起。
+  ② Finding 2 输出路径穿越——`path_for` 对 db/table 新增
+  `sanitize_for_path`（`/`、`\`、NUL → `?`；整段 `..` → `?`），此前敌意
+  TABLE_MAP 名经 `dir.join` 插值 + `sink_for` 的 create_dir_all 可越界建目录
+  写文件。**有意偏离上游**（上游 my2sql 同款缺陷可越界写；本项目立场=敌意
+  输入安全）。净化**仅作用于路径面**——SqlGroup.db/table 原字节不动，
+  extra-info 注释与反引号 SQL 文本继续消费原始值（测试钉死两侧）。
+  RED→GREEN 测试：`path_for_sanitizes_traversal_names_into_dir`、
+  `writer_traversal_names_never_escape_output_dir`（temp root 递归清点 = 2
+  文件全在 dir 内）。三门禁（test 246 绿/clippy -D/fmt）复跑通过。
 
 ## 校准记录
 
@@ -687,3 +704,4 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单（T14）：`SET NAMES utf8mb4;` 文件头为本项目计划约束，上游 Go 版无此行（python my2sql 有）——比较器须容忍首行
 - [ ] T15 白名单（T14）：`--to-stdout` 模式本侧与文件模式统一字节面（SET NAMES 头+extra-info 一并入屏幕流），上游屏幕模式仅打语句（events.go OutputToScreen 分支）
 - [ ] T15 纪律（T14）：extra-info datetime 本侧按 `--time-zone` 固定偏移渲染（下划线形与上游字节平价），上游走运行主机 TZ——差分双方须显式给同一 `--time-zone`/`TZ` 再比对
+- [ ] T15 白名单：文件名字节净化（仅 path，SQL 文本原样）vs 上游可越界写
