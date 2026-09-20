@@ -23,9 +23,11 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 10 已完成**（ROWS 行解码 decode_rows + 真机行级端到端 fixture；
-  `cargo test` 133+3/136 绿、clippy -D warnings、fmt 干净。Step 0 类型码统一表
-  独立提交 `228d00e`，功能提交 `1f59064`；详见 task-10-report.md）
+- 状态：**Task 11 已完成**（metadata 层 SchemaStore online/offline +
+  align_cols 列数对账 + key_indexes 键名→序号；`cargo test` 152+3/155 绿
+  （1 ignored = 真库 live 测试，已对 docker mysql:8.0.46 与 5.6.51 双实例
+  实跑通过）、
+  clippy -D warnings、fmt 干净；详见 task-11-report.md）
 
 ## 任务节点日志
 
@@ -387,6 +389,59 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 遗留/对后续影响：tz_offset_secs 本层恒 0，T14 `--time-zone` 需经参数注入
   （接缝已记录）；flags 2B 消费性跳过，STMT_END_F 归 T12 事务机自 body[6..8]
   读取；挂账清单「T2 勘误残余子项归 T10（extra-info 跳过）」已销账。
+
+### Task 11: metadata 层（SchemaStore 在线/离线 + 列数对账 + 键映射）
+
+- 做了什么：`src/metadata/schema.rs` 扩展（serde derive 上表结构、`norm_type`
+  Type 列归一化、`Align`/`align_cols`、`key_indexes`）+ 新建
+  `src/metadata/store.rs`（`MetaError`、`SchemaStore` offline/online/get/dump、
+  `parse_columns`/`parse_keys`）+ `mod.rs` 接线。两文件拆分采纳简报建议
+  （store.rs 独立）。TDD：RED 14 失败（todo!()）→ GREEN 152+3（1 ignored）。
+  **真库证明**：`#[ignore]` 的 `online_store_live` 双实例实跑通过——docker
+  mysql:8.0.46（t1：unsigned/decimal unsigned/复合 uk/非唯一键 + 生成列/
+  不可见列 ALTER 成功收录）与 mysql:5.6.51（无此类列，ALTER 失败自动降级、
+  absent-safe 证实）；均自建 `my2sql_t11` 库（含 odd 表：无主键、uk 名
+  `fake_primary_idx`），SHOW 两查询→解析断言→dump→offline 闭环→删库，
+  throwaway 容器用毕即删。
+- 顺带修复（既有潜伏）：table_map.rs:385/529/615 三处
+  `assert_eq!(e.charset, Vec::new())` 限定为 `Vec::<u64>::new()`。原因：
+  bin 此前从未引用 serde_json（依赖虽在 Cargo.toml，trait impl 不进选型）；
+  store.rs 首次使用 serde_json 后 `impl PartialEq<serde_json::Value> for u64`
+  参与竞争，旧断言类型推断歧义（E0282/0283 编译失败）。最小限定、零行为改动。
+- **JSON schema 文件格式**（裁定 1，键面绑定——T14 CLI 与用户手编以本文为准）：
+  `{"version":1,"tables":[{"db":"…","table":"…","cols":[{"name":"…",
+  "type_name":"…","unsigned":false}],"pk":["…"],"uks":[["…"]]}]}`。
+  `type_name` 小写、无括号、无 unsigned/zerofill 后缀词。tables 按
+  `db.table` 字典序（BTreeMap，dump 字节稳定）；读入重复 db.table →
+  最后生效 + `tracing::warn`；version≠1 → `MetaError::BadFile`。
+- 权威对照表（reference/my2sql-go，简报 shorthand 裁定见报告）：
+  | 行为点 | 上游实码 | 本层实现 |
+  |---|---|---|
+  | 列查询 | `SHOW COLUMNS`（mysqlFuncs.go:254），Field/Type 前两列 | `SHOW FULL COLUMNS` 按列名取 Field/Type（简报措辞；输出前两列同序同值，有效一致） |
+  | type 归一化 | GetFiledType `(` 前首段（funcs.go:86-92）+ IsUnsigned 含 "unsigned"（:94-96）；8.0.19+ `int unsigned` 无括号形态会把 " unsigned" 留在 type_name（上游 quirk，上游消费不受影响） | norm_type 首段后再剥尾部 unsigned/signed/zerofill 词 → 对齐上游 5.7 形态有效输出与 T9 契约 |
+  | 生成/不可见列过滤 | **零过滤**，吃服务器所给（8.0.46 实测 SHOW FULL COLUMNS 含 STORED GENERATED 与 INVISIBLE 列） | 同样零过滤；5.6 无此类列自然 absent-safe |
+  | PK 判定 | 键名小写**含 "primary" 即主键**（:194，简报此点核实为真非 shorthand）；多 primary 名键：map 随机序最后生效、前者整体丢弃（:221-238） | parse_keys 确定序复刻「最后生效 + 前者丢弃」；真库实测 `fake_primary_idx` 被提成 pk |
+  | 多列/表达式索引 | Seq_in_index 保序 + ContainsString 去重（:184-192）；表达式索引 NULL Column_name→"" （:189） | 照抄（空串名进组；下游 key_indexes 因匹配不到列而整键降级） |
+  | 键名→序号 | GetColIndexFromKey（:337-348）找不到时**静默置 0**（零值 bug，WHERE 用错列）；仅 PK 名列表为空才 pk=[]（events.go:139-143）；序号≥行宽 → 上游后续访问越界 panic | key_indexes 整键丢弃（pk→[]、uk 剔除），刻意偏离上游 bug，T15 白名单候选 |
+  | 列数·扩宽(binlog>schema) | sqlgen.go:23-33 补 `dropped_column_i`/unknown_type（命名 :19-21、context.go:26-27），但 events.go:87 随即**无条件 Fatalf**——补位从不产出 SQL | 非 strict → `Padded{dropped:["dropped_column_0"…]}`；strict → `Err(ColCountFatal)` 复现 fatal。**T15 差分：此情形上游恒 fatal，对账需 strict=true** |
+  | 列数·收窄(binlog<schema) | events.go:83 rowLen≤len → 静默取 schema 前 binlog 列 | `Truncated(schema宽-binlog宽)` 恒返回（含 strict——上游该方向从不 fatal，strict 覆盖两向是本层语义扩展） |
+- 关键接口（T12/T13/T14 消费）：
+  - `SchemaStore::{offline(&Path), online(uri)->, get(&mut,db,tb)->Result<&TableSchema,MetaError>, dump(&self,&Path)}`；
+    online 构造建连一次、get 懒查+缓存、无重试（裁定 2，上游同）；空库/表名 →
+    `EmptyIdent`；offline 缺表 → `NotFound`。`MetaError`（thiserror，
+    Db/Io/Json/NotFound/BadFile/EmptyIdent/ColCountFatal）——**签名偏差**：
+    align_cols 错误类型由简报 `BinlogError` 改 `MetaError`（列数对账属
+    metadata 层语义，不向 binlog 层塞变体；依赖面不扩，mysql/serde/serde_json
+    既白名单）。
+  - `Align::{Ok, Truncated(尾列个数), Padded{dropped:Vec<String>}}`：目标宽度
+    可推导（Truncated：cols.len()-n；Padded：cols.len()+dropped.len()，均等
+    binlog_cols）。T10 decode_rows 已按静态 dropped 占位处理超宽列，
+    Padded.dropped 供 T13 在 SQL 文本面拼 per-index 真名（T10 节点接缝）。
+  - `key_indexes(&TableSchema,&TableMapEvent)->(Vec<usize>,Vec<Vec<usize>>)`。
+- 遗留/对后续影响：T13 strict 语义接线时决定默认值——与上游有效行为等价
+  要求扩宽方向 fatal（见对照表「列数·扩宽」行）；`--schema-dump` 在 T14 接
+  online 时仅含已缓存表（懒查语义，上游 GetTableInfoJson 亦惰性）。
+  schema.rs/store.rs 模块级 `#![allow(dead_code)]` 保留至 T13/T14 生产接线。
 
 ## 校准记录
 
