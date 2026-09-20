@@ -474,3 +474,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [x] ~~**T4 勘误（T9 真机捕获）**：T4 严格 LNE 解析器拒绝真实 8.0 TLV optional-metadata~~——T9 后校准补丁实现 fork 同构 `decodeOptionalMeta` 镜像（无总长前缀、未知项跳过、截断报错），`tests/fixtures/capture_8.0_minimal/` 真机 TABLE_MAP 回归通过（捕获件 /tmp/t9probe 亦同源）。
 - [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义
+- [ ] T15 白名单（T11）：key_indexes 键名指向缺失列时本侧整键降级（pk=[]/丢 uk），上游 GetColIndexFromKey 映射为序号 0（bug 兼容会产生错误 WHERE）；表达式索引/坏 JSON 场景输出必分歧
+- [ ] T15 纪律（T11）：binlog 比 schema 宽的场景差分必须跑 strict=true（上游 events.go:87 无条件 fatal，pad 列永不出 SQL）
+- [ ] T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict
+- [ ] T15 夹具约束（T11 审阅发现）：上游 UniqueKeys 为 Go map 序（mysqlFuncs.go:221-238），多 uk 表 GetOneUniqueKey 选择跨运行不稳定；本侧确定性序更优——差分夹具限 ≤1 候选 uk 或容忍键选择分歧
