@@ -33,16 +33,20 @@ EXTRA=(--log-bin=mysql-bin --binlog-format=row --binlog-row-image=full --server-
 NATIVE_FIXUP=""
 case "$VER" in
   5.6|5.7) : ;;
-  8.0) [ "${AUTH:-native}" = native ] && \
-       EXTRA+=(--default-authentication-plugin=mysql_native_password) ;;
+  8.0) # T17 修复轮 1：原为裸 `[ cond ] && EXTRA+=(...)`（set -e 下的脆弱形态，
+       # AUTH=stock 条件为假时分支状态即 1；bash 5.2 实测豁免未 abort，但
+       # 该模式依赖 && 列表豁免，函数化/换 shell 即成雷）→ 显式 if。
+       if [ "${AUTH:-native}" = native ]; then
+         EXTRA+=(--default-authentication-plugin=mysql_native_password)
+       fi ;;
   8.4) if [ "${AUTH:-native}" = native ]; then
          EXTRA+=(--mysql-native-password=ON)   # 8.4 默认禁用 native 插件（T17 真机勘误）
          NATIVE_FIXUP=1                        # 就绪后把 root@% 改回 native（Go 裁判用）
        fi ;;
   *)   echo "unsupported version $VER (want 5.6|5.7|8.0|8.4)" >&2; exit 1 ;;
 esac
-[ -n "${CKSUM:-}" ] && EXTRA+=("--binlog-checksum=$CKSUM")
-[ -n "${V1ROWS:-}" ] && EXTRA+=(--log-bin-use-v1-row-events=1)
+if [ -n "${CKSUM:-}" ]; then EXTRA+=("--binlog-checksum=$CKSUM"); fi
+if [ -n "${V1ROWS:-}" ]; then EXTRA+=(--log-bin-use-v1-row-events=1); fi
 
 docker run -d --name "$NAME" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=1 \

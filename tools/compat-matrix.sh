@@ -4,7 +4,8 @@
 #   to-sql 差分（Go 裁判 vs Rust，含离线 schema 回放 = run-difftest 步骤 7）
 #   + binlog_checksum 双态（实测本机镜像 5.6.51/5.7.x 默认均 CRC32；
 #     5.6 与 5.7 各加跑 CKSUM=none——两条 checksum 代码路径在两个大版本上正反都过）
-#   + 5.6 V1 rows 事件用例（log_bin_use_v1_row_events=1，真机 23/24/25 解码路径）
+#   + 5.6 V1 rows 事件用例（log_bin_use_v1_row_events=1，真机 23/24/25 解码路径；
+#     run-difftest 步骤 3.5 事件普查硬门，产物 EVENT_CENSUS.txt）
 #   + 8.4 专项：原版 caching_sha2_password 在线元数据探针（Rust mysql crate
 #     对 8.4 默认认证插件的握手验证；Go 裁判侧走 native policy 已由差分覆盖）
 # 结果行落 out/compat-results.tsv；任一 FAIL 则退出码非 0。
@@ -61,6 +62,10 @@ CREATE USER IF NOT EXISTS 'probe'@'%' IDENTIFIED WITH caching_sha2_password BY '
 GRANT ALL PRIVILEGES ON *.* TO 'probe'@'%';
 FLUSH PRIVILEGES;
 SQL
+    # T17 修复轮 1：插件实证落日志（root + probe 实际 plugin 值逐行打印，
+    # caching_sha2 声明自此有 artifact 背书），随后 grep 仍作硬断言。
+    docker exec "$PROBE_NAME" mysql -uroot -N -e \
+      "SELECT CONCAT('plugin proof: ', user, '@', host, ' -> ', plugin) FROM mysql.user WHERE user IN ('root','probe')"
     docker exec "$PROBE_NAME" mysql -uroot -N -e \
       "SELECT CONCAT('probe plugin=', plugin) FROM mysql.user WHERE user='probe'" | grep -q "plugin=caching_sha2_password"
     ./target/debug/my2sql-rs to-sql \
@@ -80,6 +85,18 @@ SQL
 }
 
 for v in $VERSIONS; do ensure_image "$v"; done
+
+# T17 修复轮 1：PROBE_ONLY=1 只重跑 8.4 caching_sha2 探针（复用既有
+# out/difftest-8.4/BINLOG + data/8.4 产物，不碰版本用例与全量 tsv——
+# 结果行落 out/compat-probe-only.tsv），使插件实证日志可低成本再生。
+if [ -n "${PROBE_ONLY:-}" ]; then
+  RESULTS="$ROOT/out/compat-probe-only.tsv"; : > "$RESULTS"
+  ensure_image 8.4
+  probe_84_caching_sha2
+  echo "==== probe-only results ($RESULTS) ===="
+  cat "$RESULTS"
+  [ "$FAILS" -eq 0 ] && { echo "PROBE ONLY: GREEN"; exit 0; } || { echo "PROBE ONLY: FAIL"; exit 1; }
+fi
 
 for v in $VERSIONS; do
   case "$v" in

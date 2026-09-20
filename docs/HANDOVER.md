@@ -24,7 +24,8 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
 - 状态：**Task 17 已完成——全版本兼容矩阵 5.6/5.7/8.0/8.4 全绿（`make compat`
-  exit 0，9 用例；唯一真解码器 bug = 5.7 FDE CRC 尾误判，RED→GREEN 修复
+  exit 0，8 用例（修复轮 1 勘误：早先误记 9，tsv 实为 8 行）；唯一真解码器
+  bug = 5.7 FDE CRC 尾误判，RED→GREEN 修复
   `b8f401c`，结果表 docs/compat/matrix.md，见下 Task 17 节点）**。前序：
   Task 15 golden 差分基建（8.0 矩阵 21/21 全绿，
   工具链 tools/{docker-mysql,run-difftest}.sh + gen-data.sql + 比较器 +
@@ -742,7 +743,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 ### Task 17: 全版本兼容矩阵 5.6/5.7/8.0/8.4（全绿）
 
-- 交付物：`tools/compat-matrix.sh`（9 用例编排 + 8.4 caching_sha2 探针，
+- 交付物：`tools/compat-matrix.sh`（8 用例编排 + 8.4 caching_sha2 探针，
   复用 run-difftest 入口不复制步骤）、`docs/compat/matrix.md`（结果表 +
   排除清单 + 真机勘误）、Makefile `compat` 目标。run-difftest.sh 扩展
   （全 env 开关，默认行为与 T15 一致）：`CKSUM=none|crc32`（透传
@@ -767,7 +768,8 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   三门禁复跑：cargo test 240+3+4 绿 / clippy -D / fmt。
 - 实测勘误（brief 假设 vs 真机）：① 5.6.51 默认 **CRC32**（非 NONE）且默认
   产 **V2** rows 事件（V1 需 log_bin_use_v1_row_events=1——矩阵加测该用例，
-  事件普查 10W/6D/3U 全 V1 确认）；② 8.4.11
+  事件普查 10W/6U/3D 全 V1 确认（修复轮 1：U/D 曾误记为 D/U；普查现为
+  run-difftest 步骤 3.5 实证硬门，产物 out/difftest-5.6-v1rows/EVENT_CENSUS.txt））；② 8.4.11
   `--authentication-policy=mysql_native_password` **启动失败**（MY-013797，
   native 插件默认 OFF）——正确姿势 `--mysql-native-password=ON` + 建库后
   `ALTER USER 'root'@'%'` 为 native（docker-mysql.sh 已按实测改）；

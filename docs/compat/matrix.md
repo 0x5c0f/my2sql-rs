@@ -4,8 +4,13 @@
 结果表 `out/compat-results.tsv`）。裁判 = Go my2sql（reference 未改动）；
 比较器/白名单 = Task 15 基建，本任务**零放宽、零新增白名单规则**。
 
-- 测试日期：2026-09-21
-- 被测源码 commit：`b8f401c`（fix(task-12) FDE checksum 探针修正；其前为 a7c88eb）
+- 测试日期：2026-09-21（修复轮 1 同日：5.6-v1rows 用例与 8.4 探针按新门重跑，
+  其余 6 用例沿用全跑数据）
+- 用例数：**8**（`out/compat-results.tsv` 8 行 = 版本差分用例 7 +
+  8.4 在线探针 1；修复轮勘误：早先报告误记 9）
+- 被测源码 commit：`b8f401c`（fix(task-12) FDE checksum 探针修正；其前为 a7c88eb）；
+  修复轮 1 重跑（仅 v1rows 用例 + 8.4 探针）落在其后的 fix(task-17) 提交上，
+  解码器代码与矩阵判定不因重跑改变
 - 镜像实测版本：mysql:5.6.51 / 5.7.44 / 8.0.46 / 8.4.11（官方 docker 镜像）
 
 ## 结果表
@@ -27,13 +32,16 @@
 ⁴ 8.4 专项（brief 要求）：原版启动（不传任何 auth policy，默认插件
 caching_sha2_password），显式建 `IDENTIFIED WITH caching_sha2_password` 探针
 用户，`to-sql --uri` 走该用户读在线 schema（无 TLS，RSA full-auth 握手），
-产物与 native-auth 差分跑**逐字节一致**。日志 `out/compat-8.4-sha2.log`。
+产物与 native-auth 差分跑**逐字节一致**。日志 `out/compat-8.4-sha2.log`；
+修复轮 1 起该日志含插件实证行（逐行打印 `mysql.user` 的
+`probe@% -> caching_sha2_password` 等），由 `PROBE_ONLY=1 bash
+tools/compat-matrix.sh` 重跑生成（探针步骤全脚本化，声明自此有 artifact 背书）。
 
 ## 加测用例（超出版本轴）
 
 | 用例 | 内容 | 结果 |
 |---|---|---|
-| 5.6-v1rows | `--log-bin-use-v1-row-events=1`：5.6 真机产 **V1 rows 事件（23/24/25）**，V1 解码路径（decode_rows v2=false）首次真机全类型走读 | PASS 19/19 组（事件普查确认 10×23/6×24/3×25，零 V2） |
+| 5.6-v1rows | `--log-bin-use-v1-row-events=1`：5.6 真机产 **V1 rows 事件（23/24/25）**，V1 解码路径（decode_rows v2=false）首次真机全类型走读 | PASS 19/19 组。事件普查为**实证硬门**（run-difftest 步骤 3.5，`tools/event-census.py` 走读事件头，无需 mysqlbinlog）：23(WRITE_V1)×10 / 24(UPDATE_V1)×6 / 25(DELETE_V1)×3，V2(30/31/32)=0、V0=0，产物 `out/difftest-5.6-v1rows/EVENT_CENSUS.txt`（修复轮 1 重跑生成）。普查勘误：修复前矩阵/报告把 6/3 记成 DELETE/UPDATE，实为 **UPDATE×6 / DELETE×3**（与 gen-data-5.6.sql 的 6 UPDATE + 3 DELETE 语句数吻合）；10/6/3 总数与"零 V2"结论不变 |
 
 ## 每版本排除/裁剪清单（矩阵级，非白名单放宽）
 
@@ -67,4 +75,6 @@ caching_sha2_password），显式建 `IDENTIFIED WITH caching_sha2_password` 探
 make compat                      # 全矩阵（约 10 分钟，需 docker + /opt/go/bin）
 VERSIONS="5.7" make compat       # 单版本调试（用例集仍含 checksum 双态）
 KEEP=1 VER=5.7 CKSUM=none bash tools/run-difftest.sh   # 失败保容器
+VER=5.6 V1ROWS=1 bash tools/run-difftest.sh            # 单跑 v1rows（含事件普查门）
+PROBE_ONLY=1 bash tools/compat-matrix.sh               # 单跑 8.4 探针（不碰全量 tsv）
 ```

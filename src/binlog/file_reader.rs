@@ -687,6 +687,43 @@ mod tests {
         assert_eq!(r.next().unwrap_err(), BinlogError::ChecksumMismatch);
     }
 
+    // ---------- T17 修复轮 1：无尾 FDE 兜底分支钉死（handle_fde else 臂） ----------
+
+    #[test]
+    fn no_tail_fde_with_none_alg_decodes_as_checksumless_stream() {
+        // 钉死语义（log_event.cc FDE 行为的本仓库立场，b8f401c 判定次序）：
+        // 5.6.1~5.6.x 部分构建的 FDE **不带 CRC 尾**（checksum_event 未随体）
+        // → `fde_checksum_ok` 不过 → 回退按「无尾形态」解读：body 末字节即
+        // checksum alg 字节。alg=0（NONE）→ 流按无校验解码（with_crc=false），
+        // 后续事件照常产出——不得因探针失败误报 ChecksumMismatch。
+        // （合成件 = 97B FDE 体 [ver4|server|ts|hdr_len 19|ethl×39|alg=0]，无尾。）
+        let mut s = Synth::start();
+        s.crc = false;
+        s.push_fde(4, "5.6.51", 0);
+        let (tm_start, _) = s.table_map(7, "t10", "u", 1001);
+        s.write_rows(7, 1002);
+        let mut r = reader(&s, Filters::none());
+        let evs = collect(&mut r);
+        assert_eq!(evs.len(), 1, "无尾 NONE FDE 必须整流可解");
+        assert_eq!(evs[0].kind, RawKind::Rows(RowsKind::Write, true));
+        assert_eq!(evs[0].start_pos, tm_start);
+        assert!(!r.with_crc, "alg 字节（无尾体末）=0 → NONE 态");
+    }
+
+    #[test]
+    fn no_tail_fde_claiming_crc32_is_rejected_as_checksum_mismatch() {
+        // 钉死语义（alg mismatch 路径）：FDE 验证不过（无合法 CRC 尾）而体末
+        // alg 字节声称 CRC32(=1) → mysqld 的 CRC32 流 FDE 恒带尾（T17 真机
+        // 5.6.51/5.7.44/8.x 实测 + log_event.cc 写盘次序），无尾+声称 CRC32
+        // 只可能是损坏/改写件 → 必须 BinlogError::ChecksumMismatch 硬拒，
+        // 不得静默降级成 NONE 流丢弃全文件校验保护。
+        let mut s = Synth::start();
+        s.crc = false;
+        s.push_fde(4, "5.6.51", 1); // 无尾，但 alg 字节 = CRC32
+        let mut r = reader(&s, Filters::none());
+        assert_eq!(r.next().unwrap_err(), BinlogError::ChecksumMismatch);
+    }
+
     #[test]
     fn fixture_5_7_checksum_none_fde_carries_crc_tail() {
         // T17 真机回归（mysql:5.7.44, --binlog-checksum=none, mysql-bin.000003

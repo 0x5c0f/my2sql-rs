@@ -1,6 +1,6 @@
 -- Task 17：5.6 矩阵级裁剪版 gen-data（与 gen-data.sql 逐行同源，仅剔 JSON 单元格）
 -- 剔除依据：MySQL 5.6 无 JSON 类型（5.7.8 引入）→ t_all.c_json 列、t_json 专表、
--- 事务内 UPDATE t_json 全部去除；其余 20 组保持与 8.0 矩阵一致（覆盖最大化）。
+-- 事务内 UPDATE t_json 全部去除；其余 19 组保持与 8.0 矩阵一致（覆盖最大化）。
 -- 排除登记：docs/compat/matrix.md（矩阵级排除，非白名单放宽；NOTE ALW-56-JSON 落地）。
 -- 注意：改动 gen-data.sql 时本文件必须同步（run-difftest.sh 按 VER 自动选择本文件）。
 SET SESSION sql_mode='';            -- 放行零日期/零时间/空 ENUM（矩阵需要）

@@ -8,6 +8,9 @@
 #   V1ROWS=1              v1 rows 事件模式（docker-mysql.sh 透传；产物目录加后缀）
 #   gen-data-$VER.sql 存在则优先（5.6 无 JSON 类型的矩阵级裁剪）
 #   步骤 7 = 离线 schema 回放（在线 dump → --schema-file 重跑 → 与在线输出逐字节对差分）
+#   步骤 3.5（仅 V1ROWS=1）= binlog 事件类型普查（tools/event-census.py，纯 stdlib
+#   走读事件头，无需镜像内 mysqlbinlog）；产物 $OUT/EVENT_CENSUS.txt，
+#   硬断言行事件全 V1（23/24/25 齐、30/31/32 零），违例即用例 FAIL（T17 修复轮 1）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -24,7 +27,8 @@ echo "== [2/7] build rust (debug) + go oracle"
 cargo build --quiet
 (export PATH="$PATH:/opt/go/bin"; cd reference/my2sql-go && go build -o ../../tools/bin/my2sql-go .)
 
-ROWSMODE=V2; [ -n "${V1ROWS:-}" ] && ROWSMODE=V1
+# T17 修复轮 1：裸 `[ ] &&` 同型隐患 → 显式 if（见 docker-mysql.sh 注释）
+if [ -n "${V1ROWS:-}" ]; then ROWSMODE=V1; else ROWSMODE=V2; fi
 echo "== [3/7] mysql:$VER container + data matrix (checksum=${CKSUM:-server-default}, rows=$ROWSMODE)"
 # 清空 datadir（999 属主文件宿主不可删——借 root 容器 wipe，保证每次全新状态）
 if [ -d "data/$VER" ]; then
@@ -48,6 +52,11 @@ echo "$BIN" > "$OUT/BINLOG"
 # binlog 属 uid999(mode 640) 宿主不可读——root 助手容器放开读取（datadir 遍历 + binlog 可读）
 docker run --rm -u 0 -v "$ROOT/data/$VER:/d" --entrypoint sh mysql:"$VER" \
   -c "find /d -maxdepth 1 -name 'mysql-bin*' -exec chmod a+r {} + && chmod a+rX /d" >/dev/null
+
+if [ -n "${V1ROWS:-}" ]; then
+  echo "== [3.5/7] event-type census (V1ROWS=1 hard gate → $OUT/EVENT_CENSUS.txt)"
+  python3 tools/event-census.py "data/$VER/$BIN" --assert-v1-only | tee "$OUT/EVENT_CENSUS.txt"
+fi
 
 echo "== [4/7] go oracle (-mode file -work-type 2sql, TZ=UTC)"
 (export TZ=UTC; cd "$OUT/go" && "$ROOT/tools/bin/my2sql-go" \

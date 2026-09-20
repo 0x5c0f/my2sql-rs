@@ -79,3 +79,97 @@ checksum 覆盖口径：实测四个镜像默认**均为 CRC32**，NONE 路径�
   "COMPAT MATRIX: ALL GREEN"）。
 - src 有改动 → cargo test（247 用例）/ clippy -D warnings / fmt 三门全绿。
 - `docker ps -a` 无 my2sql-dt-*/my2sql-t17-* 残留。
+
+---
+
+## Fix round 1（2026-09-21，审阅者清零项；本节为追加，上文历史不改写）
+
+审阅发现 6 项，全部处理。逐项结果：
+
+### 1. 用例数勘误：9/9 → **8/8**
+
+上文「全绿，9/9 用例」为误记：`out/compat-results.tsv` 恒 **8 行**
+（5.6-default/none/v1rows、5.7-default/none、8.0-default、8.4-default、
+8.4-caching_sha2-online = 7 差分用例 + 1 在线探针），且上表本身即 8 行。
+已在 docs/compat/matrix.md（新增「用例数：8」行）、docs/HANDOVER.md
+（当前进度 + Task 17 节点两处 9→8）与本报告（本节）三处钉正。
+
+### 2. V1ROWS 事件普查：从口头声明 → 实证硬门 + artifact
+
+- 新增 `tools/event-census.py`（纯 stdlib：fe'bin' 校验 → 19B 公共头走读，
+  type 字节@4、event_size@9 → 类型计数 + rows V0/V1/V2 汇总；
+  `--assert-v1-only` 硬断言 23/24/25 齐、30/31/32 零、无 V0，违例 rc=1）。
+- `tools/run-difftest.sh` 新步骤 **3.5/7**（仅 V1ROWS=1 触发）：对数据
+  binlog 跑普查，`tee $OUT/EVENT_CENSUS.txt`；set -e + pipefail 下断言失败
+  = 用例 FAIL。事件编号对照 MySQL event_codes.h，与 file_reader.rs 路由表
+  （23→Write、24→Update、25→Delete）一致。
+- **单用例重跑**（VER=5.6 CKSUM= V1ROWS=1，复刻 run_case 全部命令）：
+  rc=0，`out/compat-5.6-v1rows.log` +
+  `out/difftest-5.6-v1rows/EVENT_CENSUS.txt` 重新生成。
+- **普查结果（mysql-bin.000004，76 事件）**：23 WRITE_ROWS_V1 ×**10**、
+  24 UPDATE_ROWS_V1 ×**6**、25 DELETE_ROWS_V1 ×**3**；30/31/32 全零；20/21/22
+  全零。**结论 = 部分证实 + 部分勘误**：总数 10/6/3 与「零 V2、全 V1」
+  证实；但原声明「6×DELETE_V1/3×UPDATE_V1」把 U/D **写反**——真机为
+  UPDATE×6 / DELETE×3（与 gen-data-5.6.sql 的 6 条 UPDATE + 3 条 DELETE
+  语句数独立吻合）。matrix.md 已改写为 artifact 引用式表述并记勘误；
+  HANDOVER 的「10W/6D/3U」同步改「10W/6U/3D」。
+
+### 3. docker-mysql.sh 8.0 臂 set -e 隐患
+
+- 8.0 臂 `[ cond ] && EXTRA+=(...)` 已重写为显式 if；同型的
+  `[ -n CKSUM ] && ...`、`[ -n V1ROWS ] && ...` 两行与 run-difftest.sh 的
+  `ROWSMODE` 行一并转 if。
+- **如实记录**：审阅声称的 abort（AUTH=stock VER=8.0 → 空端口）在本机
+  bash 5.2.21 **不可复现**——git HEAD 原脚本 + stub docker 干跑，
+  AUTH=stock VER=8.0 正常打印端口、rc=0（bash 对 `&&` 列表非末位命令的
+  set -e 豁免）。但该模式依赖豁免规则（函数化/重构即成雷），属真隐患，
+  按审阅要求清除。验证：`bash -n` 三脚本全过；stub-docker 干跑改后脚本
+  AUTH=stock VER=8.0 → 端口输出、`docker run` 实参不含 native plugin 旗标；
+  真机 AUTH=stock 路径由本轮 8.4 探针重跑（item 6）同型覆盖。
+
+### 4. FDE 无尾兜底分支单测（src，TDD）
+
+`handle_fde` else 臂（file_reader.rs:166）此前无任何命名测试钉死
+（旁证：既有 with_fde(false) 合成用例顺路走过 body[-1]=0 分支，但语义
+未声明、翻转不可见）。新增两测试，钉**现行有意语义**
+（log_event.cc 立场：CRC32 流的 FDE 恒带尾，T17 真机四版本实证）：
+
+- `no_tail_fde_with_none_alg_decodes_as_checksumless_stream`：5.6 式无尾
+  FDE、体末 alg=0 → 按无校验流解码、with_crc=false、整流可用。
+- `no_tail_fde_claiming_crc32_is_rejected_as_checksum_mismatch`：无尾但
+  体末 alg=1 且 FDE 验证不过 → 只可能损坏/改写 → `ChecksumMismatch`
+  硬拒，不得静默降级丢全文件校验。
+
+RED 证据（pinned-semantics 测试无旧 bug 可红，用变异证明分支真实咬合）：
+- `== 1` → `!= 1`：两测试**双双 RED**（none 被误拒、CRC32 声称不再拒）；
+- `== 1` → `false`：reject 测试 RED（unwrap_err on Ok）；
+- 还原后两测试 GREEN。全量 cargo test/clippy -D/fmt 见门禁节。
+
+### 5. gen-data-5.6.sql:3 注释
+
+「其余 20 组」→「其余 19 组」（比较器计数 A=19，与矩阵级剔除 2 处一致）。
+
+### 6. 8.4 探针插件实证入日志
+
+- `probe_84_caching_sha2` 在建 probe 用户后新增逐行打印
+  `SELECT CONCAT('plugin proof: ',user,'@',host,' -> ',plugin) FROM
+  mysql.user WHERE user IN ('root','probe')`（块重定向 →
+  `out/compat-8.4-sha2.log`）；原 `grep -q` 硬断言保留。
+- 新增 `PROBE_ONLY=1 bash tools/compat-matrix.sh` 门（只重跑探针、结果落
+  独立 `out/compat-probe-only.tsv`，不碰全量 tsv/用例）。
+- **已真机重跑**（非"待重跑"）：PROBE_ONLY=1 全绿，日志实证行 =
+  `probe@% -> caching_sha2_password`（探针用户，to-sql --uri 即走它）、
+  `root@% -> mysql_native_password`（datadir 承自 native 差分跑的持久化
+  ALTER，如实记录）、`root@localhost -> caching_sha2_password`；
+  to-sql 产物与 native 跑 `diff -r` 全等。矩阵 8.4 探针行判定不变。
+
+### Fix round 1 门禁
+
+- `bash -n`：compat-matrix.sh / run-difftest.sh / docker-mysql.sh 全过；
+  event-census.py py_compile 过。
+- src 改动：cargo test 全绿（lib 242（1 ignored）+ 集成 3 + 4，含新增两
+  fallback 测试）/ clippy 语法见下 / fmt 干净
+  `cargo clippy --all-targets -- -D warnings` 干净 / `cargo fmt --all --check` 干净。
+- 重跑集：v1rows 用例 rc=0（含 3.5 普查门）、8.4 探针 rc=0；
+  其余 6 用例沿用 8cda7e8 全跑数据（判定与代码均未变）。
+- `docker ps -a`：无 my2sql-* 残留。
