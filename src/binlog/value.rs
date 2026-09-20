@@ -183,7 +183,8 @@ fn time_v1_text(v: u64) -> String {
     if v == 0 {
         return "00:00:00".into();
     }
-    format!("{}:{:02}:{:02}", v / 10_000, v / 100 % 100, v % 100)
+    // T9 校准：Go `%02d:%02d:%02d`（row_event.go:1105）——hour 也零位左补。
+    format!("{:02}:{:02}:{:02}", v / 10_000, v / 100 % 100, v % 100)
 }
 
 /// 值分发主入口：从 `buf[*pos..]` 按 `ctx` 解码一列，成功时 `pos` 前进到
@@ -200,7 +201,9 @@ pub fn decode_value(buf: &[u8], pos: &mut usize, ctx: &ColCtx) -> Result<ColumnV
         let b0 = (m >> 8) as u8;
         let b1 = (m & 0xFF) as u8;
         if b0 & 0x30 != 0x30 {
-            m = b1 as u16 | ((((b0 & 0x30) ^ 0x30) << 4) as u16);
+            // T9 校准：对照 go-mysql :1013 `uint16(b1) | (uint16((b0&0x30)^0x30) << 4)`
+            // ——**先转 u16 再移位**；旧写法在 u8 域移位使 {0x10,0x20,0x30}<<4 全截为 0。
+            m = b1 as u16 | (((b0 & 0x30) ^ 0x30) as u16) << 4;
             tp = b0 | 0x30;
         } else {
             m = b1 as u16;
@@ -536,6 +539,14 @@ mod tests {
             ),
             s("10:44:09")
         );
+        // T9 校准：hour<10 必须零位左补（Go `%02d:%02d:%02d`）——90506 → "09:05:06"
+        assert_eq!(
+            dv(
+                &[0x8A, 0x61, 0x01], // 90506
+                &ColCtx::new(tp::TIME, 0, &sc("time"))
+            ),
+            s("09:05:06")
+        );
         // 838:59:59（TIME 上限，>24h）
         assert_eq!(
             dv(
@@ -548,6 +559,30 @@ mod tests {
             dv(&[0, 0, 0], &ColCtx::new(tp::TIME, 0, &sc("time"))),
             s("00:00:00")
         );
+    }
+
+    /// T9 校准：STRING 前奏 if 分支（b0&0x30 != 0x30，旧伪装形态）的还原长度
+    /// 高位必须按 go-mysql :1013 `uint16((b0&0x30)^0x30) << 4` 先转宽再移位——
+    /// u8 域移位会把 {0x10,0x20,0x30}<<4 全部截成 0。
+    /// 用例（合成，前奏规则穷举 b0&0x30 的三个非 0x30 值）：b0∈{0xCD,0xDD,0xED}
+    /// 均还原 tp=b0|0x30=0xFD(VAR_STRING)，length=b1|{0x300,0x200,0x100} ≥256
+    /// → 行内 2B LE 前缀（decodeString :1173-1185 用还原后的 length 判前缀宽）。
+    #[test]
+    fn string_preamble_if_branch_restores_high_bits() {
+        for (b0, hi) in [(0xCDu8, 0x300u16), (0xDD, 0x200), (0xED, 0x100)] {
+            let meta = ((b0 as u16) << 8) | 0x01; // b1 = 1
+            // 2B LE 前缀 = 1，payload 'a'；u8 截断 bug 会按 1B 前缀少读 1 字节、
+            // 且 payload 变成 [0x00]——两侧夹击，pos 与值都能钉死。
+            assert_eq!(
+                dv(
+                    &[0x01, 0x00, b'a'],
+                    &ColCtx::new(tp::STRING, meta, &sc("varbinary"))
+                ),
+                s("a"),
+                "b0={b0:#04X} 应还原 length={:#X}",
+                hi | 0x01,
+            );
+        }
     }
 
     #[test]

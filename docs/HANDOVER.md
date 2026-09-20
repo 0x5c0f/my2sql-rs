@@ -65,9 +65,11 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   - `parse_header(&[u8]) -> Result<EventHeader, BinlogError>`（<19 字节 → TooShort）。
   - `strip_checksum(&mut Vec<u8>, with_crc: bool)`（尾部剥 4 字节；<4 字节时不动）。
   - `crc32_ok(&[u8]) -> bool`（crc32fast 前 len-4 比对尾 4 字节小端；<4 字节 → false）。
-  - `EventType` 常量：QUERY=2 CREATE_DB=3 ROTATE=4 FORMAT_DESC=15 XID=16 TABLE_MAP=19
-    HEARTBEAT=27 WRITE/UPDATE/DELETE_ROWS_V1=30/31/32 GTID_LOG=33 V2=34/35/36
-    PREVIOUS_GTIDS=37 ANONYMOUS_GTID_LOG=119（brief 内 "XID=15?" 注释为历史噪声，以本表为准）。
+  - `EventType` 常量：QUERY=2 STOP=3 ROTATE=4 FORMAT_DESC=15 XID=16 TABLE_MAP=19
+    HEARTBEAT=27 GTID_LOG=33；rows 三代 V0=20/21/22、V1=23/24/25、V2=30/31/32、
+    ANONYMOUS_GTID=34、PREVIOUS_GTIDS=35（T9 后校准补丁定稿，逐一对照
+    log_event.h / const.go:54-87；原表 30/31/32=V1、34/35/36=V2、37=PREVIOUS_GTIDS、
+    ANON=119、CREATE_DB=3 均为误标，已勘误）。
 - 依赖调整（Task 1 遗留债务）：移除了直接依赖 `mysql_common 0.38.2`（src 内零引用，
   与 mysql 28 传递依赖的 0.37.3 双版本共存）。Task 3 若需 LNE 等原语，按 mysql 28
   对齐补 `mysql_common 0.37` 或直接手写，勿再引入 0.38。
@@ -76,6 +78,14 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `#[cfg(test)] mod tests` 内自足）；Task 15 引入 lib 目标后可 `mod fixtures;` 复用。
 - 遗留：event.rs / error.rs 顶部有临时 `#![allow(dead_code)]`（骨架阶段无生产消费者，
   沿 Task 1 惯例），Task 12+ 接入管道后移除。
+- （T9 后校准补丁）ALARM A 勘误：原常量表 rows V1=30/31/32、V2=34/35/36、
+  PREVIOUS_GTIDS=37、ANONYMOUS_GTID=119 全部错档（源自简报误抄，T2 当时未对照
+  const.go 实码）。已改为 V0=20/21/22、V1=23/24/25、V2=30/31/32、GTID=33、
+  ANON=34、PREVIOUS_GTIDS=35，CREATE_DB=3 更名 STOP=3；新增 fixture 回归
+  `fixture_8_0_event_type_sequence`（真实 8.0 抓包走读，序列 15,35,34,2,34,2,19,30,16）。
+  附带发现（未改，非本补丁范围）：FDE 的 crc32 校验区须排除公共头末 4B，
+  现 `crc32_ok` 对 FDE 整件校验必失败（fixture 实测其余 8 件全过）——T12 接入
+  逐事件校验时处理。
 
 ### Task 3: 协议原语（LNE / bitmap cursor）
 
@@ -115,9 +125,20 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
     零尾随字节 → `Ok(空)`（pre-8.0/无 metadata 合法）；否则要求长度前缀
     （1B，=255 转义为后随 2B LE）+ **恰好 n_cols 条**完整 LNE 且无多余尾随字节，
     任一不满足 → `Err(InvalidData("unsupported table_map optional metadata / charset
-    section: …"))`（D5：不支持的元数据必须报错、不得猜测）。MySQL 8.0
+    section: …"))`（D5：不支持的元数据必须报错、不得猜测）。~~MySQL 8.0
     `binlog_row_metadata=FULL` 的 TLV optional metadata（2B LE total_length +
-    type/LNE长/值 条目）会被明确拒绝，完整 TLV 解析留 Task 15。
+    type/LNE长/值 条目）会被明确拒绝，完整 TLV 解析留 Task 15~~（T9 后校准补丁
+    已实现 TLV 解析，见下）。
+- （T9 后校准补丁）ALARM B 修复：真机 8.0.46（MINIMAL）null_bits 后为**无前导
+  total_length** 的 TLV 流（fork `decodeOptionalMeta` row_event.go:241-321 即如此，
+  原文档「2B LE total_length」表述系臆断，已删）。现两形态分流：legacy 精确覆盖
+  → 原严格数组解析（5.6/5.7 既有测试全保留）；否则 TLV 迭代到 body 末尾——
+  #1 signedness 消费不存（P1 裁定 unsigned 来自 schema DDL）、#2/#10 默认字符集
+  奇数项校验、#3 column charset 存入 `charset`、#4/#5/#6/#7/#8/#9/#11 结构校验、
+  未知 type 跳过（vendored fork default 臂 "Ignore for future extension"，
+  my2sql-go 无任何 ignore 开关调用，参考工具有效行为即跳过）；截断一律报错。
+  Fixture 回归 `fixture_8_0_table_map_parses_with_real_tlv_opt_meta` 钉死真机件
+  （26 列 meta/null_bits 全量断言，TLV `01 01 40|02 0d …|07 01 00` 完整消费）。
 - 遗留：table_map.rs 顶部 `#![allow(dead_code)]`；schema/table 用 `String::from_utf8`
   （非法 UTF-8 → InvalidData，真机库表名均为 UTF-8 可行）。
 
@@ -323,6 +344,18 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   decode_meta 匹配臂经真机校验、动它需独立评审轮；建议 T10 统一 int.rs+value.rs
   两份（官方值），table_map.rs 一份保留或同轮处理。
 
+## 校准记录
+
+- **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
+  第二权威）：① ALARM A——event.rs 事件码表勘误（V0=20/21/22、V1=23/24/25、
+  V2=30/31/32、GTID=33、ANON=34、PREVIOUS_GTIDS=35、STOP=3；详见 Task 2 节点）；
+  ② ALARM B——table_map.rs 接受 8.0 TLV optional metadata（无前导 total_length，
+  镜像 fork `decodeOptionalMeta`；未知条目跳过、截断报错；详见 Task 4 节点）；
+  ③ value.rs STRING 前奏 if 分支先转 u16 再 `<<4`（原 u8 域移位把 {0x10,0x20,0x30}
+  全截成 0，Go row_event.go:1013 口径；该分支从零覆盖 → 新增合成穷举测试）；
+  ④ V1 TIME hour 零位左补 `{:02}`（Go `%02d`）。TDD：每项先 RED 后 GREEN；
+  test/clippy/fmt 三门全绿。
+
 ## 环境事实
 
 - 本机：docker（镜像 mysql:5.6/5.7/8.0 已就绪，8.4 需拉取）、Go 工具链 /opt/go/bin、cargo/rustc 最新 stable
@@ -337,8 +370,8 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] spec §4.6 ENUM/SET 名称注释 → 推迟至 P2
 - [ ] T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）
 - [ ] T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数
-- [ ] T15 校准：8.0 TLV opt-meta 真实解析、5.7 signedness bitmap、T4 charset 形状拒绝的构造性误判
-- [ ] **T2 勘误（T9 真机证实，T10/T12 必须处理）**：event.rs 事件码表与实际 8.0 binlog 不符——真机 PREVIOUS_GTIDS=35、GTID=33/ANON_GTID=34、rows V2 事件头含 extra-info；event.rs 把 30/31/32 标成 V1 且 ANONYMOUS_GTID=119 错误。修正归属 T10（行事件读取含 extra-info 跳过）。
-- [ ] **T4 勘误（T9 真机捕获）**：8.0.46 真实 TLV optional-metadata 字节 `010140020dfcff00000b083f093f0a3f0b3f070100`（null_bits 后）——T4 严格 LNE 解析器会拒绝真实 8.0 table map；T15 TLV 完整解析前需放宽/分支（捕获件 /tmp/t9probe）。
+- [ ] T15 校准：8.0 TLV opt-meta 已随 T9 后校准补丁真实解析（fixture 回归钉死）；剩余 = 5.7 signedness bitmap、与更多真机捕获（FULL 形态等）的差分校准。~~T4 charset 形状拒绝的构造性误判~~（已修：真机 8.0 件现 Ok，5.6/5.7 legacy 严格形态测试全保留）。
+- [x] ~~**T2 勘误（T9 真机证实）**：event.rs 事件码表错档（30/31/32 标 V1、ANON=119 等）~~——T9 后校准补丁已按 const.go:54-87 勘误并加 fixture 走读回归；**残余子项归 T10**：rows V2 事件 extra-info（固定公共段后、行体前的可选 4B）读取跳过。
+- [x] ~~**T4 勘误（T9 真机捕获）**：T4 严格 LNE 解析器拒绝真实 8.0 TLV optional-metadata~~——T9 后校准补丁实现 fork 同构 `decodeOptionalMeta` 镜像（无总长前缀、未知项跳过、截断报错），`tests/fixtures/capture_8.0_minimal/` 真机 TABLE_MAP 回归通过（捕获件 /tmp/t9probe 亦同源）。
 - [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义

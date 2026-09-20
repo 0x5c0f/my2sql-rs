@@ -11,27 +11,33 @@ use super::error::BinlogError;
 /// 公共事件头长度：timestamp(4)+type(1)+server_id(4)+event_size(4)+log_pos(4)+flags(2)。
 pub const EVENT_HEADER_SIZE: usize = 19;
 
-/// 事件类型（u8 newtype，数值与 MySQL 官方 / go-mysql EventType 常量一致）。
+/// 事件类型（u8 newtype，数值与 MySQL 官方 log_event.h / go-mysql
+/// `replication/const.go:54-87` 一致——T9 校准修正，见 `event_type_constants_match_mysql`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventType(pub u8);
 
 impl EventType {
     pub const QUERY: u8 = 2;
-    pub const CREATE_DB: u8 = 3;
+    /// 原表误标 `CREATE_DB=3`；const.go:54-87 中 3 为 STOP_EVENT（v3 时代停用，
+    /// 无消费者），本补丁按权威勘误为 STOP，值不变。
+    pub const STOP: u8 = 3;
     pub const ROTATE: u8 = 4;
     pub const FORMAT_DESC: u8 = 15;
     pub const XID: u8 = 16;
     pub const TABLE_MAP: u8 = 19;
+    pub const WRITE_ROWS_V0: u8 = 20;
+    pub const UPDATE_ROWS_V0: u8 = 21;
+    pub const DELETE_ROWS_V0: u8 = 22;
+    pub const WRITE_ROWS_V1: u8 = 23;
+    pub const UPDATE_ROWS_V1: u8 = 24;
+    pub const DELETE_ROWS_V1: u8 = 25;
     pub const HEARTBEAT: u8 = 27;
-    pub const WRITE_ROWS_V1: u8 = 30;
-    pub const UPDATE_ROWS_V1: u8 = 31;
-    pub const DELETE_ROWS_V1: u8 = 32;
+    pub const WRITE_ROWS_V2: u8 = 30;
+    pub const UPDATE_ROWS_V2: u8 = 31;
+    pub const DELETE_ROWS_V2: u8 = 32;
     pub const GTID_LOG: u8 = 33;
-    pub const WRITE_ROWS_V2: u8 = 34;
-    pub const UPDATE_ROWS_V2: u8 = 35;
-    pub const DELETE_ROWS_V2: u8 = 36;
-    pub const PREVIOUS_GTIDS: u8 = 37;
-    pub const ANONYMOUS_GTID_LOG: u8 = 119;
+    pub const ANONYMOUS_GTID_LOG: u8 = 34;
+    pub const PREVIOUS_GTIDS: u8 = 35;
 }
 
 /// binlog 事件公共头（19 字节，小端）。
@@ -134,41 +140,90 @@ mod tests {
 
     #[test]
     fn event_type_constants_match_mysql() {
+        // 数值逐一对照 MySQL 官方 log_event.h（enum Log_event_type）与 vendored
+        // go-mysql replication/const.go:54-87（iota 序）：rows V0=20/21/22、
+        // V1=23/24/25、V2=30/31/32、GTID=33、ANONYMOUS_GTID=34、
+        // PREVIOUS_GTIDS=35（T9 审阅校准：原表把 V2 标成 V1、ANON 写成 119 均系误标）。
         let actual = [
             ("QUERY", EventType::QUERY),
             ("ROTATE", EventType::ROTATE),
             ("FORMAT_DESC", EventType::FORMAT_DESC),
             ("XID", EventType::XID),
             ("TABLE_MAP", EventType::TABLE_MAP),
-            ("HEARTBEAT", EventType::HEARTBEAT),
+            ("WRITE_ROWS_V0", EventType::WRITE_ROWS_V0),
+            ("UPDATE_ROWS_V0", EventType::UPDATE_ROWS_V0),
+            ("DELETE_ROWS_V0", EventType::DELETE_ROWS_V0),
             ("WRITE_ROWS_V1", EventType::WRITE_ROWS_V1),
             ("UPDATE_ROWS_V1", EventType::UPDATE_ROWS_V1),
             ("DELETE_ROWS_V1", EventType::DELETE_ROWS_V1),
-            ("GTID_LOG", EventType::GTID_LOG),
+            ("HEARTBEAT", EventType::HEARTBEAT),
             ("WRITE_ROWS_V2", EventType::WRITE_ROWS_V2),
             ("UPDATE_ROWS_V2", EventType::UPDATE_ROWS_V2),
             ("DELETE_ROWS_V2", EventType::DELETE_ROWS_V2),
-            ("PREVIOUS_GTIDS", EventType::PREVIOUS_GTIDS),
+            ("GTID_LOG", EventType::GTID_LOG),
             ("ANONYMOUS_GTID_LOG", EventType::ANONYMOUS_GTID_LOG),
+            ("PREVIOUS_GTIDS", EventType::PREVIOUS_GTIDS),
         ];
-        let expected: [(&str, u8); 15] = [
+        let expected: [(&str, u8); 18] = [
             ("QUERY", 2),
             ("ROTATE", 4),
             ("FORMAT_DESC", 15),
             ("XID", 16),
             ("TABLE_MAP", 19),
+            ("WRITE_ROWS_V0", 20),
+            ("UPDATE_ROWS_V0", 21),
+            ("DELETE_ROWS_V0", 22),
+            ("WRITE_ROWS_V1", 23),
+            ("UPDATE_ROWS_V1", 24),
+            ("DELETE_ROWS_V1", 25),
             ("HEARTBEAT", 27),
-            ("WRITE_ROWS_V1", 30),
-            ("UPDATE_ROWS_V1", 31),
-            ("DELETE_ROWS_V1", 32),
+            ("WRITE_ROWS_V2", 30),
+            ("UPDATE_ROWS_V2", 31),
+            ("DELETE_ROWS_V2", 32),
             ("GTID_LOG", 33),
-            ("WRITE_ROWS_V2", 34),
-            ("UPDATE_ROWS_V2", 35),
-            ("DELETE_ROWS_V2", 36),
-            ("PREVIOUS_GTIDS", 37),
-            ("ANONYMOUS_GTID_LOG", 119),
+            ("ANONYMOUS_GTID_LOG", 34),
+            ("PREVIOUS_GTIDS", 35),
         ];
         assert_eq!(actual, expected);
+    }
+
+    /// T9 校准回归：真实 8.0.46 抓包（binlog_row_metadata=MINIMAL，crc32 on）
+    /// 逐事件走读，断言事件类型序列与常量表一致。序列由 fixture 实测推得
+    /// （非简报猜测值）：FDE → PREVIOUS_GTIDS(35) → ANON_GTID(34) → QUERY(2)
+    /// → ANON_GTID(34) → QUERY(2,BEGIN) → TABLE_MAP(19) → WRITE_ROWS_V2(30) → XID(16)。
+    #[test]
+    fn fixture_8_0_event_type_sequence() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/capture_8.0_minimal/mysql-bin.000003"
+        );
+        let data = std::fs::read(path).expect("fixture must be committed");
+        assert_eq!(&data[..4], b"\xfebin");
+        let mut pos = 4usize;
+        let mut types = Vec::new();
+        while pos < data.len() {
+            let h = parse_header(&data[pos..]).unwrap();
+            let size = h.event_size as usize;
+            // 注：不对逐事件做 crc32_ok——FDE 的 CRC 校验区须再排除公共头末 4B
+            // （MySQL 规范），现 crc32_ok 不覆盖该特例（既有 T9 事实，非本补丁范围）。
+            types.push(h.event_type);
+            pos += size;
+        }
+        assert_eq!(pos, data.len());
+        assert_eq!(
+            types,
+            vec![
+                EventType(EventType::FORMAT_DESC),
+                EventType(EventType::PREVIOUS_GTIDS),
+                EventType(EventType::ANONYMOUS_GTID_LOG),
+                EventType(EventType::QUERY),
+                EventType(EventType::ANONYMOUS_GTID_LOG),
+                EventType(EventType::QUERY),
+                EventType(EventType::TABLE_MAP),
+                EventType(EventType::WRITE_ROWS_V2),
+                EventType(EventType::XID),
+            ]
+        );
     }
 
     #[test]
