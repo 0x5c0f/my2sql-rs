@@ -22,14 +22,17 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 ## 当前进度
 
 - 分支：`feat/p1`（main 只有文档）
-- 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成，P1 待终审**。
+- 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成；全分支终审
+  已做，唯一一轮终审修复（#1 decimal panic 闸 / #2 SHOW 标识符转义 / #3 本文
+  档口径修正）见 Task 16 节点「终审修复轮」与挂账清单**。
 - **P1 DoD 对账**（证据= Task 16 节点 + docs/bench/p1.md + docs/compat/matrix.md）：
   ① `make difftest` exit 0（8.0 矩阵 21/21 绿 + 离线回放逐字节，T16 复跑）；
   ② file 模式双 schema 源一致（`--uri` 在线 vs `--schema-file` 离线，
   difftest 第 7 步 `diff -r` 硬闸 + T17 矩阵 8 用例全过）；
   ③ 吞吐基线 ≥500MB @ threads=8 ≥40MB/s：**实测 108.9 MB/s（2.7×）**，
   release 态 criterion（`cargo bench --bench decode`，数据 `tools/gen-bench-binlog.sh`）；
-  ④ `tests/fuzz_seed/` 3 件坏事件语料，解码层断言 Err-不-panic（T16，兼 P4 corpus）；
+  ④ `tests/fuzz_seed/` 4 件坏事件语料（T16 三件 + 终审 #1 补 DECIMAL 满组
+  溢出件），解码层断言 Err-不-panic（兼 P4 corpus）；
   ⑤ test/clippy/fmt 三门全绿 + README 落地（本节点收尾复跑）。
   前序：Task 17 全版本兼容矩阵（8 用例全绿，唯一真解码器 bug 修复 `b8f401c`）；
   Task 15 golden 差分基建（21/21 绿，工具链 + 白名单）；Task 14 端到端装配
@@ -291,6 +294,16 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   UTF-8：键与字符串非法字节 → InvalidData（go 用 hack.String lossy）；
   ④ 空输入 → `Ok("")`（与 go decodeJsonBinary:76 一致，brief 未提，
   从权威）。
+  **终审勘误（决策日志续笔）**：上面「decodeDecimal 无守卫取下标…已封堵」
+  在写就时只覆盖了 json 复用路径的截断面——**残余洞**：被 T8/T12 复用的
+  `decode_decimal` 自身，损坏 4B 满组 XOR 还原出 ≥10 位 u32（如
+  0xFFFFFFFF^0x80000000）时组内左补零 `9 − t.len()` 下溢，debug
+  （subtract overflow）/release（repeat capacity）双 panic。终审（review
+  569d74e..a97f010）发现，fix 8bfe73a 封堵：满组值 > 999999999 →
+  InvalidData（DECIMAL(19,9) 敌意字节 `81 00 00 00 01 FF FF FF FF`，
+  单测双点位 + threads=1 e2e 直通泵回归 + `tests/fuzz_seed/` 第 4 件
+  `decimal_full_group_overflow.bin`）。「无 panic 路径」自该修复起方为
+  全真。
 - 与 MySQL 渲染语义的已核实细节：转义仅 `"` `\` 与 <0x20（\b\f\n\r\t，
   其余 `\u00xx` 小写 hex）；DEL/<>&/UTF-8 原样输出（id7 实抓）；TIME v==0
   → "00:00:00.000000"、DATETIME 零值 → "0000-00-00 00:00:00.000000"、
@@ -773,6 +786,17 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `cargo clippy --all-targets -- -D warnings` 零告警、`cargo fmt --check` 干净。
 - 遗留（不阻塞 P1）：吞吐 2.5× 扩展上限的画像优化（P4+，先 profile 再动）；
   bench 输入生成器依赖本机 docker + mysql:8.0 镜像（CI 化归 P4）。
+- **终审修复轮**（全分支终审 review 569d74e..a97f010 后唯一一轮，TDD 先红后绿）：
+  ① `fix(binlog)` 8bfe73a——`decode_decimal` 满组越界 `9 − t.len()` 下溢
+  panic 封堵（>999999999 → InvalidData，pos 不动），RED=敌意字节
+  `81 00 00 00 01 FF FF FF FF` 单测双点位 + threads=1 e2e 直通泵 abort +
+  fuzz 第 4 件种子，三处先红后绿（详注见 Task 9 节点「终审勘误」段）；
+  ② `fix(metadata)` 29bcab2——online `fetch_online` 两条 SHOW 语句的
+  db/tb 裸插值改走 `quote_ident` 单通道（裁定 8，终审 #2 注入面：表名
+  含反引号即 breakout），纯函数 `show_columns_sql`/`show_index_sql` 抽出，
+  公开 API 不变；③ `docs`——本档与 README 加固口径按实修正（含下方挂账
+  四条终审登记项）。矩阵缺口（ENUM>255/GEOMETRY/LONGBLOB>64K）等四项
+  登记挂账，不阻塞 P1。
 
 ### Task 17: 全版本兼容矩阵 5.6/5.7/8.0/8.4（全绿）
 
@@ -840,11 +864,32 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - [ ] P2：flashback + stats（另出计划）
 - [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
-- [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 3 件 +
+- [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 4 件——终审 #1
+  补第 4 件 `decimal_full_group_overflow.bin`，DECIMAL 满组溢出 repro +
   `tests/fuzz_seed.rs` 构造器/再生通道 FUZZ_SEED_REGEN=1）、影子库端到端回放、
   **musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
   static-pie 可运行；实测崩塌至 ~3.4 MiB/s——musl malloc arena 竞争，
   候选 mimalloc / glibc-static，证据 docs/bench/p1.md）
+- [ ] 测试债（P2 邻近，终审登记）——矩阵覆盖缺口：① ENUM >255 成员
+  （2B packlen 形态仅 `value.rs::enum_set_ordinals_to_uint` 合成单测，
+  真机捕获与差分矩阵均无该列）；② GEOMETRY 真机捕获（裁决 7 字节保真
+  路径无实抓 fixture）；③ LONGBLOB >64K 前缀行（packlen 4B 档 + 跨页
+  payload 未进矩阵）。补捕获即补差分用例，不改解码器。
+- [ ] 已文档化行为（终审核对，**不修**）：writer 写盘错误在 `pump_*` 内
+  `emit`/`finish` 处早返回 Err，`pump_parallel` 该路径不 join 已 spawn 的
+  worker——整跑已进入终止收敛，worker 阻塞在 `job_rx.recv()` 随通道丢弃
+  自然退出，detached 线程随进程回收；登记为文档化行为而非缺陷。
+- [ ] 已文档化行为（终审核对，**不修**）：`frac_text`（time.rs）与
+  go-mysql `fracTimeFormat` 的截断口径在 usec > 999999 时输出分歧
+  （本侧 `%06` 展开为 7+ 位后取前 fsp 位）——该形态仅敌意/非法位域可
+  触发，真机合法 binlog usec 恒 < 1e6；legal-inputs-only 注记，P2 fuzz
+  若发现真机可达再复审。
+- [ ] 已文档化行为（终审核对，**不修**）：ROTATE 事件携带的新文件名
+  （rotate url）不做字符白名单/路径净化即信任——input-side-only 信任面：
+  url 仅更新 `FileReader.name`（裁定 7：只改名、不切文件；跨文件续读由
+  装配层 `next_binlog_name` 在该名上推导），最坏后果 = 拼出的路径
+  open 失败/非 binlog 解码报错即停（读侧越权顶多「读到不该读的文件而
+  报错」），输出侧文件名字节净化已另闸（T14），无写逃逸面。注记备案。
 - [ ] spec §4.6 ENUM/SET 名称注释 → 推迟至 P2
 - [x] ~~T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）~~——ALW-ZERO-TIMESTAMP 落地（eq 零日期对，fsp 后缀须一致；selftest 第 6 组正反例）
 - [x] ~~T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数~~——ALW-FLOAT-WIDTH（≤17 有效位闸口 + f64/f32 同 bits）+ ALW-INT-SIGN-WRAP（mod 2^64）落地；1e+10 类经 num 桥 Decimal 直判等

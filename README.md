@@ -116,7 +116,10 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
 9. **JSON 渲染忠于 MySQL 显示规则**：对象键序 = 存储序（长度,memcmp）、数值按
    MySQL 文本规则（`12.0`/`1e21`/`-0.0`）、`<>&` 与 U+2028/9 不 HTML 转义；
    上游 = Go map 字典序 + `%v` + `json.Marshal` 转义（ALW-JSON-* 白名单，深比较
-   判等）。JSON 嵌套深度上限 100，超界报 Err（防恶意 binlog，见 `tests/fuzz_seed/`）。
+   判等）。防恶意 binlog 的实际口径：解码器对**已知**敌意输入做了 panic
+   加固 + 回归闸（JSON 深度闸 100、DECIMAL 满组越界闸、截断/位图/charset
+   畸形面，`tests/fuzz_seed/` 4 件种子逐字节钉死）；连续探索式 fuzz
+   （cargo-fuzz 正式 campaign）归 P4，本工具不宣称穷尽防恶意 binlog。
 10. **TIMESTAMP 零值渲染 `1970-01-01 00:00:00`**（MySQL 合法零值语义）；上游
     go-mysql 走 `formatZeroTime` 输出 `0000-00-00`（ALW-ZERO-TIMESTAMP）。
 11. **UPDATE 仅输出变化列**（before/after 逐列对比后省略等值列）；上游 SET 段
