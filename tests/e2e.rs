@@ -128,6 +128,51 @@ impl Synth {
     fn delete(&mut self, tid: u64, n: usize, rows: &[Vec<i32>], ts: u32) -> (u32, u32) {
         self.rows(tid, 32, n, rows, ts) // DELETE_ROWS_V2
     }
+
+    /// TABLE_MAP：单列 NEWDECIMAL(precision,scale)（type 246，meta 2B 大端对，
+    /// 终审 #1 敌意事件回放用）。
+    fn table_map_decimal(
+        &mut self,
+        tid: u64,
+        db: &str,
+        tb: &str,
+        precision: u8,
+        scale: u8,
+        ts: u32,
+    ) -> (u32, u32) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&tid.to_le_bytes()[..6]);
+        b.extend_from_slice(&0u16.to_le_bytes()); // flags
+        b.push(db.len() as u8);
+        b.extend_from_slice(db.as_bytes());
+        b.push(0);
+        b.push(tb.len() as u8);
+        b.extend_from_slice(tb.as_bytes());
+        b.push(0);
+        b.push(1); // n_cols
+        b.push(246); // MYSQL_TYPE_NEWDECIMAL
+        b.push(2); // metadata 总长
+        b.push(precision);
+        b.push(scale);
+        b.push(0); // null_bits（1 列 → 1B）
+        self.push(19, ts, &b)
+    }
+
+    /// WRITE_ROWS_V2：单列、行载荷裸字节（行 null 区 1B=非NULL + 给定 payload），
+    /// 供敌意 DECIMAL 字节直灌解码层。
+    fn write_raw(&mut self, tid: u64, payloads: &[Vec<u8>], ts: u32) -> (u32, u32) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&tid.to_le_bytes()[..6]);
+        b.extend_from_slice(&0u16.to_le_bytes()); // flags
+        b.extend_from_slice(&2u16.to_le_bytes()); // extra_info_len = 2（自含）
+        b.push(1); // n_cols
+        b.push(0x01); // cols_present：列 0
+        for p in payloads {
+            b.push(0u8); // 行 null_bits（1 列 → 1B，非 NULL）
+            b.extend_from_slice(p);
+        }
+        self.push(30, ts, &b)
+    }
 }
 
 // ---------- 临时目录 ----------
@@ -355,6 +400,74 @@ fn e2e_file_per_table_splits_by_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ---------- 终审 #1 回归：threads=1 直通泵遇敌意 DECIMAL 事件 → 计错不终止 ----------
+
+#[test]
+fn e2e_hostile_decimal_event_counted_not_abort() {
+    // 终审 #1：DECIMAL(19,9) 满组溢出字节 `81 00 00 00 01 FF FF FF FF` 经
+    // threads=1 直通泵（pump_direct，无 worker catch_unwind 兜底）→ 修复前
+    // `9 − 10` 减法溢出直接 abort 整测程；修复后按逐事件错误策略计错跳过、
+    // run_to_sql 仍 Ok，其后的正常事件照常产出。
+    let dir = tmp_dir("decbomb");
+    let binlog_dir = dir.join("binlog");
+    std::fs::create_dir_all(&binlog_dir).unwrap();
+
+    let mut s = Synth::new();
+    s.query("t10", "BEGIN", 1700000000);
+    s.table_map_decimal(90, "t10", "d", 19, 9, 1700000000);
+    s.write_raw(
+        90,
+        &[vec![0x81, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]],
+        1700000000,
+    );
+    s.xid(1700000000);
+    s.query("t10", "BEGIN", 1700000001);
+    s.table_map(91, "t10", "a", 1, 1700000001);
+    s.write(91, 1, &[vec![7]], 1700000001);
+    s.xid(1700000001);
+    std::fs::write(binlog_dir.join("mysql-bin.000001"), &s.bytes).unwrap();
+
+    let schema_file = dir.join("schema.json");
+    std::fs::write(
+        &schema_file,
+        r#"{"version":1,"tables":[
+  {"db":"t10","table":"d","cols":[{"name":"amt","type_name":"decimal","unsigned":false}],"pk":[],"uks":[]},
+  {"db":"t10","table":"a","cols":[{"name":"id","type_name":"int","unsigned":false}],"pk":["id"],"uks":[]}
+]}"#,
+    )
+    .unwrap();
+
+    let out = dir.join("out");
+    let cfg = config_from(&[
+        "my2sql-rs",
+        "to-sql",
+        "--binlog-dir",
+        binlog_dir.to_str().unwrap(),
+        "--start-file",
+        "mysql-bin.000001",
+        "--schema-file",
+        schema_file.to_str().unwrap(),
+        "--output-dir",
+        out.to_str().unwrap(),
+        "--threads",
+        "1",
+    ]);
+    let summary = run_to_sql(&cfg).expect("threads=1 直通：敌意事件计错，不 abort 整跑");
+    assert_eq!(summary.events, 2, "两个 rows 事件均被派发");
+    assert_eq!(
+        summary.errors, 1,
+        "敌意 DECIMAL 事件计 1 错（逐事件错误策略）"
+    );
+    assert_eq!(summary.statements, 1, "其后正常事件照常产出");
+
+    let body = read_file(&out.join("to_sql.1.sql"));
+    assert_eq!(
+        body,
+        "SET NAMES utf8mb4;\nINSERT INTO `t10`.`a` (`id`) VALUES (7);\n"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
 // ---------- robust-continue：schema 缺失表 → 计数跳过、不中断 ----------
 
 #[test]

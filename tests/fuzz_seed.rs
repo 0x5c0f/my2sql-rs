@@ -1,7 +1,7 @@
 //! Task 16 / DoD-4：畸形 binlog 事件语料（fuzz seed）→ 解码层必须返回
 //! `Err` 且**绝不 panic**。
 //!
-//! 三个种子文件落在 `tests/fuzz_seed/*.bin`，由本文件的 `builders` 从
+//! 四个种子文件落在 `tests/fuzz_seed/*.bin`，由本文件的 `builders` 从
 //! `tests/fixtures/events.rs` 的合法事件头常量 + 合法事件体构造器
 //! （e2e.rs Synth 同款布局）对字节流施加畸形而来：
 //!   1. `table_map_truncated_meta.bin` —— TABLE_MAP 在 metadata 段中途截断
@@ -10,7 +10,10 @@
 //!      活锁形态，T12 Step-0 守卫的敌意输入形状，行区刻意非空）；
 //!   3. `json_depth_bomb.bin` —— WRITE_ROWS_V2 的 JSON 列携带 151 层嵌套
 //!      数组（> MAX_DEPTH=100 的深度炸弹，同时把每层 size 字段保持自洽，
-//!      防止在深度闸口之前先撞长度校验）。
+//!      防止在深度闸口之前先撞长度校验）；
+//!   4. `decimal_full_group_overflow.bin` —— WRITE_ROWS_V2 的 DECIMAL(19,9)
+//!      列携带终审 #1 repro 字节 `81 00 00 00 01 FF FF FF FF`（小数满组
+//!      XOR 还原为 10 位 u32，`9 − 10` 下溢点，修复前 debug/release 双 panic）。
 //!
 //! 用途注记：**这些文件是 P4 正式 fuzz（cargo-fuzz/libfuzzer）的起始语料
 //! 种子**（spec §挂账 P4）。P4 接入时直接以 tests/fuzz_seed/ 为 corpus 目录；
@@ -108,7 +111,7 @@ fn jsonb_wrapped(depth: usize) -> Vec<u8> {
     buf
 }
 
-// ---------- 三个种子：合法事件流 + 一处畸形 ----------
+// ---------- 四个种子：合法事件流 + 一处畸形 ----------
 
 /// 种子 1：TABLE_MAP 在 metadata 中途截断（声明 4B、实给 2B、无 null_bits）。
 fn seed_table_map_truncated_meta() -> Vec<u8> {
@@ -148,6 +151,19 @@ fn seed_json_depth_bomb() -> Vec<u8> {
     out
 }
 
+/// 种子 4：合法 TABLE_MAP（1×NEWDECIMAL(19,9)，meta=2B [19,9]）+ WRITE_ROWS_V2
+/// 载终审 #1 repro 字节——小数满组 0xFFFFFFFF 还原为 10 位值，`9 − t.len()`
+/// 下溢（修复前 debug subtract-overflow / release repeat-capacity 双 panic）。
+fn seed_decimal_full_group_overflow() -> Vec<u8> {
+    let tm = tm_body(7, "fz", "t_dec_bomb", &[0xF6], 2, &[19, 9], &[0x00]);
+    let mut rows = rows_head(7, 1, &[0x01]); // present = 列 0
+    rows.push(0x00); // 行 null 区（1 列 → 1B，非 NULL）
+    rows.extend_from_slice(&[0x81, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]);
+    let mut out = event_bytes(TABLE_MAP_TYPE, &tm);
+    out.extend_from_slice(&event_bytes(WRITE_ROWS_V2_TYPE, &rows));
+    out
+}
+
 // ---------- 解码层走读：任一事件出错即整体 Err ----------
 
 fn schema_for(tm: &TableMapEvent) -> TableSchema {
@@ -167,6 +183,11 @@ fn schema_for(tm: &TableMapEvent) -> TableSchema {
         "t_json_bomb" => vec![SchemaCol {
             name: "j".into(),
             type_name: "json".into(),
+            unsigned: false,
+        }],
+        "t_dec_bomb" => vec![SchemaCol {
+            name: "d".into(),
+            type_name: "decimal".into(),
             unsigned: false,
         }],
         other => panic!("unexpected table in seed: {other}"),
@@ -219,6 +240,10 @@ const SEEDS: &[(&str, SeedBuilder)] = &[
     ),
     ("rows_cols_present_zero.bin", seed_rows_cols_present_zero),
     ("json_depth_bomb.bin", seed_json_depth_bomb),
+    (
+        "decimal_full_group_overflow.bin",
+        seed_decimal_full_group_overflow,
+    ),
 ];
 
 #[test]
@@ -247,7 +272,7 @@ fn fuzz_seeds_return_err_and_never_panic() {
             }
         }
     }
-    assert_eq!(checked, 3, "三个种子全部检查");
+    assert_eq!(checked, 4, "四个种子全部检查");
 }
 
 /// 非默认路径：`FUZZ_SEED_REGEN=1 cargo test --test fuzz_seed` 重生成磁盘种子。

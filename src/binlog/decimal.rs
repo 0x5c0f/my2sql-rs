@@ -47,7 +47,10 @@ fn decompress_small(s: &[u8], mask_byte: u8) -> u32 {
 /// - 截断 → [`BinlogError::TooShort`]（`pos` 不动，T5/T6 口径）；
 /// - `precision == 0 || precision > 65 || scale > precision`（meta 为 u8，
 ///   损坏值可达 254；go-mysql 在 precision=0 时越界 panic，此处按控制器
-///   裁定报 [`BinlogError::InvalidData`]）。
+///   裁定报 [`BinlogError::InvalidData`]）；
+/// - 4 字节满组还原值 > 999999999（≥10 位，敌意/损坏输入，go-mysql 此处
+///   组内左补零 `9 − len` 下溢 panic；终审 #1 封堵，报
+///   [`BinlogError::InvalidData`]，`pos` 不动）。
 pub fn decode_decimal(
     buf: &[u8],
     pos: &mut usize,
@@ -102,9 +105,18 @@ pub fn decode_decimal(
             res.push_str(&v.to_string());
         }
     }
-    // 整数满组：首个非零组前跳过全零组（去前导零），其后每组 9 位左补零
+    // 整数满组：首个非零组前跳过全零组（去前导零），其后每组 9 位左补零。
+    // 终审 #1 守卫：损坏 4B 组 XOR 还原出 ≥10 位 u32（如 0xFFFFFFFF）时，
+    // 下方 `9 − t.len()` 在 debug（减法溢出）与 release（repeat 容量溢出）
+    // 双双 panic——合法 DECIMAL 满组恒 ≤ 999999999，越界即敌意输入，报
+    // InvalidData（与其余解码闸口同口径，pos 不动）。
     for _ in 0..uncomp_int {
         let v = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) ^ mask_word;
+        if v > 999_999_999 {
+            return Err(BinlogError::InvalidData(format!(
+                "decimal integral group overflow: {v} > 999999999"
+            )));
+        }
         p += 4;
         let t = v.to_string();
         if zero_leading {
@@ -127,6 +139,11 @@ pub fn decode_decimal(
         for _ in 0..uncomp_fr {
             let v =
                 u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) ^ mask_word;
+            if v > 999_999_999 {
+                return Err(BinlogError::InvalidData(format!(
+                    "decimal fractional group overflow: {v} > 999999999"
+                )));
+            }
             p += 4;
             let t = v.to_string();
             res.push_str(&"0".repeat(9 - t.len()));
@@ -551,6 +568,43 @@ mod tests {
             decode_decimal(&[0x80], &mut pos, 0, 0),
             Err(BinlogError::InvalidData(_))
         ));
+        assert_eq!(pos, 0);
+    }
+
+    // ---- 终审 #1：敌意满组值（>9 位 u32）不得 panic，必须 Err ----
+    // 现场：4B 满组 XOR 还原后 ≥10^9（如 0xFFFFFFFF = 4294967295），
+    // `9 - t.len()` 在 debug（减法溢出 panic）与 release（repeat 容量
+    // 溢出 panic）双双崩——reviewer 确认字节序列
+    // `81 00 00 00 01 FF FF FF FF` 过 DECIMAL(19,9) 即触发。
+
+    #[test]
+    fn decimal_corrupt_frac_full_group_rejected() {
+        // 终审 #1 原始 repro：(19,9) 布局 = 1B 余数组(0x81→+1) + 4B 整满组
+        // (0x00000001) + 4B 小数满组(0xFFFFFFFF → 10 位 → :132 下溢点)。
+        let bytes = [0x81, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF];
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut pos = 0usize;
+            let v = decode_decimal(&bytes, &mut pos, 19, 9);
+            (v, pos)
+        }));
+        let (v, pos) = res.expect("decimal 满组越界不得 panic");
+        assert!(matches!(v, Err(BinlogError::InvalidData(_))), "{v:?}");
+        assert_eq!(pos, 0, "错误路径不污染 pos");
+    }
+
+    #[test]
+    fn decimal_corrupt_int_full_group_rejected() {
+        // 整数满组同型（:116 下溢点）：余数组 0x81→1 先置 zero_leading=false，
+        // 随后 4B 整满组 0xFFFFFFFF → 10 位。小数满组给合法值保证触发的是
+        // 整组分支而非小数组分支。
+        let bytes = [0x81, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0x03, 0x04];
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut pos = 0usize;
+            let v = decode_decimal(&bytes, &mut pos, 19, 9);
+            (v, pos)
+        }));
+        let (v, pos) = res.expect("decimal 满组越界不得 panic");
+        assert!(matches!(v, Err(BinlogError::InvalidData(_))), "{v:?}");
         assert_eq!(pos, 0);
     }
 }
