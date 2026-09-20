@@ -23,11 +23,34 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**未开始实施**（本文档创建于 Task 1 派发前）
+- 状态：**Task 1 已完成**（脚手架 + CLI 骨架，`cargo test` 3/3 绿、clippy -D warnings 干净）
 
 ## 任务节点日志
 
 （每任务完成追加一节：做了什么/关键接口/遗留项/对后续任务的影响）
+
+### Task 1: 项目脚手架与 CLI 骨架
+
+- 做了什么：`cargo init --name my2sql-rs`（crate 在仓库根，非嵌套目录）；按白名单引入依赖
+  （clap/derive、crossbeam-channel、mysql 28 默认特性即 TLS off、mysql_common 0.38、crc32fast、
+  simdutf8、serde/derive、serde_json、thiserror、chrono、tracing、tracing-subscriber）；
+  `[profile.release] lto = true`；TDD 先写 `tests/cli.rs` 3 个失败测试（RED：3 failed）后实现转绿。
+- 关键接口（Task 9-14 消费）：
+  - `config::Cli` / `config::Command::ToSql(config::ToSqlArgs)`（clap derive，参数名/默认值与 brief 一致：
+    `--start-pos` 默认 4、`--threads` 默认 available_parallelism、`--dml` 为 `Dml{Insert,Update,Delete}` 逗号分隔、空=全部）。
+  - `config::Config::from_args() -> Config`：解析+校验，失败 `eprintln!` + `exit(2)`。校验规则：
+    (1) `--uri`/`--schema-file` 至少其一；(2) threads>=1；(3) start/stop_datetime 成对时 start<stop
+    （格式 `YYYY-MM-DD HH:MM:SS`，按 `--time-zone` 解释）；(4) stop_pos 与 start 同文件时 stop_pos>start_pos。
+  - `Config::dml_enabled(Dml) -> bool`（空列表=全部启用）。
+- 与 brief 的偏差/细化：
+  - `Config` 不持有 `ToSqlArgs` 而是平铺字段，且 datetime/time_zone 已归一化为
+    `DateTime<FixedOffset>` / `FixedOffset`（`--time-zone` 接受 `+HH:MM`、`UTC`、`SYSTEM`；
+    不支持具名时区——chrono 无 chrono-tz 白名单外依赖，P3 若需要再议）。
+  - 占位 main：打印 `to-sql: not wired yet (start_file=..., start_pos=..., threads=...)` + exit 1。
+  - `src/{binlog,metadata,pipeline,sqlopen}/mod.rs` 为空壳（仅注释），main.rs 已声明四个 mod。
+- 遗留：`Config` 与 `dml_enabled` 上有临时 `#[allow(dead_code)]`（骨架阶段字段无消费者），
+  Task 12/13/14 接入后应移除。
+- 注意：mysql 28 默认特性含 `flate2/zlib`（构建需系统 zlib/cmake，本机已验证可编译）。
 
 ## 环境事实
 
