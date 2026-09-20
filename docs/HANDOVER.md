@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 5 已完成**（定宽列值解码 int.rs + ColumnValue；`cargo test` 52/52 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 6 已完成**（时间族解码 time.rs；`cargo test` 63/63 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -152,6 +152,39 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   私有 `mod tp` 把 FLOAT/DOUBLE 命名互换了——数值相同、meta 宽度一致，无功能
   影响，T4 已审不改，此处不触碰）。
 - 遗留：int.rs 顶部 `#![allow(dead_code)]`（Task 9/10 消费后移除）。
+
+### Task 6: 时间族解码（DATE2/DATETIME2/TIMESTAMP2/TIME2 → 字符串保真）
+
+- 做了什么：新增 `src/binlog/time.rs`——`decode_date2` / `decode_datetime2` /
+  `decode_timestamp2` / `decode_time2`，全部 `Result<String, BinlogError>`，
+  位级算式逐项对照 go-mysql `row_event.go`（`decodeDatetime2`/`decodeTimestamp2`/
+  `decodeTime2`/`timeFormat`/`MYSQL_TYPE_DATE` 分支），chrono-free（epoch→历法用
+  Hinnant civil_from_days 手工换算）。TDD：先写 11 个失败测试（RED：11 failed,
+  todo!()），实现后 60+3/63 全绿。
+- 真机回验（T5 同款探针法）：docker mysql:8.0.46 与 mysql:5.7.44 ROW binlog 抓包
+  表 t.t6（DATE / DATETIME(3)/(2) / TIMESTAMP(3) / TIME(0)/(3)/(6)，含零值、
+  ±838:59:59、>24h、跨 1970 等），**全部测试 fixture 直接取自真机字节**，两版本
+  逐字节一致。
+- 关键接口（Task 9 消费）与读长：DATE 3B；DATETIME2 `5+(fsp+1)/2`B；TIMESTAMP2
+  `4+(fsp+1)/2`B；TIME2 `3+(fsp+1)/2`B。fsp>6 → InvalidData；短缓冲 TooShort 且
+  不污染 pos。
+- **简报偏差（按权威纠正，证据= vendored go-mysql + 真机抓包）**：
+  1. DATE2 实为 **3 字节小端位域 `year*512+month*32+day`**（[y:15][m:4][d:5]），
+     零值 0x000000 → "0000-00-00"。简报「3B 大端、减 0x800000」两处均不成立
+     （0x800000 是 TIME2 的 `TIMEF_INT_OFS`；DATE 无任何 bias；dispatch 猜测的
+     0x8000 亦不成立——真机 '2020-07-16' = `f0 c8 0f` LE = 1034480 = 2020<<9|7<<5|16）。
+  2. `decode_timestamp2` 签名增 `tz_offset_secs: i32`（控制器裁定；CLI
+     --time-zone 的 FixedOffset 秒数在 T9/T14 传入，解码层不引 chrono）。
+  3. **TIMESTAMP2 秒=0 输出 `1970-01-01 00:00:00`（+tz 偏移）**——此处是
+     控制器裁定**覆盖** go-mysql（go 的 `formatZeroTime` 特例输出
+     "0000-00-00 00:00:00"）。MySQL 服务器语义上 TIMESTAMP 0 即零值日期，
+     若 T15 差分对 go-mysql 裁判产生差异，回看此条。
+- 输出文本细节（与 go-mysql 完全一致）：DATETIME/TIMESTAMP fsp>0 恒输出 fsp 位
+  小数（含零值日期）；TIME2 仅当小数非 0 才输出小数段；负 TIME2 的 fsp≤4 小数段
+  反向存储需 `intPart++ / frac−=0x100^k` 补偿；TIME hour 为 10 bit（838 上限，
+  无 24h 钳制）。
+- 遗留：time.rs 顶部 `#![allow(dead_code)]`（Task 9 消费后移除）；DATE 型在
+  table_map metadata 中 meta 恒 0（真机确认），T9 分发时 date2 无需 fsp 参数。
 
 ## 环境事实
 
