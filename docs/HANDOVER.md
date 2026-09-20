@@ -198,3 +198,6 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
 - [ ] P4：fuzz 正式接入、影子库端到端回放、musl 静态构建
 - [ ] spec §4.6 ENUM/SET 名称注释 → 推迟至 P2
+- [ ] T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）
+- [ ] T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数
+- [ ] T15 校准：8.0 TLV opt-meta 真实解析、5.7 signedness bitmap、T4 charset 形状拒绝的构造性误判
