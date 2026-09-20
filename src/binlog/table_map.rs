@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(e.column_type, vec![0x03, tp::VAR_STRING, tp::BLOB]);
         assert_eq!(e.column_meta, vec![0, 20, 1]);
         assert_eq!(e.null_bits, vec![0]);
-        assert_eq!(e.charset, Vec::new());
+        assert_eq!(e.charset, Vec::<u64>::new());
     }
 
     #[test]
@@ -526,7 +526,7 @@ mod tests {
         ]);
         let e = parse_table_map(&b, false).unwrap();
         // 非字符列语义字段一律不落位；charset 仅 #3 填充
-        assert_eq!(e.charset, Vec::new());
+        assert_eq!(e.charset, Vec::<u64>::new());
         assert_eq!(e.n_cols, 3);
     }
 
@@ -612,7 +612,7 @@ mod tests {
         );
         assert_eq!(e.null_bits, vec![0xFF, 0xFF, 0xFF, 0x03]);
         // MINIMAL 只带 #1/#2/#7，无 #3 column charset → charset 保持空
-        assert_eq!(e.charset, Vec::new());
+        assert_eq!(e.charset, Vec::<u64>::new());
     }
 
     /// brief Step2 指定两例：0x06 高字节补成 0x36（ENUM）；0xF6 原样透传（NEWDECIMAL）。

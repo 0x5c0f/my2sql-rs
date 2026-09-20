@@ -1,6 +1,9 @@
 //! metadata 层（表结构/键信息获取与缓存）。
 //!
-//! - `schema`：本阶段（Task 9）仅定义 `SchemaCol` / `TableSchema` 结构体；
-//!   SchemaStore 离线/在线存取、列数对账、索引解析在 Task 11 实现。
+//! - `schema`：`SchemaCol`/`TableSchema` 结构（T9）+ 列数对账 `align_cols`
+//!   + 键名→binlog 序号映射 `key_indexes`（T11）；
+//! - `store`：`SchemaStore`（online 连库懒查 + offline JSON 文件）与
+//!   `MetaError`（T11）。
 
 pub mod schema;
+pub mod store;
