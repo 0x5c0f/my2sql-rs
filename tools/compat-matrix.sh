@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 VERSIONS="${VERSIONS:-5.6 5.7 8.0 8.4}"
 RESULTS="$ROOT/out/compat-results.tsv"
-mkdir -p out && : > "$RESULTS"
+mkdir -p out
 FAILS=0
 PROBE_NAME=my2sql-t17-sha2
 trap 'docker rm -f "$PROBE_NAME" >/dev/null 2>&1 || true' EXIT
@@ -95,8 +95,9 @@ if [ -n "${PROBE_ONLY:-}" ]; then
   probe_84_caching_sha2
   echo "==== probe-only results ($RESULTS) ===="
   cat "$RESULTS"
-  [ "$FAILS" -eq 0 ] && { echo "PROBE ONLY: GREEN"; exit 0; } || { echo "PROBE ONLY: FAIL"; exit 1; }
+  if [ "$FAILS" -eq 0 ]; then echo "PROBE ONLY: GREEN"; exit 0; else echo "PROBE ONLY: FAIL"; exit 1; fi
 fi
+: > "$RESULTS"   # 全量矩阵才截断（PROBE_ONLY 分支已在上方 exit）
 
 for v in $VERSIONS; do
   case "$v" in
