@@ -631,6 +631,10 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义
 - [ ] T15 白名单（T11）：key_indexes 键名指向缺失列时本侧整键降级（pk=[]/丢 uk），上游 GetColIndexFromKey 映射为序号 0（bug 兼容会产生错误 WHERE）；表达式索引/坏 JSON 场景输出必分歧
+- [ ] T15 白名单（T13）：blob/非utf8-text 字面量本侧 `0xUPPERHEX`，上游 X'lowerhex' 或原样字节引号串（语义等价）
+- [ ] T15 白名单（T13 审阅）：多条件 WHERE 上游带括号 `(a=1 AND b=2)`（expression.go conjunctExpression），本侧裸连 `a=1 AND b=2`；SET 分隔上游 ", "/VALUES 行上游 ", ("，本侧 ","；比较器须括号/空白不敏感
+- [ ] T15 白名单（T13 审阅）：标识符含反引号时本侧加倍 ``a``b``，上游 table.go/column.go 原样包裹不加倍（上游产生坏 SQL）
+- [ ] T15 白名单（T13）：UPDATE 行前后无变化时上游 Fatalf 整跑终止，本侧 skip+warn——该病理夹具不得进入差分对比
 - [ ] T15 纪律（T11）：binlog 比 schema 宽的场景差分必须跑 strict=true（上游 events.go:87 无条件 fatal，pad 列永不出 SQL）
 - [ ] T15 白名单：blob 字面量形态 本侧 `0xUPPERHEX` vs 上游 `X'lowerhex'`（sqltypes.go:567-570）——语义等价 SQL，比较器须双解（T13 裁定 1 重设计，非 parity 缺陷）
 - [x] ~~T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict~~——T13 定稿：`SqlOpts::strict_schema` 默认 **false**（非 strict：dropped 位列清单/WHERE 省略+warn、Truncated 静默前缀），true 经 align_cols 逐事件 ColCountFatal；与上游有效行为等价的论证见 Task 13 节点「裁定 2 定稿」段
