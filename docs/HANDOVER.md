@@ -526,6 +526,79 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   - T14 若做多文件续读：仅当 stop 条件存在时（镜像 file.go:74-85 语义），
     文件名推进用 `next_binlog_name`（十进制 %06d），不信任 rotate url 切文件。
 
+### Task 13: sqlopen（值编码 + DML 构建器）
+
+- 做了什么（提交 ebf8a10）：`src/sqlopen/{mod,encode,dml}.rs`。
+  `quote_ident`（反引号、内部 `` ` `` 双写，裁定 8——库/表/列名进 SQL 文本的
+  唯一通道）；`encode_value`（Null→`NULL`、Int/UInt→十进制、Double/Decimal→
+  预渲染文本原样透传、Str/Json→单引号+上游全等转义集、Bytes→`0xUPPERHEX`、
+  Missing→`InvalidData` 硬错误〔裁定 3，partial rows 已在 T10 拒收，非出货
+  路径〕）；`DmlBuilder::{inserts,deletes,updates}` 返回
+  `Result<Vec<String>, SqlError>`（简报 `-> Vec<String>` 速记不承载裁定 2/3
+  的错误传播——失真续例）；`SqlOpts` 六字段与 T1 config.rs flag 一一对应
+  （db_prefix←`--no-db-prefix` 取反；`from_config` 就位，T14 零新字段接线）。
+- 权威行为对照（本任务行号全部实读自 reference/my2sql-go）：
+  - **转义集**：字面量渲染链 = `SQL.Literal`→`sqltypes.BuildValue`
+    （sqltypes.go:217-278）→`String.encodeSql`（:548-566）按 `SqlEncodeMap`
+    逐字节。映射由 `encodeRef`（:611-621）定义，**恰为 9 项**：`0x00→\0`
+    `'→\'` `"→\"` `0x08→\b` `0x0A→\n` `0x0D→\r` `0x09→\t` `0x1A→\Z`
+    `\→\\`；简报/控制器备忘猜测的「%, 反斜杠?/ctrl-S?」不在集内——以代码
+    为准。com.go/funcs.go **无** Escape 函数（简报定位失真续例）。另有 LIKE
+    例外（:556-561）：`\` 后随 `%`/`_` 不双写（MySQL 5.7 string-literals
+    文档注），本层逐字节复刻。%/_ 本身不转义。
+  - **WHERE NULL**：`sqlbuilder.Eq`（expression.go:441-447）对 NULL 右值把
+    `=` 算子换成 ` IS `，右值渲染 `null`（sqltypes.go:27 `nullstr`）——
+    即上游产出 `col IS null`，**从不** `col = null`（恒假、行不可定位）。
+    本层镜像为 `col IS NULL`（大写，无语义差）。无键表全列 WHERE 同规则。
+  - **键选择**：`GetOneUniqueKey`（mysqlFuncs.go:322-335）：uniqueFirst∧uk
+    非空→uk[0]；否则 pk；否则 uk[0]；皆空→`GenEqualConditions`
+    （sqlgen.go:269-282）full 分支全列等值。`--full-columns`
+    （context.go:215）短路为恒全列 WHERE + SET 全列。dropped 位（schema
+    无名）永不入键（key_indexes 按名解析构造保证）。
+  - **SET 差异**：`GenUpdateSetPart`（sqlgen.go:336-381）非 full 时逐列比较
+    解码值：字节族（blob/json/geometry/unknown 且非 text）按原字节
+    `CompareEquelByteSlice`，其余 Go `==`（值等值）。本层用 ColumnValue
+    derive PartialEq（int.rs:30，T10 已派生——裁定 6 核实**无需新增**）：
+    Str/Bytes 按字节、文本族按预渲染文本严格比较。因 T5-T8 渲染确定性，
+    「比解码值」与「比编码文本」效果等价（裁定 6 结论）；采前者的镜像。
+  - **批量 INSERT**：`GenInsertSqlsForOneRowsEvent`（sqlgen.go:165-187）按
+    rowsPerSql 切分；上游调用面 events.go:150 **恒传 1**（无 CLI batch
+    flag——`--insert-batch` 是本工具重设计），`insert_batch=None`→1 行/句。
+    DELETE/UPDATE 上游无批量路径（一行对/一行一语句）。
+  - **ignore_pk_for_insert**：仅 INSERT——sqlgen.go:159-164（pk 空自动失效）
+    + `ConvertRowToExpressRow` :204-217 确认列清单与 VALUES **双位置**剔除；
+    `GenUpdateSqlsForOneRowsEvent`（:288-334）签名无该参数——UPDATE 的
+    SET/WHERE 完全不受影响（裁定 7 核实毕）。
+- 裁定 2 定稿（销账下方 checklist「T13 决策点」行）：`SqlOpts.strict_schema`
+  **默认 false（非 strict）**。非 strict：`Align::Padded` 的 dropped 位从列
+  清单/全列 WHERE 中**省略**并每事件 `tracing::warn!` 一次（合成名
+  `dropped_column_i` 非真列，引用必错；binlog 序号保留仅作位置映射）；
+  `Truncated` 静默取 schema 前缀（events.go:83 口径）。strict=true：
+  align_cols 任何失配升 `ColCountFatal` → 逐事件 `SqlError::Meta`。与上游
+  有效行为等价性：上游扩宽方向恒 `log.Fatalf`（events.go:87）、pad 列从不
+  出 SQL，故非 strict 的「子集出货」只在上游崩溃的场景里多产出，等宽场景
+  两家逐字节一致——T15 差分纪律（宽出跑 strict=true）不变。
+- 与上游的有意偏差（T15 白名单候选，blob 项已挂账下方清单）：
+  - **Blob 字面量**：`Bytes`→`0xHEX`（大写），上游非 utf8 String→
+    `X'lowerhex'`（sqltypes.go:567-570 + hex.go:19 `%02x`）——前缀与大小写
+    双分歧，SQL 语义等价，比较器须双解（裁定 1 重设计）。
+  - Str 的**契约兜底**：utf8_safe 后仍构造非法 UTF-8 Str（违约输入）→
+    降级 `0xHEX`（不 lossy 重写，D3），测试钉死。
+  - **无变化行对**（FULL 镜像 matched-update）：上游空 SET → sqlbuilder 报错
+    → log.Fatalf 进程死；本层跳过该语句 + warn（无操作重放语义等价）。
+  - NULL 渲染大写 `NULL`/`IS NULL`（上游 `null`/`IS null`）、WHERE 结合子
+    ` AND `（上游同）——仅大小写面差异。
+- 关键接口（T14 消费）：`DmlBuilder::new(SqlOpts)`；
+  `inserts/deletes/updates(&self,&TableMapEvent,&TableSchema,&[Row])
+  ->Result<Vec<String>,SqlError>`（updates 传 decode_rows 的交错对，奇数长
+  →InvalidData）；`SqlOpts::from_config(&Config)`；表名取 tm.schema/tm.table
+  （上游 rEv.Table 同源，binlog 面真名）。DmlBuilder 无跨事件状态（简报接口
+  块 `..,` 参数简写 = 与 inserts 同参 tm/schema/rows，文档化）。
+- 遗留/对后续影响：sqlopen 三模块 `#![allow(dead_code)]` 保留至 T14 接线；
+  add_extra_info 注释头（`--add-extra-info`）非本层职责、T14 包表层做；
+  rollback（flashback）方向语义（P2）本层已按上游结构预留对偶性——WHERE
+  恒取 before 镜像，P2 翻转时交换 before/after 即可复用。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -559,5 +632,6 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义
 - [ ] T15 白名单（T11）：key_indexes 键名指向缺失列时本侧整键降级（pk=[]/丢 uk），上游 GetColIndexFromKey 映射为序号 0（bug 兼容会产生错误 WHERE）；表达式索引/坏 JSON 场景输出必分歧
 - [ ] T15 纪律（T11）：binlog 比 schema 宽的场景差分必须跑 strict=true（上游 events.go:87 无条件 fatal，pad 列永不出 SQL）
-- [ ] T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict
+- [ ] T15 白名单：blob 字面量形态 本侧 `0xUPPERHEX` vs 上游 `X'lowerhex'`（sqltypes.go:567-570）——语义等价 SQL，比较器须双解（T13 裁定 1 重设计，非 parity 缺陷）
+- [x] ~~T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict~~——T13 定稿：`SqlOpts::strict_schema` 默认 **false**（非 strict：dropped 位列清单/WHERE 省略+warn、Truncated 静默前缀），true 经 align_cols 逐事件 ColCountFatal；与上游有效行为等价的论证见 Task 13 节点「裁定 2 定稿」段
 - [ ] T15 夹具约束（T11 审阅发现）：上游 UniqueKeys 为 Go map 序（mysqlFuncs.go:221-238），多 uk 表 GetOneUniqueKey 选择跨运行不稳定；本侧确定性序更优——差分夹具限 ≤1 候选 uk 或容忍键选择分歧
