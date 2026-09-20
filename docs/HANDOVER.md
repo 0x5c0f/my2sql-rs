@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 4 已完成**（table_map 解码；`cargo test` 31/31 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 5 已完成**（定宽列值解码 int.rs + ColumnValue；`cargo test` 52/52 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -120,6 +120,38 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
     type/LNE长/值 条目）会被明确拒绝，完整 TLV 解析留 Task 15。
 - 遗留：table_map.rs 顶部 `#![allow(dead_code)]`；schema/table 用 `String::from_utf8`
   （非法 UTF-8 → InvalidData，真机库表名均为 UTF-8 可行）。
+
+### Task 5: 定宽列值解码（整型 + BIT/YEAR/FLOAT/DOUBLE）+ ColumnValue
+
+- 做了什么：新增 `src/binlog/int.rs`——`ColumnValue` 枚举（Null/Int/UInt/Double/
+  Decimal/Str/Bytes/Json/Missing，derive Debug+Clone+PartialEq+Eq，后续任务按变体
+  精确匹配）与 `decode_int` / `decode_float`；`binlog/mod.rs` 声明 `pub mod int`；
+  dev-dependency 增加 `proptest 1.11`（简报 Step3 要求往返测试）。
+  TDD：先写 16 个失败测试（RED：16 failed, todo!()），实现后 52/52 绿。
+- 关键接口（Task 9/10 消费）：
+  - `decode_int(buf, &mut pos, tp, unsigned, meta) -> Result<ColumnValue, BinlogError>`：
+    TINY/SHORT/INT24/LONG/LONGLONG 均 LE，signed 用 `^(1<<(w*8-1))` 翻符号位；
+    YEAR/BIT 走本入口特例。**签名比简报多一个 `meta: u16`**——BIT 的存储字节数
+    只能从 meta 推（`nbits=(meta>>8)*8+(meta&0xFF)`，`n=ceil(nbits/8)`），简报签名
+    与之矛盾，属必要偏差（go-mysql `decodeValue(tp, meta)` 同样带 meta）。
+  - `decode_float(buf, &mut pos, tp) -> Result<ColumnValue, BinlogError>`：
+    FLOAT=4B f32 / DOUBLE=8B f64 IEEE754 LE → `Double(最短往返十进制文本)`
+    （Rust `f32/f64::to_string()` 即 shortest-roundtrip，非 from_utf8_lossy，
+    与 Task 9 计划文本「FLOAT→4B f32文本(最短表示)」一致）。
+- **YEAR 偏差（重要，已按权威纠正简报）**：简报称「官方 2 字节 LE 直存年份」。
+  实测 docker mysql:8.0.46 / 5.7.44 真机 binlog（探针表 YEAR+BIT(9)+FLOAT+DOUBLE+
+  TINY+MEDIUMINT，插入 2026/2000/0）：YEAR 为 **1 字节，值=年份−1900**（0x7E→2026），
+  与 go-mysql `decodeValue`（n=1, +1900, 0 原样）完全一致；2 字节是 MariaDB 变体
+  （D5 不支持 MariaDB）。已按实测+裁判实现：`[byte] → UInt(year+1900)`，0→UInt(0)。
+  BIT 实测 2B **大端**（b'110000000'=384 → `01 80`），即简报「字节逆序按 LE 读」
+  口径，断言 `UInt(0x0102)` 用例通过。
+- 与 T4 接口衔接的实测观察（留给 T9/T15，不影响 T5）：8.0.17+/5.7.43+ 起
+  FLOAT/DOUBLE 的 TABLE_MAP meta 从 0 变为 packlength(4/8)；真机 table_map 的
+  charset 段字节形态需 T15 用真实 fixture 回归核对 T4 的严格解析。
+- 类型常量：int.rs 内 `mod tp` 用官方值 FLOAT=4/DOUBLE=5（注意 table_map.rs 的
+  私有 `mod tp` 把 FLOAT/DOUBLE 命名互换了——数值相同、meta 宽度一致，无功能
+  影响，T4 已审不改，此处不触碰）。
+- 遗留：int.rs 顶部 `#![allow(dead_code)]`（Task 9/10 消费后移除）。
 
 ## 环境事实
 
