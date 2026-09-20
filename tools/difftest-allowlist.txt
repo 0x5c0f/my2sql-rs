@@ -29,4 +29,6 @@ EXCL  ALW-EXPR-INDEX       挂账(T11)：表达式索引 Column_name="" 两边�
 EXCL  ALW-DROP-COL-ALTER   本任务裁定：捕获中途 DROP COLUMN 的 strict-schema diff 语义复杂 → v1 矩阵排除（P2 再议）
 EXCL  ALW-JSON-OPAQUE-TIME T15白名单素材(T8)：JSON 内 TIME/DATETIME opaque 渲染分歧 → v1 矩阵不在 JSON 列放时间值（键序/double/HTML 三类已规则化覆盖）
 EXCL  ALW-TS-V1-LEGACY     V1 rows 事件（5.0 前）不在 P1 矩阵；5.6 起恒 V2/V1-rows-event 形态由 T17 覆盖
-NOTE  ALW-56-JSON          T17 预备：JSON 类型 5.6 不存在 → 5.6 跑差分需 --table/-tables 过滤排除 t_json 与 t_all.c_json（本矩阵首绿=8.0）
+NOTE  ALW-56-JSON          T17 兑现：JSON 类型 5.6 不存在 → 数据级排除 tools/gen-data-5.6.sql
+                           （剔 t_all.c_json / t_json / 事务内 JSON UPDATE，19 组 vs 21 组），
+                           排除登记 docs/compat/matrix.md；比较器规则零改动（矩阵级排除，非放宽）

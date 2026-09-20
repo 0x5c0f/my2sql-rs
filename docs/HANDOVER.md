@@ -23,14 +23,16 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 15 已完成并经审阅两轮修订（golden 差分基建，8.0 矩阵 21/21 组全绿）**
-  （tools/docker-mysql.sh + gen-data.sql + run-difftest.sh + ~155 行
-  stdlib 比较器 + 8 组自测 + 白名单运营化；`make difftest` 洁净态 exit 0；
-  本轮未发现解码器 bug，三处红灯全部裁定为渲染/上游行为差异并入白名单。
-  审阅 Important：ALW-FLOAT-WIDTH 类型盲 → 4613e0f 限 f32-canonical 侧 +
-  矩阵补 JSON 值变更 UPDATE；残留低精度漏洞 → 01edac7 再要求 canonical 侧
-  有效数字严格更多。见下 Task 15 节点）。前序：Task 14 端到端装配（275e1a6，
-  task-14-report.md）、Task 13 sqlopen（ebf8a10，task-13-report.md）
+- 状态：**Task 17 已完成——全版本兼容矩阵 5.6/5.7/8.0/8.4 全绿（`make compat`
+  exit 0，9 用例；唯一真解码器 bug = 5.7 FDE CRC 尾误判，RED→GREEN 修复
+  `b8f401c`，结果表 docs/compat/matrix.md，见下 Task 17 节点）**。前序：
+  Task 15 golden 差分基建（8.0 矩阵 21/21 全绿，
+  工具链 tools/{docker-mysql,run-difftest}.sh + gen-data.sql + 比较器 +
+  白名单；`make difftest` 洁净态 exit 0；审阅 Important：ALW-FLOAT-WIDTH
+  类型盲 → 4613e0f 限 f32-canonical 侧 + 矩阵补 JSON 值变更 UPDATE；
+  残留低精度漏洞 → 01edac7 再收紧。见下 Task 15 节点）。更早：Task 14
+  端到端装配（275e1a6，task-14-report.md）、Task 13 sqlopen（ebf8a10，
+  task-13-report.md）
 
 ## 任务节点日志
 
@@ -738,6 +740,46 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   5.7 signedness bitmap 与 TLV 差异预期由本比较器结构层吸收（num/text
   桥），真机跑通即销账 690 行残余。
 
+### Task 17: 全版本兼容矩阵 5.6/5.7/8.0/8.4（全绿）
+
+- 交付物：`tools/compat-matrix.sh`（9 用例编排 + 8.4 caching_sha2 探针，
+  复用 run-difftest 入口不复制步骤）、`docs/compat/matrix.md`（结果表 +
+  排除清单 + 真机勘误）、Makefile `compat` 目标。run-difftest.sh 扩展
+  （全 env 开关，默认行为与 T15 一致）：`CKSUM=none|crc32`（透传
+  docker-mysql）、`V1ROWS=1`（5.6 真机 V1 rows 事件用例）、
+  `gen-data-$VER.sql` 存在则优先（5.6 JSON 裁剪版 19 组）、步骤 7 =
+  离线 schema 回放（`--schema-dump` → `--schema-file` 重跑 →
+  与在线输出 `diff -r` 逐字节）；产物目录带 CKSUM/V1ROWS 后缀；
+  容器就绪后回显 `@@binlog_checksum` 等真机事实入日志。
+  docker-mysql.sh 扩展：CKSUM/V1ROWS/AUTH(stock)/DT_NAME 开关 +
+  **8.4 真机勘误**（见下）。
+- 结果（commit b8f401c，2026-09-21，全绿细节与复现 = docs/compat/matrix.md）：
+  5.6.51×3（默认 CRC32、NONE、V1rows）、5.7.44×2（CRC32、NONE）、
+  8.0.46、8.4.11 各 1 + 8.4 stock caching_sha2 在线元数据探针
+  （产物与 native 跑逐字节一致）。差分全对 19~21 组/用例，回放全等。
+- **唯一真解码器 bug（fix(task-12)，b8f401c）**：5.7+ mysqld 的 FDE
+  **恒带 4B CRC 尾**（即便 binlog_checksum=NONE，alg 字节在 len-5=0，
+  go-mysql event.go:186 同位读取）；旧 `handle_fde` 判定把 body[-1]
+  （实为 CRC 尾字节）当 alg——5.7-none 真机件尾字节恰 0x01 →
+  误判"声称 CRC32 但验证失败" → ChecksumMismatch 整跑挂。
+  RED=真机捕获件单测 `fixture_5_7_checksum_none_fde_carries_crc_tail`
+  （119B 逐字节 mysql:5.7.44 --binlog-checksum=none FDE）修复前必红。
+  三门禁复跑：cargo test 240+3+4 绿 / clippy -D / fmt。
+- 实测勘误（brief 假设 vs 真机）：① 5.6.51 默认 **CRC32**（非 NONE）且默认
+  产 **V2** rows 事件（V1 需 log_bin_use_v1_row_events=1——矩阵加测该用例，
+  事件普查 10W/6D/3U 全 V1 确认）；② 8.4.11
+  `--authentication-policy=mysql_native_password` **启动失败**（MY-013797，
+  native 插件默认 OFF）——正确姿势 `--mysql-native-password=ON` + 建库后
+  `ALTER USER 'root'@'%'` 为 native（docker-mysql.sh 已按实测改）；
+  ③ mysql 28（TLS off）对 8.4 caching_sha2 full-auth RSA 握手开箱可用
+  （探针 PASS，无需 TLS）。
+- 挂账销账/新增：NOTE ALW-56-JSON 兑现（数据级排除
+  tools/gen-data-5.6.sql，登记 matrix.md，比较器零改动）；
+  V0 rows 事件确认 5.6+ 无开关可产出（矩阵排除维持，路由层硬错误立场不变）。
+- 对后续影响：`make compat` = P1 收尾验收门之一；T16（性能/收尾）若改
+  run-difftest 须保持 7 步契约；gen-data.sql 改动必须同步 gen-data-5.6.sql
+  （文件头已钉注释）；8.4/5.6 镜像已在本机（后续无需再拉）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -752,7 +794,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 ## 环境事实
 
-- 本机：docker（镜像 mysql:5.6/5.7/8.0 已就绪，8.4 需拉取）、Go 工具链 /opt/go/bin、cargo/rustc 最新 stable
+- 本机：docker（镜像 mysql:5.6/5.7/8.0/8.4 全部就绪，T17 已拉 8.4）、Go 工具链 /opt/go/bin、cargo/rustc 最新 stable
 - 工作区：`/home/cxd/Projects/aiediter/my2sql`
 - SDD 台账：`.superpowers/sdd/2026-09-20-my2sql-rs-p1/progress.md`（git-ignored，恢复上下文先读它）
 
