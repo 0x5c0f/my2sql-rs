@@ -9,7 +9,6 @@
 //! 注：`signed` 不属于本事件——unsigned 判定在 Task 11 由 metadata 层提供。
 
 // 骨架阶段本模块尚无生产消费者（Task 10/12 接入），参照 Task 1-3 允许死代码。
-#![allow(dead_code)]
 
 use super::error::BinlogError;
 use super::field_types as tp;

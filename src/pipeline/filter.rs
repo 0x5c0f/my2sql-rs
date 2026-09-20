@@ -23,9 +23,6 @@
 //!   按 `db.table` 精确匹配；不含 `.` → 按表名匹配（= 上游行为）。
 //!   差分测试给裁判喂不含 `.` 的条目即可保持上游等价。
 
-// 生产消费者在 T14 管道装配；bin crate 视角下 pub 项暂不可达，参照同级模块豁免。
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 
 use crate::binlog::rows::RowsKind;
@@ -171,7 +168,7 @@ impl Filters {
         true
     }
 
-    /// 该 rows 种类是否启用（空 dml 列表 = 全部，`Config::dml_enabled` 同款）。
+    /// 该 rows 种类是否启用（空 dml 列表 = 全部；原 `Config::dml_enabled`，T14 收口于此）。
     pub fn dml_ok(&self, kind: RowsKind) -> bool {
         self.dml.is_empty() || self.dml.contains(&Dml::from(kind))
     }

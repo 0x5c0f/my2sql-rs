@@ -8,7 +8,6 @@
 //! bitmap 位序为 LSB first（bit i 位于 `bits[i/8]` 的第 `i%8` 位），bit==1 表示 NULL。
 
 // 骨架阶段本模块尚无生产消费者（Task 5-10 接入），参照 Task 1/2 允许死代码。
-#![allow(dead_code)]
 
 use super::error::BinlogError;
 
@@ -72,6 +71,8 @@ pub fn bit_width(n_cols: usize) -> usize {
 /// 位序 LSB first：第 i 位取自 `bits[i/8]` 的 bit `i%8`。
 pub struct BitmapCursor<'a> {
     bits: &'a [u8],
+    /// 每行位宽（字节数）：保留供调用方按行对齐；当前游标连续推进不读此字段。
+    #[allow(dead_code)] // 构造期契约字段，行重置由调用方负责（见模块文档）
     bit_width: usize,
     pos: usize,
 }

@@ -19,8 +19,7 @@
 //!   属对上游已知序号-0 缺陷的刻意偏离（差异记录见报告/HANDOVER）。
 
 // T11 起生产消费者为 store.rs 与 T13/T14（本层 align_cols/key_indexes/TableMap
-// 相关项在 pipeline 接入前仅测试消费），沿用骨架期豁免。
-#![allow(dead_code)]
+// 相关项在 pipeline 接入前仅测试消费）。
 
 use serde::{Deserialize, Serialize};
 

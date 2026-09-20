@@ -23,13 +23,12 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 12 已完成**（事件源层：FileReader（Read+Seek 泛型文件事件源）+
-  Filters（位点/时间/库表/DML 过滤）+ TrxStateMachine；前置 step-0 修复
-  （rows 活锁守卫/tm 越界加固/36·37 常量，1484cdd）；`cargo test` 191 绿
-  （1 ignored = 真库 live 测试）、clippy -D warnings、fmt 干净；
-  上游对账真相（start_pos=TABLE_MAP 起始、单文件跨文件语义、FDE CRC 置零
-  flags 特例）见下节点与 task-12-report.md）。上一里程碑：Task 11 metadata
-  层（task-11-report.md）
+- 状态：**Task 14 已完成（端到端首交付）**（流水线装配：dispatcher/Reorder
+  保序/worker 池/output Writer + `tests/e2e.rs` 4 集成测试；`cargo test`
+  236+3+4=243 绿（1 ignored = 真库 live）、clippy -D warnings、fmt 干净；
+  extra-info 与上游 events.go:322-326 模板+下划线 datetime 字节平价（收尾者
+  独立复核）；架构偏差 lib.rs 见下节点）。前序：Task 13 sqlopen（ebf8a10，
+  task-13-report.md）、Task 12 事件源层（task-12-report.md）
 
 ## 任务节点日志
 
@@ -599,6 +598,52 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   rollback（flashback）方向语义（P2）本层已按上游结构预留对偶性——WHERE
   恒取 before 镜像，P2 翻转时交换 before/after 即可复用。
 
+### Task 14: 流水线装配 + output writer（端到端首交付）
+
+- 做了什么（代码+文档本次单提交）：`src/pipeline/order.rs`（Reorder：
+  HashMap 缓冲+连续弹出，pending>2×threads 反压对齐 D7）、
+  `src/pipeline/worker.rs`（SqlGroup/Job/build_groups/worker_loop）、
+  `src/output.rs`（Writer：path_for `to_sql.{schema.table.}<N>.sql`、
+  SET NAMES utf8mb4 头、extra-info 注释行）、`src/pipeline/mod.rs`
+  （Runner 装配：FileReader→filter→trx 机→编号→threads=1 直通或并行
+  worker 池→reorder→Writer；schema 配对/Arc 下发在 dispatcher）、
+  `src/main.rs` 薄壳化（from_args→run_to_sql→摘要行）、`tests/e2e.rs`
+  （合成 binlog 全链路 4 测试，threads=1 vs 4 输出逐字节等价钉死）。
+- T13/T11/T12/T10 carry-ins **销账**：sqlopen/filter/file_reader/store/rows
+  等 11 处模块级 `#![allow(dead_code)]` 随生产接线全部移除（残留 4 处字段级
+  豁免均有终态理由，见 task-14-report.md 盘点）；add-extra-info 包表层归本
+  任务已交付；`SqlOpts::from_config`/`DmlBuilder` 零新字段消费落地；
+  `--time-zone` 注入路径落地（Config.time_zone: FixedOffset → Writer，
+  兑现 T10 节点「tz_offset_secs 恒 0、T14 经参数注入」承诺——**仅输出边沿
+  使用 chrono**，列值解码链不引 chrono，D3 不破）；`--schema-dump` 经
+  Runner::dump_schema 接 T11 API；多文件续读按 T12 裁定 7 落地（仅 stop
+  条件存在时跨文件，镜像 file.go:74-85）；`Config::dml_enabled` 删除，
+  DML 过滤唯一入口 `Filters::dml_ok`。
+- 上游对照结论（收尾者独立复核，前实施者声明成立）：extra-info 模板
+  `# datetime=%s database=%s table=%s binlog=%s startpos=%d stoppos=%d\n`
+  （events.go:322-326）与 datetime 下划线形 `DATETIME_FORMAT_NOSPACE =
+  "2006-01-02_15:04:05"`（events.go:170 + constvar.go:6）**字节平价**；
+  带空格 `DATETIME_FORMAT` 仅上游 CLI 输入解析（context.go:292/303），
+  `..._NOSPACE_FILE` 上游零引用——不落入 extra-info。保序机制以 Reorder+
+  反压替代上游自旋锁（events.go:176-193），语义等价（D7）。
+- **架构偏差（控制器裁定，采案 a）**：spec 原为 bin-only crate，集成测试
+  无 lib 目标不可编译 → 新增 `src/lib.rs` 作**薄模块根**（仅 `pub mod`
+  声明+层序注释，零逻辑）；`main.rs` 为唯一二进制且仅薄壳委派
+  `my2sql_rs::pipeline::run_to_sql`；`Cargo.toml` 未动（src/lib.rs +
+  src/main.rs 自动发现，包名 my2sql-rs → 外部名 `my2sql_rs`）。
+- 决策：逐事件错误 = robust-continue（skip+原子计数+空批填洞，仅文件级
+  损坏终止；上游多数同类 Fatalf）；schema 获取/缓存全部在 dispatcher
+  （SchemaStore `&mut` 单线程），worker 零共享；Align 每 (tm,schema) 对一
+  次甄别/告警去重，每事件对账仍走 DmlBuilder::plan（T13 API 不变）；
+  datetime 用固定偏移而非主机 TZ（确定性，T15 裁判固定 TZ 复现）；
+  stdout 模式与文件模式统一字节面（含 SET NAMES 头与 extra-info）。
+- 遗留/对后续影响：**P2 回滚配对 seam**：SqlGroup.trx_id 已透传、
+  TrxStateMachine 状态在 prepare 处可得，flashback 的 before/after 交换
+  复用面已留（T13 节点「对偶性」段）；**真实 binlog 冒烟归 T15**
+  （tools/docker-mysql.sh 建成后自动化差分，本任务以 e2e fixture 为准，
+  简报 Step 3 口径）；reorder `drain_remaining` 为 seq 断流病理防御，
+  正常路径恒空。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -639,3 +684,6 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单：blob 字面量形态 本侧 `0xUPPERHEX` vs 上游 `X'lowerhex'`（sqltypes.go:567-570）——语义等价 SQL，比较器须双解（T13 裁定 1 重设计，非 parity 缺陷）
 - [x] ~~T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict~~——T13 定稿：`SqlOpts::strict_schema` 默认 **false**（非 strict：dropped 位列清单/WHERE 省略+warn、Truncated 静默前缀），true 经 align_cols 逐事件 ColCountFatal；与上游有效行为等价的论证见 Task 13 节点「裁定 2 定稿」段
 - [ ] T15 夹具约束（T11 审阅发现）：上游 UniqueKeys 为 Go map 序（mysqlFuncs.go:221-238），多 uk 表 GetOneUniqueKey 选择跨运行不稳定；本侧确定性序更优——差分夹具限 ≤1 候选 uk 或容忍键选择分歧
+- [ ] T15 白名单（T14）：`SET NAMES utf8mb4;` 文件头为本项目计划约束，上游 Go 版无此行（python my2sql 有）——比较器须容忍首行
+- [ ] T15 白名单（T14）：`--to-stdout` 模式本侧与文件模式统一字节面（SET NAMES 头+extra-info 一并入屏幕流），上游屏幕模式仅打语句（events.go OutputToScreen 分支）
+- [ ] T15 纪律（T14）：extra-info datetime 本侧按 `--time-zone` 固定偏移渲染（下划线形与上游字节平价），上游走运行主机 TZ——差分双方须显式给同一 `--time-zone`/`TZ` 再比对

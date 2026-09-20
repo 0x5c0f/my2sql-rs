@@ -12,8 +12,6 @@
 //! - `sqlbuilder/expression.go` `Eq`(:441-447)：NULL 右值渲染为 `col IS null`
 //!   而非 `col = null`——本层镜像为反引号列名 + ` IS NULL`。
 
-#![allow(dead_code)] // 生产消费者（pipeline 装配 + Config→SqlOpts）在 T14 接线
-
 pub mod dml;
 pub mod encode;
 

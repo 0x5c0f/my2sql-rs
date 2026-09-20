@@ -118,9 +118,6 @@ pub struct ToSqlArgs {
 }
 
 /// 校验并归一化后的运行配置。后续所有任务从这里取参数。
-// 骨架阶段多数字段尚无消费者（Task 9-14 逐个接入读取），派生 Debug/Clone 不计入
-// dead-code 分析，故临时放行；管道装配完成后应移除本 allow。
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub binlog_dir: PathBuf,
@@ -261,12 +258,6 @@ impl Config {
             time_zone,
             threads: args.threads,
         })
-    }
-
-    /// 该 DML 类型是否需要处理（空 dml 列表 = 全部）。
-    #[allow(dead_code)] // Task 12 过滤器接入后移除
-    pub fn dml_enabled(&self, d: Dml) -> bool {
-        self.dml.is_empty() || self.dml.contains(&d)
     }
 }
 

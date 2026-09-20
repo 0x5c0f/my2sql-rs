@@ -13,10 +13,6 @@
 //! - JSON 文件格式为 controller 裁定 1（上游 ReadTblDefJsonFile/
 //!   DumpTblDefToFile 在参考拷贝中仅有字段、无实现，不存在可对照行为）。
 
-// SchemaStore 生产接线在 T14（cli --uri/--schema-file/--schema-dump），
-// 骨架期允许死代码，接入后移除。
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 

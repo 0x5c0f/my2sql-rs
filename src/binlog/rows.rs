@@ -64,10 +64,6 @@
 //! - 时间列会话时区：本层 `tz_offset_secs` 恒 0（brief 签名无该参数；
 //!   T14 若需 `--time-zone` 驱动，经扩展入口或参数注入，接缝记录在案）。
 
-// 行级生产消费者在 T12（FileReader→路由）接入；bin crate 视角下 pub 项
-// 暂不可达，参照同级模块保留死代码豁免至 T12。
-#![allow(dead_code)]
-
 use super::error::BinlogError;
 use super::int::ColumnValue;
 use super::proto::{BitmapCursor, bit_width, read_lne};

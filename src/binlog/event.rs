@@ -5,7 +5,6 @@
 //! 对齐上游 my2sql-go base/file.go:162 对 `<=19` 的 fatal 判定，T14 Step-0）。
 
 // 骨架阶段本模块尚未接入 main 管道（Task 12+ 消费），参照 Task 1 对 config 的处理。
-#![allow(dead_code)]
 
 use super::error::BinlogError;
 

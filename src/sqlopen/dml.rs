@@ -37,9 +37,6 @@
 //! - **Missing 值**（裁定 3）：唯一来源是 8.0.1 partial rows，T10 decode_rows
 //!   已在解码层拒收——值位置命中即 InvalidData 硬错误（防御性，非出货路径）。
 
-// 生产接线在 T14（pipeline 装配消费 DmlBuilder/SqlOpts::from_config）。
-#![allow(dead_code)]
-
 use crate::binlog::error::BinlogError;
 use crate::binlog::int::ColumnValue;
 use crate::binlog::rows::Row;

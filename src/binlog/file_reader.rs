@@ -26,9 +26,6 @@
 //! - 与上游的另一处有意差异：上游 my2sql-go **从不校验** checksum（仅按 FDE
 //!   声明剥 4B），本层对每个事件验 crc32（敌意输入防线，FDE 特例见 event.rs）。
 
-// 生产消费者在 T14 管道装配；bin crate 视角下 pub 项暂不可达，参照同级模块豁免。
-#![allow(dead_code)]
-
 use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::Arc;

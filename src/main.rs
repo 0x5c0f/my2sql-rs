@@ -1,21 +1,22 @@
-//! my2sql-rs：MySQL binlog 解析 / 还原 SQL 工具（入口装配骨架）。
-
-mod binlog;
-mod config;
-mod metadata;
-mod pipeline;
-mod sqlopen;
+//! my2sql-rs：MySQL binlog 解析 / 还原 SQL 工具（入口装配，逻辑在库层）。
 
 use std::process::exit;
 
-use config::Config;
+use my2sql_rs::config::Config;
+use my2sql_rs::pipeline::run_to_sql;
 
 fn main() {
     let cfg = Config::from_args();
-    // 占位：Task 12/13/14 将用 读取→解码→过滤→SQL 生成 管道替换此处。
-    eprintln!(
-        "to-sql: not wired yet (start_file={}, start_pos={}, threads={})",
-        cfg.start_file, cfg.start_pos, cfg.threads
-    );
-    exit(1);
+    // 进度/告警走 tracing（stderr）；默认全收（无 env-filter 特性），
+    // 摘要行单独 println 到 stdout。
+    tracing_subscriber::fmt::init();
+    match run_to_sql(&cfg) {
+        Ok(summary) => {
+            println!("{summary}");
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(1);
+        }
+    }
 }

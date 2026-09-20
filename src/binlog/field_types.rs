@@ -13,7 +13,7 @@
 
 // 常量子集按模块消费（如 DECIMAL/NEWDATE 仅测试穷举用），bin crate 视角下
 // 未引用项会报死代码——单一全量表设计使然，参照其余骨架模块豁免。
-#![allow(dead_code)]
+#![allow(dead_code)] // 完整参考表：未消费码为 P2/穷举预留
 
 pub const DECIMAL: u8 = 0;
 pub const TINY: u8 = 1;

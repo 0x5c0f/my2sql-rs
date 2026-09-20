@@ -80,3 +80,5 @@ feat: sql encoding and dml builders（`src/sqlopen/{mod,encode,dml}.rs`，
 `decode_rows→(inserts|deletes|updates)`；表名取 `tm.schema/tm.table`
 （binlog 面真名，上游 rEv.Table 同源）；`SqlError` 逐事件计错续跑；
 add_extra_info 注释包装在 T14 输出层。
+
+> 审阅更正（T13 review）：` AND ` 连接并非"上游同形"——上游多条件 WHERE 带括号 (expression.go conjunctExpression)，SET/VALUES 分隔符亦含空格；已入 HANDOVER 挂账清单 T15 白名单。

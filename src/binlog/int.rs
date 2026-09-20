@@ -12,7 +12,6 @@
 //! **1 字节（年份−1900）**，2 字节是 MariaDB 变体（D5 不支持）——按权威实现 1B。
 
 // 骨架阶段本模块尚无生产消费者（Task 9/10 接入），参照 Task 1-4 允许死代码。
-#![allow(dead_code)]
 
 use super::error::BinlogError;
 // 类型码统一取自 super::field_types（T10 Step 0 合并，原私有 `mod tp` 删除）。

@@ -1,7 +1,6 @@
 //! binlog 解码统一错误类型（Task 3-12 各解码函数均以 `Result<_, BinlogError>` 返回）。
 
 // ChecksumMismatch / UnexpectedEof 的构造点在后续任务，骨架阶段参照 Task 1 允许死代码。
-#![allow(dead_code)]
 
 use thiserror::Error;
 

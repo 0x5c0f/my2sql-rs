@@ -70,7 +70,7 @@ pub struct ColCtx<'a> {
 
 impl<'a> ColCtx<'a> {
     /// 便捷构造（tz 默认 0；测试密集使用，T10/T14 用完整结构体字面量）。
-    // 生产侧行解码走完整字面量（需注入 tz），本构造暂仅测试消费（T12+ 或移除豁免）。
+    // 生产侧行解码走完整字面量（需注入 tz），本构造仅测试消费（T14 装配后仍如此，豁免为最终态）。
     #[allow(dead_code)]
     pub fn new(tp: u8, meta: u16, schema: &'a SchemaCol) -> Self {
         Self {

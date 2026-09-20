@@ -20,9 +20,6 @@
 //!   不入 EventChan，file.go:245-268），上游对其无事务语义——简报「DDL→独立事务」
 //!   是本层为 T13 附加注释/回滚顺序引入的自有设计（记录为有意的上游超集）。
 
-// 生产消费者在 T14 管道装配；bin crate 视角下 pub 项暂不可达，参照同级模块豁免。
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::binlog::error::BinlogError;
