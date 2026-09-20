@@ -318,7 +318,10 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   int.rs 保留（`ColumnValue::Missing` 待 T10 构造）；value.rs 保留至 T10、
   schema.rs 保留至 T11。
 - 对后续任务的影响：见遗留清单新增三条（T2 事件码表勘误、T4 TLV 拒绝的
-  真机字节样本、varbinary→Str 白名单候选）。
+  真机字节样本、varbinary→Str 白名单候选）。另：value.rs 引入**第三份**私有
+  `mod tp`（T5 台账曾要求不得出现）——未做统一合并，因 T4 的 tp 命名与
+  decode_meta 匹配臂经真机校验、动它需独立评审轮；建议 T10 统一 int.rs+value.rs
+  两份（官方值），table_map.rs 一份保留或同轮处理。
 
 ## 环境事实
 
