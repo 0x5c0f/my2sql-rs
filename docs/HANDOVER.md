@@ -23,11 +23,13 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 15 已完成（golden 差分基建，8.0 矩阵 20/20 组全绿）**
-  （tools/docker-mysql.sh + gen-data.sql + run-difftest.sh + 147 行
-  stdlib 比较器 + 9 组自测 + 白名单运营化；`make difftest` 洁净态 exit 0；
-  本轮未发现解码器 bug，三处红灯全部裁定为渲染/上游行为差异并入白名单，
-  见下 Task 15 节点）。前序：Task 14 端到端装配（275e1a6，
+- 状态：**Task 15 已完成并经审阅两轮修订（golden 差分基建，8.0 矩阵 21/21 组全绿）**
+  （tools/docker-mysql.sh + gen-data.sql + run-difftest.sh + ~155 行
+  stdlib 比较器 + 8 组自测 + 白名单运营化；`make difftest` 洁净态 exit 0；
+  本轮未发现解码器 bug，三处红灯全部裁定为渲染/上游行为差异并入白名单。
+  审阅 Important：ALW-FLOAT-WIDTH 类型盲 → 4613e0f 限 f32-canonical 侧 +
+  矩阵补 JSON 值变更 UPDATE；残留低精度漏洞 → 01edac7 再要求 canonical 侧
+  有效数字严格更多。见下 Task 15 节点）。前序：Task 14 端到端装配（275e1a6，
   task-14-report.md）、Task 13 sqlopen（ebf8a10，task-13-report.md）
 
 ## 任务节点日志
@@ -675,8 +677,9 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `tools/comparator/compare.py`（147 行 ≤150 约束达标；环境无
   sqlparse/pip，走简报预案手写 stdlib 解析：引号态机 _scan +
   split_top/find_kw/split_kw + canon 字面量打标 + 组内多重集配对）、
-  `tools/comparator/selftest.py`（9 组 plain-assert：简报绑定 4 例含 2 例
-  故意不等 + 新增三规则各 1 正 1 反回归）、`tools/difftest-allowlist.txt`
+  `tools/comparator/selftest.py`（8 组 plain-assert：简报绑定 4 例含 2 例
+  故意不等 + 新增三规则各 1 正 1 反回归；初版标称「9 组」系计数虚高，
+  审阅后如实修正）、`tools/difftest-allowlist.txt`
   （挂账清单逐条运营化，本节点下表）、Makefile `difftest` 目标。
 - 对齐口径（非放宽）：双方单行语句（上游恒 1 行/句=本侧 insert_batch
   缺省）；extra-info (binlog,startpos,stoppos) 为对齐键，startpos 双方均
@@ -685,7 +688,8 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `--uri` 活库，与 oracle 同源，等宽无 strict 干扰；SET NAMES 头/
   空白/括号/引号形态由结构解析吸收。
 - 结果：`make difftest` 洁净态 exit 0，groups A=20 B=20 aligned=20
-  **green=20 red=0**；三门禁保持：cargo test 239+3+4=246 绿（1 ignored）、
+  **green=20 red=0**（修订后矩阵含 JSON 变更 UPDATE → 21/21，见下）；
+  三门禁保持：cargo test 239+3+4=246 绿（1 ignored）、
   clippy -D warnings、fmt 干净。
 - **解码器 bug：零**。首跑 17/20，三处红灯逐条溯源后全部裁定为渲染/上游
   行为差异（非 T4–T7 布局假设错误），证据链：① 组 7797（t_all zero 行）
@@ -700,6 +704,16 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   seteq 规则：多出的 SET 项仅当值为 JSON 文本才容忍、交集严格判等，
   JSON 解码覆盖仍由同组 INSERT 语句全量保真。若任一规则将来把真值差
   放绿，selftest 反例（第 5/6/7 组）先红。
+- **审阅两轮修订**（审阅者判「20/20 绿」本身可信，但白名单闸口不具对抗性）：
+  ① Important：ALW-FLOAT-WIDTH 原实现类型盲——f32 bits 兜底对任意 num/text
+  对生效，DECIMAL(10,2) 相邻值 12345678.90/.91 会漏绿（正是 T7 bug 形态）→
+  4613e0f 限定「一侧 f32-canonical 且同 bits」；② 审阅复测残留低精度漏洞
+  （16777216/16777217、12345679.0/.9、8388609.0/.6 一侧恰为 f32 精确值）→
+  01edac7 再收紧：canonical 侧有效数字须**严格多于**对侧（真 Go f64 展开必
+  满足，短文本相邻 DECIMAL/BIGINT 值必红），TDD 先红后绿，产物复跑 21/21；
+  ③ Minor：gen-data 原无 JSON 值变更 UPDATE，ALW-JSON-IN-SET 对本侧漏报
+  SET 变更不设防 → 4613e0f 在真实事务内补 `UPDATE t_json SET j=…`，本侧
+  正确发出变更列、进入交集严格比较（未暴露解码 bug），矩阵 20→21 组。
 - 挂账→机制运营化对照（权威登记 = tools/difftest-allowlist.txt）：
   ALW-JSON-KEYORDER/DOUBLE/HTMLESC→jeq 深比较；ALW-DECIMAL-TEXT→num/text
   桥 Decimal；ALW-BLOB-HEX/ALW-VARBINARY-STR→text↔bytes 双向桥；
