@@ -22,18 +22,18 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 ## 当前进度
 
 - 分支：`feat/p1`（main 只有文档）
-- 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 17 已完成——全版本兼容矩阵 5.6/5.7/8.0/8.4 全绿（`make compat`
-  exit 0，8 用例（修复轮 1 勘误：早先误记 9，tsv 实为 8 行）；唯一真解码器
-  bug = 5.7 FDE CRC 尾误判，RED→GREEN 修复
-  `b8f401c`，结果表 docs/compat/matrix.md，见下 Task 17 节点）**。前序：
-  Task 15 golden 差分基建（8.0 矩阵 21/21 全绿，
-  工具链 tools/{docker-mysql,run-difftest}.sh + gen-data.sql + 比较器 +
-  白名单；`make difftest` 洁净态 exit 0；审阅 Important：ALW-FLOAT-WIDTH
-  类型盲 → 4613e0f 限 f32-canonical 侧 + 矩阵补 JSON 值变更 UPDATE；
-  残留低精度漏洞 → 01edac7 再收紧。见下 Task 15 节点）。更早：Task 14
-  端到端装配（275e1a6，task-14-report.md）、Task 13 sqlopen（ebf8a10，
-  task-13-report.md）
+- 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成，P1 待终审**。
+- **P1 DoD 对账**（证据= Task 16 节点 + docs/bench/p1.md + docs/compat/matrix.md）：
+  ① `make difftest` exit 0（8.0 矩阵 21/21 绿 + 离线回放逐字节，T16 复跑）；
+  ② file 模式双 schema 源一致（`--uri` 在线 vs `--schema-file` 离线，
+  difftest 第 7 步 `diff -r` 硬闸 + T17 矩阵 8 用例全过）；
+  ③ 吞吐基线 ≥500MB @ threads=8 ≥40MB/s：**实测 108.9 MB/s（2.7×）**，
+  release 态 criterion（`cargo bench --bench decode`，数据 `tools/gen-bench-binlog.sh`）；
+  ④ `tests/fuzz_seed/` 3 件坏事件语料，解码层断言 Err-不-panic（T16，兼 P4 corpus）；
+  ⑤ test/clippy/fmt 三门全绿 + README 落地（本节点收尾复跑）。
+  前序：Task 17 全版本兼容矩阵（8 用例全绿，唯一真解码器 bug 修复 `b8f401c`）；
+  Task 15 golden 差分基建（21/21 绿，工具链 + 白名单）；Task 14 端到端装配
+  （275e1a6）；Task 13 sqlopen（ebf8a10）。
 
 ## 任务节点日志
 
@@ -741,6 +741,39 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   5.7 signedness bitmap 与 TLV 差异预期由本比较器结构层吸收（num/text
   桥），真机跑通即销账 690 行残余。
 
+### Task 16: 发布收尾——吞吐基线 / fuzz 语料 / README / 发布构建（P1 DoD 全项达成）
+
+- 交付物：① criterion 吞吐基线 `benches/decode.rs`（harness=false，端到端子进程
+  测 file 模式 to-sql；`[profile.bench] inherits="release"` 保证发布态口径；
+  输入缺失或 debug 档**自动跳过 exit 0**，洁净克隆 `cargo test --all-targets`
+  不受影响）+ 生成器 `tools/gen-bench-binlog.sh` 与 `tools/bench-growth.sql`
+  （服务端 INSERT…SELECT 放大 + W/U/D 混合，缓存 data/bench/ 带 marker+尺寸闸，
+  FORCE=1 重生成）；② `tests/fuzz_seed/`（3 个坏事件件：table_map 元数据截断、
+  rows present=0 livelock 形态、JSON 深度炸弹）+ `tests/fuzz_seed.rs`
+  （解码层走读断言 **Err 而非 panic**；FUZZ_SEED_REGEN=1 可再生 + 磁盘/构造器
+  漂移硬assert；头注释标明 P4 corpus 来源）；③ `README.md`（功能矩阵、
+  **实测过**的 docker 产数→to-sql 快速上手、差分说明、15 条与上游行为差异
+  摘录——白名单/决策条目curate）；④ `docs/bench/p1.md`（机器上下文、输入
+  溯源、criterion 原文、复现命令、发布构建记录、musl 性能悬崖实测量表）。
+- 吞吐结果（DoD-3 通过，release 态，528.8 MiB 单文件，errors=0）：
+  **threads=8 中位 103.85 MiB/s ≈ 108.9 MB/s（阈值 40MB/s 的 2.7 倍）**；
+  threads=1 41.37 MiB/s（扩展比 2.5×，串行点=reorder 刷出+写盘放大 ~871MB，
+  如实记录）。threads=1/8 输出 1,757,221 条语句逐字节确定一致。
+- 简报勘误（诚实口径）：「gen-data.sql ×20 ≈ 500MB」不成立——单次回放仅
+  ~37KB（difftest 000002=3MB 是初始化容器系统 DDL，非用户数据）；改用
+  服务端存储过程放大 62 轮 ≈ 554MB（2 分钟），max_binlog_size>1GB 会被
+  mysqld 静默截顶（MY-000081）。
+- 发布构建：`cargo build --release` 绿；`cargo build --target
+  x86_64-unknown-linux-musl`（debug+release）绿、static-pie 实证可运行——
+  musl **构建销账**；但同负载吞吐崩塌至 ~3.4 MiB/s（musl malloc arena 竞争，
+  8 线程 32×变慢），**性能挂账 P4**（候选 mimalloc/glibc-static），DoD 基线
+  口径 = glibc release。详见 docs/bench/p1.md。
+- 三门禁（本任务收尾复跑）：`make difftest` rc=0（21/21 绿 + 回放逐字节）、
+  `cargo test --all-targets` 绿（242+3+4+2，bench SKIP 路径验证）、
+  `cargo clippy --all-targets -- -D warnings` 零告警、`cargo fmt --check` 干净。
+- 遗留（不阻塞 P1）：吞吐 2.5× 扩展上限的画像优化（P4+，先 profile 再动）；
+  bench 输入生成器依赖本机 docker + mysql:8.0 镜像（CI 化归 P4）。
+
 ### Task 17: 全版本兼容矩阵 5.6/5.7/8.0/8.4（全绿）
 
 - 交付物：`tools/compat-matrix.sh`（8 用例编排 + 8.4 caching_sha2 探针，
@@ -807,7 +840,11 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - [ ] P2：flashback + stats（另出计划）
 - [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
-- [ ] P4：fuzz 正式接入、影子库端到端回放、musl 静态构建
+- [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 3 件 +
+  `tests/fuzz_seed.rs` 构造器/再生通道 FUZZ_SEED_REGEN=1）、影子库端到端回放、
+  **musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
+  static-pie 可运行；实测崩塌至 ~3.4 MiB/s——musl malloc arena 竞争，
+  候选 mimalloc / glibc-static，证据 docs/bench/p1.md）
 - [ ] spec §4.6 ENUM/SET 名称注释 → 推迟至 P2
 - [x] ~~T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）~~——ALW-ZERO-TIMESTAMP 落地（eq 零日期对，fsp 后缀须一致；selftest 第 6 组正反例）
 - [x] ~~T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数~~——ALW-FLOAT-WIDTH（≤17 有效位闸口 + f64/f32 同 bits）+ ALW-INT-SIGN-WRAP（mod 2^64）落地；1e+10 类经 num 桥 Decimal 直判等
