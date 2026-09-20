@@ -89,6 +89,29 @@ pub fn strip_checksum(payload: &mut Vec<u8>, with_crc: bool) {
     }
 }
 
+/// **FDE 校验和特例**（T12 Step-0 账载项，MySQL 规范行为）：
+/// `Format_description_log_event` 的 CRC32 覆盖 `[0, size-4)` 时，公共头的
+/// **flags 字段（字节 17..19）按全零参与计算**——mysqld 在写 FDE 时先算校验、
+/// 后置 `LOG_EVENT_BINLOG_IN_USE_F`，磁盘上的 flags 含该位。真机验证：
+/// 本仓库全部 4 个 8.0.46 fixture 的 FDE（flags=0x01、log_pos=126 非零参与
+/// 计算）按本规则逐字节吻合；普通 [`crc32_ok`] 口径对其必失败
+/// （rows.rs `walk_events` 当年被迫 `type != 15` 绕行，本函数补上正解）。
+/// 注：go-mysql（vendored parser.go:238-247）**完全不校验 FDE 的 crc**（FDE
+/// 分支只解析不验证）；上游 my2sql-go 更从不验证。本层取「验证」立场，
+/// 特例口径按 MySQL 写盘实现实证钉死（bytes 13..17 的 log_pos 参与计算由
+/// fixture log_pos=0x7E 非零事实锁定，不是整头清零）。
+pub fn fde_checksum_ok(ev: &[u8]) -> bool {
+    if ev.len() < EVENT_HEADER_SIZE + 4 {
+        return false;
+    }
+    let split = ev.len() - 4;
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&ev[..17]);
+    hasher.update(&[0u8; 2]); // flags 置零（规范特例）
+    hasher.update(&ev[EVENT_HEADER_SIZE..split]);
+    hasher.finalize() == u32::from_le_bytes(ev[split..].try_into().unwrap())
+}
+
 /// 校验 `body_with_crc`：前 `len-4` 字节的 crc32（crc32fast，即 IEEE CRC-32）
 /// 是否等于尾部 4 字节小端；`len < 4` 时返回 false。
 pub fn crc32_ok(body_with_crc: &[u8]) -> bool {
@@ -233,6 +256,33 @@ mod tests {
                 EventType(EventType::XID),
             ]
         );
+    }
+
+    /// T12 Step-0 账载项（FDE crc 特例）：真机 8.0.46 fixture 的 FDE 必须
+    /// 过 [`fde_checksum_ok`] 且**不过**普通 [`crc32_ok`]（钉死特例真实存在），
+    /// 其余事件反向（普通口径过）。篡改后双双失败。
+    #[test]
+    fn fixture_fde_needs_flags_zeroed_coverage() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/capture_8.0_minimal/mysql-bin.000003"
+        );
+        let data = std::fs::read(path).expect("fixture must be committed");
+        let h = parse_header(&data[4..]).unwrap();
+        assert_eq!(h.event_type.0, EventType::FORMAT_DESC);
+        assert_eq!(h.flags, 0x01, "真机 FDE 落盘 flags=IN_USE（计算时为零）");
+        let fde = &data[4..4 + h.event_size as usize];
+        assert!(fde_checksum_ok(fde));
+        assert!(!crc32_ok(fde), "普通口径对 FDE 必失败——特例存在的负证明");
+        let mut bad = fde.to_vec();
+        bad[30] ^= 0x80;
+        assert!(!fde_checksum_ok(&bad));
+        // 非 FDE 事件：普通口径过、无特例需求
+        let h2 = parse_header(&data[4 + h.event_size as usize..]).unwrap();
+        assert_eq!(h2.event_type.0, EventType::PREVIOUS_GTIDS);
+        let off = 4 + h.event_size as usize;
+        let ev2 = &data[off..off + h2.event_size as usize];
+        assert!(crc32_ok(ev2));
     }
 
     #[test]

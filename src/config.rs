@@ -191,7 +191,9 @@ impl Config {
         }
     }
 
-    fn validate(args: ToSqlArgs) -> Config {
+    /// 校验并归一化 `to-sql` 参数 → `Config`（T12 起对 `Filters` 等消费方可见；
+    /// 校验失败 `die` 直接退出进程，与 `from_args` 同路径）。
+    pub fn validate(args: ToSqlArgs) -> Config {
         if args.threads == 0 {
             die("--threads must be >= 1".into());
         }
