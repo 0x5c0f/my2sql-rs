@@ -211,6 +211,14 @@ fn decode_image(
 ) -> Result<Row, BinlogError> {
     let n = tm.n_cols;
     let present = (0..n).filter(|&i| bit_at(present_bits, i)).count();
+    // 活锁防护（T12 Step-0）：present==0（位图全 0 或 n_cols==0）时 null 区宽
+    // bit_width(0)=0，行镜像消耗 0 字节，外层 while 永不推进 → 敌意输入挂死。
+    // MySQL 从不发 0 列镜像的行，硬错误处理（D5）。
+    if present == 0 {
+        return Err(BinlogError::InvalidData(
+            "rows image has zero present columns (livelock guard)".into(),
+        ));
+    }
     let nb_bytes = bit_width(present);
     let null_bits = body
         .get(*pos..*pos + nb_bytes)
@@ -229,12 +237,16 @@ fn decode_image(
             continue;
         }
         let sc = schema.cols.get(i).unwrap_or(dropped);
+        // TableMapEvent 是 pub struct，字段间不互相约束（n_cols 可比数组长），
+        // 直接索引会把敌意构造变成 panic → 越界一律 TooShort（T12 Step-0）。
+        let tp = *tm.column_type.get(i).ok_or(BinlogError::TooShort)?;
+        let meta = *tm.column_meta.get(i).ok_or(BinlogError::TooShort)?;
         cols.push(decode_value(
             body,
             pos,
             &ColCtx {
-                tp: tm.column_type[i],
-                meta: tm.column_meta[i],
+                tp,
+                meta,
                 schema: sc,
                 tz_offset_secs: 0, // 本层无时区语义；T14 扩展接缝（见模块注释）
             },
@@ -708,6 +720,43 @@ mod tests {
         let b = body_v2(7, &[], 9, &[&[0xff, 0xff]], &[&one_full_row()]);
         let rows = decode_rows(&b, &tm, &schema_u9_wider(), RowsKind::Write, true).unwrap();
         expect_full_nine(&rows);
+    }
+
+    /// T12 Step-0（敌意输入）：cols-present 位图全 0（或 tm.n_cols==0）时
+    /// present=0 → null 区宽 bit_width(0)=0 → 行镜像消耗 0 字节 → while 循环
+    /// 永不推进（活锁）。必须报错而非空转。
+    #[test]
+    fn all_zero_present_bitmap_errors_instead_of_hanging() {
+        let tm = tm_u9(7);
+        // 位图 2 字节全 0（无任何 present 列），行区塞 1 字节垃圾保证进入循环
+        let b = body_v2(7, &[], 9, &[&[0x00, 0x00]], &[&[0xAB]]);
+        assert!(matches!(
+            decode_rows(&b, &tm, &schema_u9(), RowsKind::Write, true),
+            Err(BinlogError::InvalidData(_))
+        ));
+    }
+
+    /// T12 Step-0：pub struct `TableMapEvent` 字段不互相约束（敌意构造），
+    /// column_type/column_meta 短于 n_cols 时不得 panic（越界索引），
+    /// 必须报 TooShort。
+    #[test]
+    fn short_tm_arrays_error_not_panic() {
+        let mut tm = tm_u9(7);
+        tm.column_type.truncate(1); // n_cols 仍为 9，数组只剩 1 项
+        let mut r = vec![0x00, 0x00];
+        r.extend_from_slice(&ints(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        let b = body_v2(7, &[], 9, &[&[0xff, 0xff]], &[&r]);
+        assert_eq!(
+            decode_rows(&b, &tm, &schema_u9(), RowsKind::Write, true).unwrap_err(),
+            BinlogError::TooShort
+        );
+        let mut tm2 = tm_u9(7);
+        tm2.column_meta.truncate(1);
+        let b2 = body_v2(7, &[], 9, &[&[0xff, 0xff]], &[&r]);
+        assert_eq!(
+            decode_rows(&b2, &tm2, &schema_u9(), RowsKind::Write, true).unwrap_err(),
+            BinlogError::TooShort
+        );
     }
 
     // ---------- 真机 fixture 端到端 ----------

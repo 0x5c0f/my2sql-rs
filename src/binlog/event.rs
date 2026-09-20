@@ -38,6 +38,11 @@ impl EventType {
     pub const GTID_LOG: u8 = 33;
     pub const ANONYMOUS_GTID_LOG: u8 = 34;
     pub const PREVIOUS_GTIDS: u8 = 35;
+    /// 8.0.1+ 事务上下文事件（T12 Step-0 补录：原表为审阅过的子集，
+    /// 常量按官方 log_event.h / go-mysql const.go 序补齐）。
+    pub const TRANSACTION_CONTEXT: u8 = 36;
+    /// 8.0.1+ 视图变更事件。
+    pub const VIEW_CHANGE: u8 = 37;
 }
 
 /// binlog 事件公共头（19 字节，小端）。
@@ -163,8 +168,10 @@ mod tests {
             ("GTID_LOG", EventType::GTID_LOG),
             ("ANONYMOUS_GTID_LOG", EventType::ANONYMOUS_GTID_LOG),
             ("PREVIOUS_GTIDS", EventType::PREVIOUS_GTIDS),
+            ("TRANSACTION_CONTEXT", EventType::TRANSACTION_CONTEXT),
+            ("VIEW_CHANGE", EventType::VIEW_CHANGE),
         ];
-        let expected: [(&str, u8); 18] = [
+        let expected: [(&str, u8); 20] = [
             ("QUERY", 2),
             ("ROTATE", 4),
             ("FORMAT_DESC", 15),
@@ -183,6 +190,8 @@ mod tests {
             ("GTID_LOG", 33),
             ("ANONYMOUS_GTID_LOG", 34),
             ("PREVIOUS_GTIDS", 35),
+            ("TRANSACTION_CONTEXT", 36),
+            ("VIEW_CHANGE", 37),
         ];
         assert_eq!(actual, expected);
     }
