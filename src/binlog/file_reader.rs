@@ -118,7 +118,9 @@ impl<R: Read + Seek> FileReader<R> {
     /// （上游 mariadb 支持走独立事件码语义，D5 不猜测）；随后镜像
     /// go-mysql event.go:179-190 的版本门槛（≥5.6.1 才可能有 checksum），
     /// 用 [`fde_checksum_ok`]（flags 置零特例，T2 账载）实证探测 CRC 有无：
-    /// 通过且 alg 字节==1 → crc32；alg 字节声称 CRC32 但验证失败 → 损坏。
+    /// FDE 校验通过 → alg 字节取 len-5（5.7+ 真机：FDE 恒带 CRC 尾，NONE 态亦
+    /// 如此，T17 勘误）；校验不过 → FDE 无尾，body 末字节按 alg 解读，声称
+    /// CRC32 即判损坏。
     /// 注：go-mysql 对 FDE 本身**不验证** checksum（parser.go:238-247 FDE
     /// 分支绕开 verify），我们取验证立场并以真机 fixture 钉死口径。
     fn handle_fde(&mut self, full: &[u8]) -> Result<(), BinlogError> {
@@ -153,13 +155,17 @@ impl<R: Read + Seek> FileReader<R> {
         }
         self.with_crc = false;
         if server_version_ge(server, (5, 6, 1)) {
-            if full.len() >= EVENT_HEADER_SIZE + 5
-                && fde_checksum_ok(full)
-                && full[full.len() - 5] == 1
-            {
-                self.with_crc = true;
+            if full.len() >= EVENT_HEADER_SIZE + 5 && fde_checksum_ok(full) {
+                // FDE 带合法 CRC 尾 → alg 字节在 len-5（go-mysql event.go:186 同位）。
+                // T17 真机勘误：5.7 起 FDE **恒带 CRC 尾**，即便 binlog_checksum=NONE
+                // （mysqld 对 FDE 总是 `checksum_event`——声明位随体，校验尾不缺席）；
+                // 旧判定错把 body[-1]（=CRC 尾字节）当 alg，NONE 文件会被误判损坏。
+                if full[full.len() - 5] == 1 {
+                    self.with_crc = true;
+                }
             } else if body[body.len() - 1] == 1 {
-                // alg 字节声称 CRC32 但 FDE 验证不过 → 损坏/改写
+                // 无 CRC 尾形态（5.6.1~5.6.x 部分构建/合流）且 alg 声称 CRC32
+                // 但 FDE 验证不过 → 损坏/改写
                 return Err(BinlogError::ChecksumMismatch);
             }
         }
@@ -679,6 +685,39 @@ mod tests {
         s.bytes[n - 10] ^= 0x80;
         let mut r = reader(&s, Filters::none());
         assert_eq!(r.next().unwrap_err(), BinlogError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn fixture_5_7_checksum_none_fde_carries_crc_tail() {
+        // T17 真机回归（mysql:5.7.44, --binlog-checksum=none, mysql-bin.000003
+        // 首件 FDE，119B 逐字节捕获）：5.7 的 FDE **恒带 4B CRC 尾**——即便
+        // binlog_checksum=NONE（alg 字节在 len-5 处=0；go-mysql event.go:186 亦
+        // 无条件取 data[len-5]）。旧判定把 body[-1]（实为 crc 尾字节，此处恰为
+        // 0x01）当 alg 字节 → 误判"声称 CRC32 而验证失败" → ChecksumMismatch
+        // （RED = T17 矩阵 5.7-none 用例整跑挂，out/compat-5.7-none.log）。
+        let mut bytes = b"\xfebin".to_vec();
+        bytes.extend_from_slice(&[
+            0xe0, 0x2b, 0xb0, 0x6a, 0x0f, 0x01, 0x00, 0x00, 0x00, 0x77, 0x00, 0x00, 0x00, 0x7b,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x35, 0x2e, 0x37, 0x2e, 0x34, 0x34, 0x2d,
+            0x6c, 0x6f, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe0, 0x2b, 0xb0, 0x6a, 0x13, 0x38, 0x0d, 0x00, 0x08, 0x00, 0x12, 0x00, 0x04,
+            0x04, 0x04, 0x04, 0x12, 0x00, 0x00, 0x5f, 0x00, 0x04, 0x1a, 0x08, 0x00, 0x00, 0x00,
+            0x08, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x0a, 0x0a, 0x2a, 0x2a, 0x00, 0x12,
+            0x34, 0x00, 0x00, 0x3d, 0x4f, 0x03, 0x01,
+        ]);
+        let mut r = FileReader::new(
+            "mysql-bin.000003".into(),
+            Cursor::new(bytes),
+            Filters::none(),
+        )
+        .unwrap();
+        assert!(
+            r.next().unwrap().is_none(),
+            "FDE 由源消化后干净 EOF；不得报 ChecksumMismatch"
+        );
+        assert!(!r.with_crc, "alg 字节（len-5）=0 → NONE 态");
     }
 
     #[test]
