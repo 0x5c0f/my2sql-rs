@@ -23,11 +23,13 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 11 已完成**（metadata 层 SchemaStore online/offline +
-  align_cols 列数对账 + key_indexes 键名→序号；`cargo test` 152+3/155 绿
-  （1 ignored = 真库 live 测试，已对 docker mysql:8.0.46 与 5.6.51 双实例
-  实跑通过）、
-  clippy -D warnings、fmt 干净；详见 task-11-report.md）
+- 状态：**Task 12 已完成**（事件源层：FileReader（Read+Seek 泛型文件事件源）+
+  Filters（位点/时间/库表/DML 过滤）+ TrxStateMachine；前置 step-0 修复
+  （rows 活锁守卫/tm 越界加固/36·37 常量，1484cdd）；`cargo test` 191 绿
+  （1 ignored = 真库 live 测试）、clippy -D warnings、fmt 干净；
+  上游对账真相（start_pos=TABLE_MAP 起始、单文件跨文件语义、FDE CRC 置零
+  flags 特例）见下节点与 task-12-report.md）。上一里程碑：Task 11 metadata
+  层（task-11-report.md）
 
 ## 任务节点日志
 
@@ -442,6 +444,87 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   要求扩宽方向 fatal（见对照表「列数·扩宽」行）；`--schema-dump` 在 T14 接
   online 时仅含已缓存表（懒查语义，上游 GetTableInfoJson 亦惰性）。
   schema.rs/store.rs 模块级 `#![allow(dead_code)]` 保留至 T13/T14 生产接线。
+
+### Task 12: 事件源层（FileReader + Filters + 事务状态机）
+
+- 做了什么（提交 1484cdd 前置修复 + 227ba1f 功能）：
+  - `src/binlog/file_reader.rs`：`FileReader<R: Read+Seek>` 实现
+    `EventSource`（生产 `File` 经 `open()`，测试 `Cursor` 零临时文件）。
+    流程：magic `fe bin` 校验（错→InvalidData）→ FDE 消化（binlog version
+    ≠4 拒、server 串含 mariadb 拒——P1 矩阵外；`with_crc` 以
+    `fde_checksum_ok` 实证探测而非仅信声明字节）→ 逐事件
+    parse_header → **stop 判定在 header 后 body 前**（省 IO 收紧，停止
+    语义与上游一致）→ 常规事件 crc32 验证+剥 4B（人工 rotate log_pos=0
+    豁免）→ start 窗口「读了不产出」→ 分发 RawEvent。V0 行事件
+    （20/21/22）与 39（PARTIAL_UPDATE）路由层硬错误；rows 缺前置
+    TABLE_MAP 硬错误；PREVIOUS_GTIDS 结构性消化。
+  - `src/pipeline/source.rs`：`RawEvent{binlog,start_pos,end_pos,timestamp,
+    kind,body,tm:Option<Arc<TableMapEvent>>}`、`RawKind`
+    （Query/Xid/Gtid/Rows(RowsKind,v2)/Rotate/Other）、
+    `TrxStateMachine::feed()->(trx_id,TrxStatus)`。
+  - `src/pipeline/filter.rs`：`Filters::{none,from_config,accept,
+    pos_stopped,pos_pending}` + 库表/DML 名单。
+  - step-0（1484cdd）：rows.rs present==0 活锁守卫 + tm 数组 `.get()`
+    加固（RED=零位图挂死/越界 panic，GREEN=两测试）；event.rs 增补
+    TRANSACTION_CONTEXT=36、VIEW_CHANGE=37。
+- **上游对账真相**（本任务核心产出，裁定 2/4/7 的权威结论）：
+  - rows 事件 `start_pos` = **最近 TABLE_MAP 事件自身起始**（file.go:197-198
+    `tbMapPos = h.LogPos - h.EventSize`，:214-215 赋给行事件；非行事件
+    = 自身起始，file.go:276）。真实 fixture 钉死：WRITE_ROWS start=1020
+    = TABLE_MAP 起始，非简报可推断的行事件起点。
+  - 位点窗口按 **end_pos（header.LogPos）** 比较：`(name,end)<start` 跳过
+    （跨 start 的事件被包含），`(name,end)>=stop` 停止——**等号排除**；
+    名先字典序再位点（com.go:163-224 mysql.Position.Compare）。
+  - 时间窗口 `ts<start→续`、`ts>=stop→断`，unix u32 秒（com.go:63-74）。
+  - **跨文件真相**：上游默认**单文件**——EOF 后续读仅当设置 stop-file/
+    stop-datetime（file.go:74-85）；下一文件名 `%06d` 十进制推进
+    （funcs.go:98-103，999999→1000000 无截断）；rotate url **从不切文件**，
+    只更新比较用文件名标签（com.go:41-46），且 rotate 事件本身归属旧名
+    产出（file.go:214 造事件早于 com.go:43 改名）。简报「+06d 跨文件」
+    为部分真实（推导式存在，但非默认行为）。本层镜像：FileReader 恒
+    单文件（EOF→`Ok(None)`），rotate 只改名；多文件迭代归 T14，
+    `FileReader::next_binlog_name` helper 已就位。
+  - 上游**绝不 seek 到 start_pos**（file.go:118-122 原注释：seek 会因跳过
+    FDE/TABLE_MAP 而 panic）；本层同——窗口只过滤产出，FDE/TABLE_MAP 恒
+    消费。
+  - **FDE CRC 规范特例**：mysqld 计算 FDE 校验和时尚未写入
+    LOG_EVENT_BINLOG_IN_USE_F，故 FDE 的 CRC = crc32(event[0..len-4) 且
+    **header flags 字节 17..19 置零**；log_pos 字节照常参与。通用
+    `crc32_ok` 对真机 FDE 恒假（4 个 8.0.46 fixture 实证），`fde_checksum_ok`
+    专函数 + fixture 回归钉死；go-mysql 干脆跳过 FDE 验证
+    （parser.go:238-243 FDE 分支不触 verify），上游 my2sql-go **从不校验**
+    任何 checksum——
+    本层逐事件校验是文档化的更严立场（敌意输入防线）。
+- 与上游的有意偏差（均入 T15 白名单候选）：
+  - DDL Query 事件：上游 file 模式只把行事件送 SQL 生成（file.go:245-268），
+    Query/DDL 不出 SQL；本层状态机把非事务 Query 标记为独立已提交事务
+    （feed: begin→trx_id+1 Begin；其他 SQL→+1 Commit；XID→Commit；
+    ROLLBACK→Rollback 不改 id；GTID 33/34 透明——上游 com.go default→
+    C_reContinue 全忽略，裁定 1 保持 marker-only），出不出 SQL 归 T13。
+  - `--db/--table` 双形态：条目含 `.` → db.table 精确；无 `.` → 仅比表名
+    （兼容上游 bare-table 语义 context.go:196 的超集）。
+  - `stop_pos` 无 `stop_file`：上游 StopFilePos 仅随 -stop-file 生效
+    （context.go:325-334）；本层 from_config 以 start_file 回退名字、
+    缺位点取 u32::MAX（本工具 CLI 语义）。
+  - checksum 逐事件强制验证（上游零验证，见上）。
+- 关键接口（T13/T14 消费）：
+  - `FileReader::open(name:String, path:&Path, filters)->FileReader<File>`；
+    `FileReader::new(name, rdr:R, filters)`（R: Read+Seek）；
+    `EventSource::next()->Result<Option<RawEvent>,BinlogError>`，
+    `None`=干净终点（EOF 0B），截断 header（1..18B）=UnexpectedEof，
+    其余 IO 错映射 InvalidData("io: ..")（BinlogError 无 Io 变体）。
+  - rows 事件 `body` 剥头剥 CRC 后可直接 `decode_rows`（fixture 冒烟已
+    接）；`tm` 随事件携带 `Arc<TableMapEvent>`。
+  - `Filters::accept(&RawEvent)`（非行事件只过窗口；行事件无 tm →
+    fail-closed 拒）；`pos_stopped` 供主循环硬停。
+- 遗留/对后续影响：
+  - `Config::validate` 已 pub（Filters::from_config 测试需要）；失败路径
+    仍 `die()`→`process::exit(2)`——**凡测试调 validate 必须带 --uri 或
+    --schema-file**，否则整个测试进程被杀且只留一行 stderr（本任务实踩）。
+  - 36/37 常量本任务仅定义未消费（归 Other）；P2 flashback 若做 TXA 再消费。
+  - file_reader/filter/source 三模块 `#![allow(dead_code)]` 保留至 T14 接线。
+  - T14 若做多文件续读：仅当 stop 条件存在时（镜像 file.go:74-85 语义），
+    文件名推进用 `next_binlog_name`（十进制 %06d），不信任 rotate url 切文件。
 
 ## 校准记录
 
