@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 2 已完成**（event header 解码 + crc32，`cargo test` 11/11 绿、clippy -D warnings 干净）
+- 状态：**Task 3 已完成**（LNE 原语 + NULL bitmap 游标，`cargo test` 23/23 绿、clippy -D warnings 干净）
 
 ## 任务节点日志
 
@@ -76,6 +76,25 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `#[cfg(test)] mod tests` 内自足）；Task 15 引入 lib 目标后可 `mod fixtures;` 复用。
 - 遗留：event.rs / error.rs 顶部有临时 `#![allow(dead_code)]`（骨架阶段无生产消费者，
   沿 Task 1 惯例），Task 12+ 接入管道后移除。
+
+### Task 3: 协议原语（LNE / bitmap cursor）
+
+- 做了什么：新增 `src/binlog/proto.rs`——`read_lne`（1/2/3/8 字节前缀 length-encoded
+  整数）、`read_lns`（length-encoded 切片）、`bit_width`（`(n_cols+7)/8`，用 `div_ceil`）、
+  `BitmapCursor`（NULL 位游标，bit==1 为 NULL，LSB first，连续推进不重置）。
+  TDD：先写 11 个失败测试（RED：11 failed, todo!()），实现后全绿。未引入 mysql_common
+  （0.38 直接依赖已在 T2 移除，LNE 约 60 行自写）。
+- 关键接口（Task 4-10 消费）：
+  - `read_lne(&[u8], &mut usize) -> Result<u64, BinlogError>`：0xFB 按数值 251 返回
+    （NULL 哨兵语义由行解码层判定），0xFF → InvalidData，越界 → TooShort。
+  - `read_lns<'a>(&'a [u8], &mut usize) -> Result<&'a [u8], BinlogError>`。
+  - `BitmapCursor::new(bits, bit_width)` + `next_is_null(&mut self) -> bool`：
+    游标按读取次数线性推进，**换行不重置**——行边界由调用方控制（每行读 n_cols 次）；
+    位下标越出 bits 长度时返回 false 且仍推进（截断由上层校验）。
+- 与 brief 的对齐：Step1 跨字节用例——8 列 bitmap `[0b10000001, 0b00000010]`，
+  两行共 9 次读取断言列 0/列 7 为 NULL、第二行列 0 落入新字节 bit0。
+- 遗留：proto.rs 顶部 `#![allow(dead_code)]`（T5+ 消费后移除）；`BitmapCursor.bit_width`
+  字段当前仅 new() 存入、不参与位运算（预留行对齐）。
 
 ## 环境事实
 
