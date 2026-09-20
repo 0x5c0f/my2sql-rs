@@ -51,7 +51,20 @@ a = P("INSERT INTO `d`.`t` (`ts`) VALUES ('0000-00-00 00:00:00');")
 b = P("INSERT INTO `d`.`t` (`ts`) VALUES ('1970-01-01 00:00:01');")
 assert not veq(a, b), "zero-date rule must not leak"
 
-# 7) JSON-in-SET：上游恒在 UPDATE SET 带 JSON 列；非 JSON 多余项/交集不等仍红
+# 7) ALW-FLOAT-WIDTH 类型盲修复守卫：f32 bits 兜底仅当一侧 f32-canonical。
+#    DECIMAL(10,2) 相邻 BCD 值（f32 舍入后同 bits）必须判红（真实解码 bug 形态）
+a = P("INSERT INTO `d`.`t` (`x`) VALUES (12345678.90);")
+b = P("INSERT INTO `d`.`t` (`x`) VALUES (12345678.91);")
+assert not veq(a, b), "DECIMAL near-equal pair must stay red (f32-collapse leak)"
+a = P("INSERT INTO `d`.`t` (`x`) VALUES (-99999999.99);")
+b = P("INSERT INTO `d`.`t` (`x`) VALUES (-99999999.98);")
+assert not veq(a, b), "DECIMAL boundary pair must stay red (f32-collapse leak)"
+#    真 float 对（Go f64 最短展开 vs Rust f32 最短，一侧 canonical + 同 bits）判绿
+a = P("INSERT INTO `d`.`t` (`f`) VALUES (3.14);")
+b = P("INSERT INTO `d`.`t` (`f`) VALUES (3.140000104904175);")
+assert veq(a, b), "f32-canonical float pair must stay green"
+
+# 8) JSON-in-SET：上游恒在 UPDATE SET 带 JSON 列；非 JSON 多余项/交集不等仍红
 a = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":1}' WHERE `id`=1;")
 b = P("UPDATE `d`.`t` SET `v`=2 WHERE `id`=1;")
 assert veq(a, b), "json-in-set rule failed"
@@ -62,4 +75,4 @@ a = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":2}' WHERE `id`=1;")
 b = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":1}' WHERE `id`=1;")
 assert not veq(a, b), "JSON SET intersection must stay strict"
 
-print("comparator selftest: 9/9 groups (4 brief cases + 3 rule extensions + extras) OK")
+print("comparator selftest: 8/8 groups (4 brief cases + float-width guard + rule extensions) OK")

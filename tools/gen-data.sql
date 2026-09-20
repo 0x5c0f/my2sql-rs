@@ -1,6 +1,6 @@
 -- Task 15 差分数据矩阵（首绿目标 mysql:8.0；5.6 无 JSON 类型，T17 用表过滤处理）
 -- 覆盖：全类型 ×{正常,NULL,零值,边界} + unsigned 变体 + emoji + 非 UTF-8 blob
---       + 嵌套 JSON + DECIMAL(65,30) + 多行事务 + 单语句事务 + utf8/gbk 表混布
+--       + 嵌套 JSON + JSON 值变更 UPDATE + DECIMAL(65,30) + 多行事务 + 单语句事务 + utf8/gbk 表混布
 --       + 1 张仅 UK 表 + 1 张无键表
 -- 刻意排除（上游病理，见 HANDOVER 挂账 / difftest-allowlist.txt）：
 --   无变化 UPDATE 对（上游空 SET Fatalf）、多 UK 表（uk 序 nondeterminism）、
@@ -132,6 +132,7 @@ START TRANSACTION;
 INSERT INTO t_all (c_tiny,c_vc,c_json) VALUES (1,'trx-a','{"t":1}'),(2,'trx-b','{"t":2}'),(3,'trx-c','{"t":3}');
 UPDATE t_all SET c_vc='upd-1' WHERE id=1;
 UPDATE t_uk SET v=v+1 WHERE code='A001';
+UPDATE t_json SET j='{"changed":true,"bb":[1,2,{"deep":{"中文":"😀"}}],"n":12.0}' WHERE id=1;
 DELETE FROM t_nokey WHERE a=2;
 COMMIT;
 

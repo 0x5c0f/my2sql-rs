@@ -85,8 +85,13 @@ def eq(a, b):
         try:
             if dx == dx.to_integral_value() and dy == dy.to_integral_value() and int(dx) % (1 << 64) == int(dy) % (1 << 64): return True  # ALW-INT-SIGN-WRAP
             if sig(dx) > 17 or sig(dy) > 17: return False  # 高精度(DECIMAL65)保持严格
-            fx, fy = float(a[1]), float(b[1])  # ALW-FLOAT-WIDTH: Go按f64最短展开、Rust按f32最短，同bits即等
-            return fx == fy or struct.pack("!f", fx) == struct.pack("!f", fy)
+            # ALW-FLOAT-WIDTH: Go 把 f32 值按 f64 最短展开、Rust 按 f32 最短打印。
+            # 仅当一侧文本自身就是其 f32 值的精确 f64 还原(f32-canonical, 真 float 的
+            # 展开侧必满足)且两侧 pack 成同一 f32 bits 才容忍；DECIMAL 相邻值
+            # (如 12345678.90/.91)两侧均非 canonical、f32 舍入同 bits 也不放行。
+            fx, fy = float(a[1]), float(b[1])
+            bx, by = struct.pack("!f", fx), struct.pack("!f", fy)
+            return bx == by and (struct.unpack("!f", bx)[0] == fx or struct.unpack("!f", by)[0] == fy)
         except (InvalidOperation, ValueError, OverflowError): return False
     return False
 def jsonish(c): return c[0] == "text" and isinstance(jload(c[1]), (dict, list))
