@@ -778,6 +778,9 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 挂账销账/新增：NOTE ALW-56-JSON 兑现（数据级排除
   tools/gen-data-5.6.sql，登记 matrix.md，比较器零改动）；
   V0 rows 事件确认 5.6+ 无开关可产出（矩阵排除维持，路由层硬错误立场不变）。
+- 审阅两轮后控制器补刀（520a40b）：PROBE_ONLY=1 在全量 RESULTS 变量赋值行
+  即截断 tsv 的 bug——截断移至 PROBE_ONLY 分支 exit 之后；被清空的
+  out/compat-results.tsv 从 compat-full-run2.log 逐字恢复（8 行，tab 校验）。
 - 对后续影响：`make compat` = P1 收尾验收门之一；T16（性能/收尾）若改
   run-difftest 须保持 7 步契约；gen-data.sql 改动必须同步 gen-data-5.6.sql
   （文件头已钉注释）；8.4/5.6 镜像已在本机（后续无需再拉）。
