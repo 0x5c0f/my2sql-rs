@@ -1,0 +1,34 @@
+# my2sql-rs P1 Task 15 差分白名单 —— HANDOVER 挂账清单 T15 项的运营化落点
+# 每条 = 比较器规则 (RULE) 或 数据矩阵排除 (EXCL)。规则实现见 tools/comparator/compare.py
+# 对应函数；本文件是权威登记处（新挂账必须先登记再实现，禁止放宽值断言本身）。
+#
+# 通用前提（对齐配置，非放宽）：
+#   - 双方同开 extra-info；对齐键 = (binlog,startpos,stoppos)（load/HDR）。
+#   - 时区：容器 TZ=UTC + Go 裁判进程 TZ=UTC + Rust --time-zone +00:00
+#     → TIMESTAMP 列值与 extra-info datetime 双方同为 UTC（HANDOVER T14 纪律）。
+#   - 批量：双方均单行语句（上游恒 1 行/句；本侧 insert_batch 缺省=1）——
+#     无需多行/单行拆分对齐（比较器仍按组内多重集比较，容未来 batch 模式）。
+RULE  ALW-JSON-KEYORDER    T15白名单(T8)：对象键序=存储序(长度,memcmp) vs 纯字典序  → text-text 对 json.loads 深比较 (eq/jload/jeq)
+RULE  ALW-JSON-DOUBLE      T15白名单(T8)：double 文本 12.0 vs 12 / 1e21 vs 1e+21 / -0.0 vs -0 → jeq 内 Decimal(str) 数值判等
+RULE  ALW-JSON-HTMLESC     T15白名单(T8)：<>& U+2028/9 本侧原样 vs Go json.Marshal \uXXXX → json.loads 解转义后判等（unq 对未知 \x 保留反斜杠）
+RULE  ALW-DECIMAL-TEXT     T15白名单(T4/D4)：DECIMAL 精确文本 vs 上游文本 —— 正常应逐字节等；quoting/尾零差异经 num/text 桥 Decimal 判等 (eq)
+RULE  ALW-BLOB-HEX         T15白名单(T13)：本侧 0xUPPERHEX vs 上游 X'lowerhex'/原样字节 → 任一 0x/X' 形态即按字节比较 (canon/eq text-bytes 桥)
+RULE  ALW-VARBINARY-STR    T15白名单候选(T9)：varbinary 合法 UTF-8 时本侧 Str 引号化 → text-bytes 桥双向覆盖，无须排除
+RULE  ALW-ZERO-TIMESTAMP   T15白名单(T6 裁定)：TIMESTAMP 秒=0 本侧 1970-01-01 00:00:00 vs go-mysql formatZeroTime 0000-00-00 00:00:00 → 仅此字面对互判等；fsp 后缀须逐字符一致 (eq/ZERO_A/B)
+RULE  ALW-INT-SIGN-WRAP    T15白名单(T5)：BIT(64) 高位置 1 本侧 UInt 正数 vs go-mysql int64 负数；unsigned 大数 → 整数按 mod 2^64 判等 (eq)
+RULE  ALW-FLOAT-WIDTH      T15白名单(T5/T7 派生)：FLOAT 边界值上游按 f64 全展开(3.4028234663852886e+38) 本侧 f32 最短(3.4028235e38) → 仅当双方有效数字≤17、一侧文本 f32-canonical(经 f32 round-trip 不变) 且该侧有效数字严格多于对侧、两侧 pack 同 f32 bits 判等；恰好 f32 可表示的 DECIMAL/BIGINT 相邻值(16777216/17、12345679.0/.9)位数不增不放行，DECIMAL(65,30) 高有效位天然被 sig>17 闸口保持严格 (eq/sig)
+RULE  ALW-JSON-IN-SET      T15白名单(上游 sqlgen.go GenUpdateSetPart)：decoded JSON 非 []byte → 上游 UPDATE SET 恒含 JSON 列（即使未变）本侧按实际 diff 省略 → seteq：多出的 SET 项仅当值为 JSON 文本才容忍，交集逐列严格；JSON 解码覆盖由 INSERT 组 + 矩阵内 JSON 值变更 UPDATE（真实进入交集严格比较）保证 (veq/seteq/jsonish)
+RULE  ALW-WHERE-PARENS     T15白名单(T13 审阅)：上游 WHERE 带括号/本侧裸连；IS null vs IS NULL；SET ", " vs ","；AND 序 → 结构解析（cond/split_kw/sorted），文本不敏感
+RULE  ALW-IDENT-BACKTICK   T13 审阅：本侧反引号加倍 vs 上游不加倍（上游产坏 SQL）→ 夹具规避该形态；矩阵内库表列名不含反引号
+RULE  ALW-SETNAMES-HEADER  T15白名单(T14)：SET NAMES utf8mb4; 头行仅本侧有 → load() 跳过
+RULE  ALW-EXTRAINFO-DTZ    T15白名单(T14)：extra-info datetime 字段主机 TZ vs 固定偏移 → 不进对齐键；时区配置对齐（见通用前提）
+RULE  ALW-COLCOUNT-STRICT  T15纪律(T11/T13)：binlog 宽于 schema 上游恒 fatal → 差分夹具不做中途 ALTER/DROP COLUMN（本侧默认 non-strict 与上游等价于等宽场景）
+EXCL  ALW-NOCHANGE-UPDATE  T15白名单(T13)：UPDATE 行前后无变化 → 上游空 SET Fatalf。矩阵排除：所有 UPDATE 必改值（gen-data.sql 注释钉死）
+EXCL  ALW-MULTI-UK         挂账(T15 夹具约束 T11)：多 uk 表上游键选择 Go map 序不稳定。矩阵排除：每表 ≤1 候选 uk
+EXCL  ALW-EXPR-INDEX       挂账(T11)：表达式索引 Column_name="" 两边必分歧。矩阵排除：无表达式索引
+EXCL  ALW-DROP-COL-ALTER   本任务裁定：捕获中途 DROP COLUMN 的 strict-schema diff 语义复杂 → v1 矩阵排除（P2 再议）
+EXCL  ALW-JSON-OPAQUE-TIME T15白名单素材(T8)：JSON 内 TIME/DATETIME opaque 渲染分歧 → v1 矩阵不在 JSON 列放时间值（键序/double/HTML 三类已规则化覆盖）
+EXCL  ALW-TS-V1-LEGACY     V1 rows 事件（5.0 前）不在 P1 矩阵；5.6 起恒 V2/V1-rows-event 形态由 T17 覆盖
+NOTE  ALW-56-JSON          T17 兑现：JSON 类型 5.6 不存在 → 数据级排除 tools/gen-data-5.6.sql
+                           （剔 t_all.c_json / t_json / 事务内 JSON UPDATE，19 组 vs 21 组），
+                           排除登记 docs/compat/matrix.md；比较器规则零改动（矩阵级排除，非放宽）

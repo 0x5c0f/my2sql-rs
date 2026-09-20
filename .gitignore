@@ -1,2 +1,8 @@
 reference/
 target/
+.superpowers/
+data/
+out/
+tools/bin/
+
+__pycache__/

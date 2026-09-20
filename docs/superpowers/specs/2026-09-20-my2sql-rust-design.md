@@ -10,7 +10,7 @@
 ### 功能范围（一期全做）
 - work 能力：`to-sql`（正向 SQL）、`flashback`（回滚 SQL）、`stats`（DML 统计 + 大/长事务）
 - 取数模式：本地 binlog 文件解析（file）、伪装从库实时拉取（repl）
-- 目标服务端：仅 MySQL 5.7 / 8.0 / 8.4（含 9.x 尽力而为）；认证支持 mysql_native_password 与 caching_sha2_password
+- 目标服务端：MySQL **5.6** / 5.7 / 8.0 / 8.4（含 9.x 尽力而为）；认证支持 mysql_native_password 与 caching_sha2_password；5.6 需显式 `binlog_format=row`（工具在兼容性文档中说明，并在检测到 statement 格式时给出明确报错指引）
 - 明确不做：DDL 回滚、回滚结果直接执行（`--apply`）、MariaDB 专用事件、8.0.1 partial rows image 的 default_metadata 解析（检测到即显式报错，不猜）
 
 ### 超越上游项（本设计的增量价值）
