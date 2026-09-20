@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 1 已完成**（脚手架 + CLI 骨架，`cargo test` 3/3 绿、clippy -D warnings 干净）
+- 状态：**Task 2 已完成**（event header 解码 + crc32，`cargo test` 11/11 绿、clippy -D warnings 干净）
 
 ## 任务节点日志
 
@@ -51,6 +51,31 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 遗留：`Config` 与 `dml_enabled` 上有临时 `#[allow(dead_code)]`（骨架阶段字段无消费者），
   Task 12/13/14 接入后应移除。
 - 注意：mysql 28 默认特性含 `flate2/zlib`（构建需系统 zlib/cmake，本机已验证可编译）。
+
+### Task 2: event header 解码 + checksum
+
+- 做了什么：新增 `src/binlog/error.rs`（`BinlogError`：TooShort / ChecksumMismatch /
+  UnexpectedEof / InvalidData(String)，thiserror）与 `src/binlog/event.rs`
+  （`EVENT_HEADER_SIZE=19`、`EventType(pub u8)` newtype + u8 关联常量表、`EventHeader`、
+  `parse_header` / `strip_checksum` / `crc32_ok`）；`binlog/mod.rs` 声明两个子模块。
+  TDD：先写 8 个单测（RED：6 failed，todo!() 断言），实现后全绿。行为对照
+  go-mysql replication/event.go `EventHeader.Decode`（19 字节全小端；event_size<19 判
+  InvalidData，防下游按错误长度切片——此校验为对照参考实现补充，brief 未列）。
+- 关键接口（Task 3-12 消费）：
+  - `parse_header(&[u8]) -> Result<EventHeader, BinlogError>`（<19 字节 → TooShort）。
+  - `strip_checksum(&mut Vec<u8>, with_crc: bool)`（尾部剥 4 字节；<4 字节时不动）。
+  - `crc32_ok(&[u8]) -> bool`（crc32fast 前 len-4 比对尾 4 字节小端；<4 字节 → false）。
+  - `EventType` 常量：QUERY=2 CREATE_DB=3 ROTATE=4 FORMAT_DESC=15 XID=16 TABLE_MAP=19
+    HEARTBEAT=27 WRITE/UPDATE/DELETE_ROWS_V1=30/31/32 GTID_LOG=33 V2=34/35/36
+    PREVIOUS_GTIDS=37 ANONYMOUS_GTID_LOG=119（brief 内 "XID=15?" 注释为历史噪声，以本表为准）。
+- 依赖调整（Task 1 遗留债务）：移除了直接依赖 `mysql_common 0.38.2`（src 内零引用，
+  与 mysql 28 传递依赖的 0.37.3 双版本共存）。Task 3 若需 LNE 等原语，按 mysql 28
+  对齐补 `mysql_common 0.37` 或直接手写，勿再引入 0.38。
+- 与 brief 的偏差/细化：`tests/fixtures/events.rs` 仅存测试常量占位（bin-only crate 的
+  tests/ 子目录不会被 cargo 编译为测试目标；单测常量按 brief 要求在 event.rs 的
+  `#[cfg(test)] mod tests` 内自足）；Task 15 引入 lib 目标后可 `mod fixtures;` 复用。
+- 遗留：event.rs / error.rs 顶部有临时 `#![allow(dead_code)]`（骨架阶段无生产消费者，
+  沿 Task 1 惯例），Task 12+ 接入管道后移除。
 
 ## 环境事实
 
