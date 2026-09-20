@@ -21,7 +21,8 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 ## 当前进度
 
-- 分支：`feat/p1`（main 只有文档）
+- 分支：`main`（`feat/p1` 已于终审修复后合入并删除，merge commit `62d9f6a`，
+  合并复跑 245+3+5+2 全绿）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成；全分支终审
   已做，唯一一轮终审修复（#1 decimal panic 闸 / #2 SHOW 标识符转义 / #3 本文
   档口径修正）见 Task 16 节点「终审修复轮」与挂账清单**。
