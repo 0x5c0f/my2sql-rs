@@ -12,24 +12,12 @@
 #![allow(dead_code)]
 
 use super::error::BinlogError;
+use super::field_types as tp;
 use super::proto::{bit_width, read_lne, read_lns};
 
-/// MySQL 列类型常量（仅本模块 meta 长度表 / real_string_type 所需子集）。
-mod tp {
-    pub const DOUBLE: u8 = 0x04;
-    pub const FLOAT: u8 = 0x05;
-    pub const VARCHAR: u8 = 0x0F;
-    pub const BIT: u8 = 0x10;
-    pub const TIME2: u8 = 0x11;
-    pub const DATETIME2: u8 = 0x12;
-    pub const TIMESTAMP2: u8 = 0x13;
-    pub const NEWDECIMAL: u8 = 0xF6;
-    pub const BLOB: u8 = 0xFC;
-    pub const VAR_STRING: u8 = 0xFD;
-    pub const STRING: u8 = 0xFE;
-    pub const GEOMETRY: u8 = 0xFF;
-    pub const JSON: u8 = 0xF5;
-}
+// 类型码统一取自 super::field_types（T10 Step 0 合并）。原私有 `mod tp`
+// 把 FLOAT/DOUBLE 与时间 2 族命名相对官方值互换（三族在本模块 meta 长度表
+// 同走 1B 分支，值集合一致、行为从未出错，但命名系误，T5/T9 评审挂账至今）。
 
 /// TABLE_MAP 事件（19B 公共头之后的 body 解码结果）。
 #[derive(Debug, Clone, PartialEq, Eq)]

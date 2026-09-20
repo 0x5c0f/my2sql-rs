@@ -7,6 +7,8 @@
 pub mod decimal;
 pub mod error;
 pub mod event;
+/// MYSQL_TYPE_* 唯一常量表（T10 Step 0 合并三处私有 `mod tp`，仅层内使用）。
+pub(crate) mod field_types;
 pub mod int;
 pub mod json;
 pub mod proto;

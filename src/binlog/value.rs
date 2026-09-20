@@ -2,10 +2,9 @@
 //!
 //! 分支图逐条镜像 go-mysql `replication/row_event.go` 的
 //! `RowsEvent.decodeValue`（vendor 行号 :1004-1170，含 STRING 前奏 :1007-1022），
-//! 类型码取 `mysql/const.go:102-140` 官方 iota（FLOAT=4/DOUBLE=5、
+//! 类型码统一取 [`super::field_types`]（官方 iota：FLOAT=4/DOUBLE=5、
 //! TIMESTAMP2=17/DATETIME2=18/TIME2=19、JSON=245…GEOMETRY=255；
-//! 注意 table_map.rs 私有 `mod tp` 的 FLOAT/DOUBLE 与时间 2 族命名互换，
-//! 但数值集合一致、meta 宽度表不受影响，本模块以官方值为准）。
+//! T10 Step 0 起原私有 `mod tp` 与 table_map.rs 的误名副本一并并入该表）。
 //!
 //! 与简报/控制器的对接口径：
 //! - `ColCtx` 在简报 3 字段之外增 `tz_offset_secs`（TIMESTAMP2/V1 TIMESTAMP
@@ -58,36 +57,8 @@ use super::time::{
 };
 use crate::metadata::schema::SchemaCol;
 
-/// MySQL `enum_field_types` 官方码值（go-mysql `mysql/const.go:102-140`）。
-mod tp {
-    pub const DECIMAL: u8 = 0;
-    pub const TINY: u8 = 1;
-    pub const SHORT: u8 = 2;
-    pub const LONG: u8 = 3;
-    pub const FLOAT: u8 = 4;
-    pub const DOUBLE: u8 = 5;
-    pub const NULL: u8 = 6;
-    pub const TIMESTAMP: u8 = 7;
-    pub const LONGLONG: u8 = 8;
-    pub const INT24: u8 = 9;
-    pub const DATE: u8 = 10;
-    pub const TIME: u8 = 11;
-    pub const DATETIME: u8 = 12;
-    pub const YEAR: u8 = 13;
-    pub const VARCHAR: u8 = 15;
-    pub const BIT: u8 = 16;
-    pub const TIMESTAMP2: u8 = 17;
-    pub const DATETIME2: u8 = 18;
-    pub const TIME2: u8 = 19;
-    pub const JSON: u8 = 0xF5;
-    pub const NEWDECIMAL: u8 = 0xF6;
-    pub const ENUM: u8 = 0xF7;
-    pub const SET: u8 = 0xF8;
-    pub const BLOB: u8 = 0xFC;
-    pub const VAR_STRING: u8 = 0xFD;
-    pub const STRING: u8 = 0xFE;
-    pub const GEOMETRY: u8 = 0xFF;
-}
+// 类型码统一取自 super::field_types（T10 Step 0 合并，原私有 `mod tp` 删除）。
+use super::field_types as tp;
 
 /// 单列解码上下文：binlog 类型码 + TABLE_MAP 列 metadata + schema 交叉信息。
 ///

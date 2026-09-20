@@ -15,19 +15,8 @@
 #![allow(dead_code)]
 
 use super::error::BinlogError;
-
-/// MySQL `enum_field_types` 常量子集（数值与官方/go-mysql iota 顺序一致）。
-mod tp {
-    pub const TINY: u8 = 1;
-    pub const SHORT: u8 = 2;
-    pub const LONG: u8 = 3;
-    pub const FLOAT: u8 = 4;
-    pub const DOUBLE: u8 = 5;
-    pub const LONGLONG: u8 = 8;
-    pub const INT24: u8 = 9;
-    pub const YEAR: u8 = 13;
-    pub const BIT: u8 = 16;
-}
+// 类型码统一取自 super::field_types（T10 Step 0 合并，原私有 `mod tp` 删除）。
+use super::field_types as tp;
 
 /// 单列解码结果的全链路载体（后续任务按此精确匹配/消费）。
 ///
