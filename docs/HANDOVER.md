@@ -23,12 +23,12 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 14 已完成（端到端首交付）**（流水线装配：dispatcher/Reorder
-  保序/worker 池/output Writer + `tests/e2e.rs` 4 集成测试；`cargo test`
-  236+3+4=243 绿（1 ignored = 真库 live）、clippy -D warnings、fmt 干净；
-  extra-info 与上游 events.go:322-326 模板+下划线 datetime 字节平价（收尾者
-  独立复核）；架构偏差 lib.rs 见下节点）。前序：Task 13 sqlopen（ebf8a10，
-  task-13-report.md）、Task 12 事件源层（task-12-report.md）
+- 状态：**Task 15 已完成（golden 差分基建，8.0 矩阵 20/20 组全绿）**
+  （tools/docker-mysql.sh + gen-data.sql + run-difftest.sh + 147 行
+  stdlib 比较器 + 9 组自测 + 白名单运营化；`make difftest` 洁净态 exit 0；
+  本轮未发现解码器 bug，三处红灯全部裁定为渲染/上游行为差异并入白名单，
+  见下 Task 15 节点）。前序：Task 14 端到端装配（275e1a6，
+  task-14-report.md）、Task 13 sqlopen（ebf8a10，task-13-report.md）
 
 ## 任务节点日志
 
@@ -661,6 +661,69 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   `writer_traversal_names_never_escape_output_dir`（temp root 递归清点 = 2
   文件全在 dir 内）。三门禁（test 246 绿/clippy -D/fmt）复跑通过。
 
+### Task 15: golden 差分基建 vs Go 裁判（8.0 矩阵全绿）
+
+- 交付物：`tools/docker-mysql.sh`（版本参数化 5.6/5.7/8.0/8.4，
+  `--binlog-format=row --binlog-row-image=full --server-id=1`，挂载
+  `data/<ver>/`，8.x 强制 mysql_native_password——8.4 用
+  `--authentication-policy`，容器 TZ=UTC）、`tools/gen-data.sql`（全类型
+  ×{normal,NULL,zero,boundary} 矩阵 + unsigned + emoji + 非UTF8 blob +
+  嵌套 JSON(HTML 字符/\u2028/大整数) + DECIMAL(65,30) + 多行事务 +
+  单语句 autocommit + utf8mb3/GBK 表 + 1 个仅-UK 表 + 1 个无键表）、
+  `tools/run-difftest.sh`（6 步：selftest→双构建→容器+灌数据→oracle
+  file 模式→本侧 to-sql→比较；trap 清理容器，KEEP=1 失败时保留调试）、
+  `tools/comparator/compare.py`（147 行 ≤150 约束达标；环境无
+  sqlparse/pip，走简报预案手写 stdlib 解析：引号态机 _scan +
+  split_top/find_kw/split_kw + canon 字面量打标 + 组内多重集配对）、
+  `tools/comparator/selftest.py`（9 组 plain-assert：简报绑定 4 例含 2 例
+  故意不等 + 新增三规则各 1 正 1 反回归）、`tools/difftest-allowlist.txt`
+  （挂账清单逐条运营化，本节点下表）、Makefile `difftest` 目标。
+- 对齐口径（非放宽）：双方单行语句（上游恒 1 行/句=本侧 insert_batch
+  缺省）；extra-info (binlog,startpos,stoppos) 为对齐键，startpos 双方均
+  TABLE_MAP 事件起点；oracle 进程 TZ=UTC + 本侧 `--time-zone +00:00` +
+  行解码链恒 UTC（T10 纪律），datetime 字段不进对齐键；本侧 schema 走
+  `--uri` 活库，与 oracle 同源，等宽无 strict 干扰；SET NAMES 头/
+  空白/括号/引号形态由结构解析吸收。
+- 结果：`make difftest` 洁净态 exit 0，groups A=20 B=20 aligned=20
+  **green=20 red=0**；三门禁保持：cargo test 239+3+4=246 绿（1 ignored）、
+  clippy -D warnings、fmt 干净。
+- **解码器 bug：零**。首跑 17/20，三处红灯逐条溯源后全部裁定为渲染/上游
+  行为差异（非 T4–T7 布局假设错误），证据链：① 组 7797（t_all zero 行）
+  c_ts3 本侧 `1970-01-01 00:00:00` vs go-mysql formatZeroTime
+  `0000-00-00 00:00:00`——T6 既有裁定，扩展为零日期对 + fsp 后缀逐字符
+  一致方可判等；② 组 8317（boundary 行）c_float=FLOAT 最大值：oracle
+  按 f64 全展开 `34028234663852886000…`、本侧 f32 最短 `34028235e38`，
+  双方 f32-pack 同 bits → 白名单规则，且以「双方有效数字≤17」闸口
+  保护 DECIMAL(65,30) 严格性（自测第 5 组钉死不泄漏）；③ 组 23618
+  （t_json UPDATE）上游 sqlgen.go GenUpdateSetPart 对 decoded JSON 的
+  `[]byte` 断言失败 → 「恒视为变更」写进 SET，本侧按实际 diff 省略 →
+  seteq 规则：多出的 SET 项仅当值为 JSON 文本才容忍、交集严格判等，
+  JSON 解码覆盖仍由同组 INSERT 语句全量保真。若任一规则将来把真值差
+  放绿，selftest 反例（第 5/6/7 组）先红。
+- 挂账→机制运营化对照（权威登记 = tools/difftest-allowlist.txt）：
+  ALW-JSON-KEYORDER/DOUBLE/HTMLESC→jeq 深比较；ALW-DECIMAL-TEXT→num/text
+  桥 Decimal；ALW-BLOB-HEX/ALW-VARBINARY-STR→text↔bytes 双向桥；
+  ALW-ZERO-TIMESTAMP→零日期对(含fsp)；ALW-INT-SIGN-WRAP→整数 mod 2^64；
+  ALW-FLOAT-WIDTH→≤17 位闸口 + f64/f32 同bits；ALW-JSON-IN-SET→seteq；
+  ALW-WHERE-PARENS/ALW-IDENT-BACKTICK→cond/idn 结构解析；
+  ALW-SETNAMES-HEADER→load 跳头；ALW-EXTRAINFO-DTZ→对齐键不含
+  datetime；ALW-COLCOUNT-STRICT/EXCL ALW-NOCHANGE-UPDATE/ALW-MULTI-UK/
+  ALW-EXPR-INDEX/ALW-DROP-COL-ALTER/ALW-JSON-OPAQUE-TIME/ALW-TS-V1-LEGACY
+  →gen-data.sql 头部注释钉死的矩阵排除；NOTE ALW-56-JSON→T17 预案。
+- 环境事实（容器侧，T17 复用）：本机 uid 999 已被 dnsmasq 占用 →
+  datadir chown/chmod 走 `docker run --rm -u 0 --entrypoint chown/sh`
+  助手容器；binlog 文件 640/uid999 须 `chmod a+r mysql-bin*`+`a+rX` 否则
+  两侧读档均失败（oracle 读到不可读时**静默 exit 0**，run 脚本以
+  forward*.sql 存在性硬护栏兜底）；`mysqladmin ping` 走 socket 会误中
+  临时初始化服务（skip-networking）→ 就绪探测必须 TCP
+  `-h127.0.0.1 -P3306`；mysql:8.0 容器 `--memory=1g` 会 OOM 静默断连 →
+  2g；Go 侧 `go build` 需 PATH 加 /opt/go/bin。
+- T17 预备：5.6 无 JSON 类型 → 差分需表/列过滤（ALW-56-JSON，矩阵
+  t_json + t_all.c_json）；8.4 `--default-authentication-plugin` 已移除，
+  docker-mysql.sh 已按版本切换 `--authentication-policy=mysql_native_password`；
+  5.7 signedness bitmap 与 TLV 差异预期由本比较器结构层吸收（num/text
+  桥），真机跑通即销账 690 行残余。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -685,23 +748,23 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
 - [ ] P4：fuzz 正式接入、影子库端到端回放、musl 静态构建
 - [ ] spec §4.6 ENUM/SET 名称注释 → 推迟至 P2
-- [ ] T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）
-- [ ] T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数
+- [x] ~~T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）~~——ALW-ZERO-TIMESTAMP 落地（eq 零日期对，fsp 后缀须一致；selftest 第 6 组正反例）
+- [x] ~~T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数~~——ALW-FLOAT-WIDTH（≤17 有效位闸口 + f64/f32 同 bits）+ ALW-INT-SIGN-WRAP（mod 2^64）落地；1e+10 类经 num 桥 Decimal 直判等
 - [ ] T15 校准：8.0 TLV opt-meta 已随 T9 后校准补丁真实解析（fixture 回归钉死）；剩余 = 5.7 signedness bitmap、与更多真机捕获（FULL 形态等）的差分校准。~~T4 charset 形状拒绝的构造性误判~~（已修：真机 8.0 件现 Ok，5.6/5.7 legacy 严格形态测试全保留）。
 - [x] ~~**T2 勘误（T9 真机证实）**：event.rs 事件码表错档（30/31/32 标 V1、ANON=119 等）~~——T9 后校准补丁已按 const.go:54-87 勘误并加 fixture 走读回归；**残余子项归 T10**：rows V2 事件 extra-info（固定公共段后、行体前的可选 4B）读取跳过。~~残余子项~~（T10 已完成：extra-info 按自含长度整段跳过 + 未知 typecode → PartialNotSupported，见 Task 10 节点）。
 - [x] ~~**T4 勘误（T9 真机捕获）**：T4 严格 LNE 解析器拒绝真实 8.0 TLV optional-metadata~~——T9 后校准补丁实现 fork 同构 `decodeOptionalMeta` 镜像（无总长前缀、未知项跳过、截断报错），`tests/fixtures/capture_8.0_minimal/` 真机 TABLE_MAP 回归通过（捕获件 /tmp/t9probe 亦同源）。
-- [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
-- [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义
-- [ ] T15 白名单（T11）：key_indexes 键名指向缺失列时本侧整键降级（pk=[]/丢 uk），上游 GetColIndexFromKey 映射为序号 0（bug 兼容会产生错误 WHERE）；表达式索引/坏 JSON 场景输出必分歧
-- [ ] T15 白名单（T13）：blob/非utf8-text 字面量本侧 `0xUPPERHEX`，上游 X'lowerhex' 或原样字节引号串（语义等价）
-- [ ] T15 白名单（T13 审阅）：多条件 WHERE 上游带括号 `(a=1 AND b=2)`（expression.go conjunctExpression），本侧裸连 `a=1 AND b=2`；SET 分隔上游 ", "/VALUES 行上游 ", ("，本侧 ","；比较器须括号/空白不敏感
-- [ ] T15 白名单（T13 审阅）：标识符含反引号时本侧加倍 ``a``b``，上游 table.go/column.go 原样包裹不加倍（上游产生坏 SQL）
-- [ ] T15 白名单（T13）：UPDATE 行前后无变化时上游 Fatalf 整跑终止，本侧 skip+warn——该病理夹具不得进入差分对比
-- [ ] T15 纪律（T11）：binlog 比 schema 宽的场景差分必须跑 strict=true（上游 events.go:87 无条件 fatal，pad 列永不出 SQL）
-- [ ] T15 白名单：blob 字面量形态 本侧 `0xUPPERHEX` vs 上游 `X'lowerhex'`（sqltypes.go:567-570）——语义等价 SQL，比较器须双解（T13 裁定 1 重设计，非 parity 缺陷）
+- [x] ~~T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。~~——ALW-VARBINARY-STR 落地（canon text/bytes 打标 + eq 双向桥，非UTF8 经 surrogateescape；真机 c_vb/c_bin 全绿）
+- [x] ~~T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义~~——ALW-JSON-KEYORDER/DOUBLE/HTMLESC 落地（jload+jeq 深比较：键序无关、数值 Decimal(str) 判等、转义解码后比）；另 ALW-JSON-IN-SET（seteq）覆盖上游 UPDATE SET 恒含 JSON 列（GenUpdateSetPart []byte 断言失败）而本侧按 diff 省略的差集
+- [x] ~~T15 白名单（T11）：key_indexes 键名指向缺失列时本侧整键降级（pk=[]/丢 uk），上游 GetColIndexFromKey 映射为序号 0（bug 兼容会产生错误 WHERE）；表达式索引/坏 JSON 场景输出必分歧~~——矩阵 EXCL 落地：ALW-MULTI-UK/ALW-EXPR-INDEX/ALW-DROP-COL-ALTER（gen-data.sql 头注释钉死每表 ≤1 uk、无表达式索引、无中途 ALTER）；等宽场景 20/20 绿未触发分歧路径
+- [x] ~~T15 白名单（T13）：blob/非utf8-text 字面量本侧 `0xUPPERHEX`，上游 X'lowerhex' 或原样字节引号串（语义等价）~~——ALW-BLOB-HEX 落地（canon HEXP/XHQ 双形→bytes，eq text↔bytes 桥）
+- [x] ~~T15 白名单（T13 审阅）：多条件 WHERE 上游带括号 `(a=1 AND b=2)`（expression.go conjunctExpression），本侧裸连 `a=1 AND b=2`；SET 分隔上游 ", "/VALUES 行上游 ", ("，本侧 ","；比较器须括号/空白不敏感~~——ALW-WHERE-PARENS 落地（find_kw noparen + cond 剥括号 + split_top/sorted 结构解析；idn 反引号/空白不敏感）
+- [x] ~~T15 白名单（T13 审阅）：标识符含反引号时本侧加倍 ``a``b``，上游 table.go/column.go 原样包裹不加倍（上游产生坏 SQL）~~——ALW-IDENT-BACKTICK：矩阵库表列名不含反引号（夹具规避该病理形态）
+- [x] ~~T15 白名单（T13）：UPDATE 行前后无变化时上游 Fatalf 整跑终止，本侧 skip+warn——该病理夹具不得进入差分对比~~——EXCL ALW-NOCHANGE-UPDATE（gen-data.sql 所有 UPDATE 必改值）
+- [x] ~~T15 纪律（T11）：binlog 比 schema 宽的场景差分必须跑 strict=true（上游 events.go:87 无条件 fatal，pad 列永不出 SQL）~~——ALW-COLCOUNT-STRICT 登记；v1 矩阵无中途 ALTER → 天然等宽，strict 路径由 T13 单测覆盖（EXCL ALW-DROP-COL-ALTER，P2 再议）
+- [x] ~~T15 白名单：blob 字面量形态 本侧 `0xUPPERHEX` vs 上游 `X'lowerhex'`（sqltypes.go:567-570）——语义等价 SQL，比较器须双解（T13 裁定 1 重设计，非 parity 缺陷）~~——并入 ALW-BLOB-HEX（上上条）
 - [x] ~~T13 决策点（T11）：strict 默认值 = CLI 语义决定（静默补列 vs 硬停），定稿前不得静默 non-strict~~——T13 定稿：`SqlOpts::strict_schema` 默认 **false**（非 strict：dropped 位列清单/WHERE 省略+warn、Truncated 静默前缀），true 经 align_cols 逐事件 ColCountFatal；与上游有效行为等价的论证见 Task 13 节点「裁定 2 定稿」段
-- [ ] T15 夹具约束（T11 审阅发现）：上游 UniqueKeys 为 Go map 序（mysqlFuncs.go:221-238），多 uk 表 GetOneUniqueKey 选择跨运行不稳定；本侧确定性序更优——差分夹具限 ≤1 候选 uk 或容忍键选择分歧
-- [ ] T15 白名单（T14）：`SET NAMES utf8mb4;` 文件头为本项目计划约束，上游 Go 版无此行（python my2sql 有）——比较器须容忍首行
+- [x] ~~T15 夹具约束（T11 审阅发现）：上游 UniqueKeys 为 Go map 序（mysqlFuncs.go:221-238），多 uk 表 GetOneUniqueKey 选择跨运行不稳定；本侧确定性序更优——差分夹具限 ≤1 候选 uk 或容忍键选择分歧~~——EXCL ALW-MULTI-UK 落地：矩阵 t_uk 仅 1 个 UNIQUE 键、无复合多候选
+- [x] ~~T15 白名单（T14）：`SET NAMES utf8mb4;` 文件头为本项目计划约束，上游 Go 版无此行（python my2sql 有）——比较器须容忍首行~~——ALW-SETNAMES-HEADER 落地（load() 跳头行）
 - [ ] T15 白名单（T14）：`--to-stdout` 模式本侧与文件模式统一字节面（SET NAMES 头+extra-info 一并入屏幕流），上游屏幕模式仅打语句（events.go OutputToScreen 分支）
-- [ ] T15 纪律（T14）：extra-info datetime 本侧按 `--time-zone` 固定偏移渲染（下划线形与上游字节平价），上游走运行主机 TZ——差分双方须显式给同一 `--time-zone`/`TZ` 再比对
-- [ ] T15 白名单：文件名字节净化（仅 path，SQL 文本原样）vs 上游可越界写
+- [x] ~~T15 纪律（T14）：extra-info datetime 本侧按 `--time-zone` 固定偏移渲染（下划线形与上游字节平价），上游走运行主机 TZ——差分双方须显式给同一 `--time-zone`/`TZ` 再比对~~——ALW-EXTRAINFO-DTZ 落地：容器 TZ=UTC + oracle 进程 TZ=UTC + 本侧 --time-zone +00:00；datetime 字段不进对齐键
+- [x] ~~T15 白名单：文件名字节净化（仅 path，SQL 文本原样）vs 上游可越界写~~——差分按 SQL 文本面比对（glob *.sql + 对齐键），路径净化不进比对面；净化本身由 T14 单测钉死
