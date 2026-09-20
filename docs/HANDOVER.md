@@ -23,7 +23,9 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 9 已完成**（值分发 decode_value + schema 结构 + rows 占位；`cargo test` 112+3/115 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 10 已完成**（ROWS 行解码 decode_rows + 真机行级端到端 fixture；
+  `cargo test` 133+3/136 绿、clippy -D warnings、fmt 干净。Step 0 类型码统一表
+  独立提交 `228d00e`，功能提交 `1f59064`；详见 task-10-report.md）
 
 ## 任务节点日志
 
@@ -344,6 +346,48 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   decode_meta 匹配臂经真机校验、动它需独立评审轮；建议 T10 统一 int.rs+value.rs
   两份（官方值），table_map.rs 一份保留或同轮处理。
 
+### Task 10: ROWS 事件行解码（rows.rs + 类型码统一表）
+
+- 做了什么（两提交）：
+  - `228d00e` refactor: single field-type constant table——Step 0 绑定先行：
+    新建 `src/binlog/field_types.rs`（官方 MYSQL_TYPE_* 唯一表），删除
+    int.rs/value.rs/table_map.rs 三份私有 `mod tp`（含 T5/T9 挂账的
+    FLOAT/DOUBLE 误名表），三处 `use super::field_types as tp` 统一；
+    118 项既有测试零改动全绿。
+  - `1f59064` feat: rows event decoding with bitmap cursors——
+    `decode_rows(body, tm, schema, kind, v2)` + `Row{cols}`/`RowsKind`；
+    `BinlogError::PartialNotSupported` 新变体；真机 fixture
+    `tests/fixtures/capture_8.0_rows/`（000002 全镜像 W+U、000003 MINIMAL
+    镜像 U、000004 JSON 表 W/2×39/D）；capture_8.0_minimal 26 列行 P1 首个
+    真实 binlog 端到端行值断言。TDD：RED 15 失败（todo!()）→ GREEN 133+3。
+- 关键接口（T12/T13 消费）：
+  - `rows::decode_rows(body, tm, schema, kind: RowsKind, v2: bool) ->
+    Result<Vec<Row>, BinlogError>`。body 须已剥 CRC（`event::strip_checksum`）；
+    **签名无 `with_crc`**（剥除后无真实用途——裁定 2「去掉并记录」分支，报告
+    差异表 #5）。UPDATE 返回 2n 交错 `[before,after,…]`；`Row.cols.len()
+    == tm.n_cols` 恒成立（schema 更宽时不补齐——T13 责任，接缝）。
+  - 行布局（双权威+真机钉死）：tid6B+flags2B+[v2: extra_info_len u16 含自身,
+    整段跳过]+n_cols LNE+bm1(+bm2)；**每镜像独立字节对齐 null 区，宽
+    bit_width(present)**，present 按前 n_cols 位掩蔽（真机 padding 位=1）、
+    null 位按 present 序数推进。简报「双镜像共用游标」shorthand 被否
+    （T6-T9 先例第 3 例，报告差异表 #1）。
+  - 路由约束（T12）：事件码 39 PARTIAL_UPDATE 与 V0 rows 20/21/22 **不得**
+    送入本函数（39 无法从 body 判别，误送必 TooShort/InvalidData——真机
+    两件 39 fixture 已钉）；v2 = 事件码 ∈ {30,31,32}。
+  - 值语义：present 0 位 → `ColumnValue::Missing`（≠NULL，简报绑定；与
+    go-mysql nil 的差异入 T15 白名单候选）；dropped 列（binlog 宽于 schema）
+    用占位 `{name:"dropped_column", type_name:"unknown_type"}` 解码照常
+    （对齐 my2sql-go context.go:26-27，per-index 名 T13 拼）；空行区 →
+    TooShort（比 go-mysql 收紧，T3 校验纪律）；extra-info 首字节 typecode
+    ∉ {0,1,2} → `PartialNotSupported`（D5；真机 ROWS_QUERY 实为独立事件
+    type 29，8.0.46 extra_info_len 恒 2）。
+  - `field_types`（pub(crate)）：binlog 层类型码唯一来源，新代码不得再立私有表。
+- 豁免审计：value.rs 模块级 `#![allow(dead_code)]` 移除（`ColCtx::new` 转定点
+  豁免，暂仅测试消费）；rows.rs 保留模块级豁免至 T12 生产接入。
+- 遗留/对后续影响：tz_offset_secs 本层恒 0，T14 `--time-zone` 需经参数注入
+  （接缝已记录）；flags 2B 消费性跳过，STMT_END_F 归 T12 事务机自 body[6..8]
+  读取；挂账清单「T2 勘误残余子项归 T10（extra-info 跳过）」已销账。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -371,7 +415,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）
 - [ ] T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数
 - [ ] T15 校准：8.0 TLV opt-meta 已随 T9 后校准补丁真实解析（fixture 回归钉死）；剩余 = 5.7 signedness bitmap、与更多真机捕获（FULL 形态等）的差分校准。~~T4 charset 形状拒绝的构造性误判~~（已修：真机 8.0 件现 Ok，5.6/5.7 legacy 严格形态测试全保留）。
-- [x] ~~**T2 勘误（T9 真机证实）**：event.rs 事件码表错档（30/31/32 标 V1、ANON=119 等）~~——T9 后校准补丁已按 const.go:54-87 勘误并加 fixture 走读回归；**残余子项归 T10**：rows V2 事件 extra-info（固定公共段后、行体前的可选 4B）读取跳过。
+- [x] ~~**T2 勘误（T9 真机证实）**：event.rs 事件码表错档（30/31/32 标 V1、ANON=119 等）~~——T9 后校准补丁已按 const.go:54-87 勘误并加 fixture 走读回归；**残余子项归 T10**：rows V2 事件 extra-info（固定公共段后、行体前的可选 4B）读取跳过。~~残余子项~~（T10 已完成：extra-info 按自含长度整段跳过 + 未知 typecode → PartialNotSupported，见 Task 10 节点）。
 - [x] ~~**T4 勘误（T9 真机捕获）**：T4 严格 LNE 解析器拒绝真实 8.0 TLV optional-metadata~~——T9 后校准补丁实现 fork 同构 `decodeOptionalMeta` 镜像（无总长前缀、未知项跳过、截断报错），`tests/fixtures/capture_8.0_minimal/` 真机 TABLE_MAP 回归通过（捕获件 /tmp/t9probe 亦同源）。
 - [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义
