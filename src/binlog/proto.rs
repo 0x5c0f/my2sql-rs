@@ -79,7 +79,11 @@ pub struct BitmapCursor<'a> {
 impl<'a> BitmapCursor<'a> {
     /// 以 `bits` 为底层数据、每行位宽 `bit_width`（字节数）构造游标，起始位为 0。
     pub fn new(bits: &'a [u8], bit_width: usize) -> Self {
-        Self { bits, bit_width, pos: 0 }
+        Self {
+            bits,
+            bit_width,
+            pos: 0,
+        }
     }
 
     /// 读取当前位并前进 1 位；返回 true 表示该列 NULL。
@@ -130,13 +134,19 @@ mod tests {
     #[test]
     fn read_lne_advances_pos() {
         let mut pos = 1usize;
-        assert_eq!(read_lne(&[0x00, 0xFC, 0xAB, 0xCD], &mut pos).unwrap(), 0xCDAB);
+        assert_eq!(
+            read_lne(&[0x00, 0xFC, 0xAB, 0xCD], &mut pos).unwrap(),
+            0xCDAB
+        );
         assert_eq!(pos, 4);
     }
 
     #[test]
     fn read_lne_short_buffer_is_too_short() {
-        assert_eq!(read_lne(&[0xFC, 0x01], &mut 0).unwrap_err(), BinlogError::TooShort);
+        assert_eq!(
+            read_lne(&[0xFC, 0x01], &mut 0).unwrap_err(),
+            BinlogError::TooShort
+        );
         assert_eq!(read_lne(&[], &mut 0).unwrap_err(), BinlogError::TooShort);
     }
 

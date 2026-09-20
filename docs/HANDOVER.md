@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 3 已完成**（LNE 原语 + NULL bitmap 游标，`cargo test` 23/23 绿、clippy -D warnings 干净）
+- 状态：**Task 4 已完成**（table_map 解码；`cargo test` 31/31 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -95,6 +95,28 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   两行共 9 次读取断言列 0/列 7 为 NULL、第二行列 0 落入新字节 bit0。
 - 遗留：proto.rs 顶部 `#![allow(dead_code)]`（T5+ 消费后移除）；`BitmapCursor.bit_width`
   字段当前仅 new() 存入、不参与位运算（预留行对齐）。
+
+### Task 4: TABLE_MAP 解码（含 STRING meta 还原）
+
+- 做了什么：新增 `src/binlog/table_map.rs`——`TableMapEvent`（table_id/schema/table/
+  n_cols/column_type/column_meta/null_bits/charset，**无 signed 字段**，unsigned 判定
+  归 Task 11 metadata 层）、`parse_table_map(body, with_crc)`、`real_string_type(tp, meta)`。
+  TDD：先写 8 个失败测试（RED：8 failed, todo!()），实现后全绿。
+- 关键接口（Task 10/11 消费）：`parse_table_map` 输入为剥掉 19B 公共头后的 body；
+  `with_crc=true` 时先剥尾 4B CRC 再解字段；`real_string_type(0xFE, (0x06<<8)|2)=0x36`、
+  `real_string_type(0xFE, (0xF6<<8)|6)=0xF6`（brief 写死的两对）。
+- 与简报布局的偏差（按 ledger Ruling 允许 T15 真机校准，此处主动先对齐 go-mysql）：
+  - **字段顺序**：column_types → metadata（LNE 总长+逐列 meta）→ null_bits bitmap，
+    与简报正文「bitmap 在前、meta_len 2B LE 在后」相反；以 go-mysql
+    `TableMapEvent.Decode` 为准（真实 MySQL 5.6+ 即此顺序，meta_len 为 LNE）。
+  - 每列 meta 宽度表照抄 go-mysql `decodeMeta`：STRING/NEWDECIMAL 2B（高字节在前）、
+    VAR_STRING/VARCHAR/BIT 2B LE、BLOB/FLOAT/DOUBLE/GEOMETRY/JSON/时间2族 1B、其余 0。
+  - 字符集段按简报的 5.6.3 WL#6494 宽松读法：1B 总长（=255 转义为后随 2B LE）+
+    逐列 LNE 序列；残段/EOF 置空不报错。**注意**：MySQL 8.0 的 optional metadata 是
+    TLV 格式（type 1B + LNE 长 + 值），本宽松读法对 8.0 binlog 的 charset 结果不可靠
+    （P1 无消费者，仅展示用）；5.7 的 signedness bitmap 亦未处理——均留 T15 差分校准。
+- 遗留：table_map.rs 顶部 `#![allow(dead_code)]`；schema/table 用 `String::from_utf8`
+  （非法 UTF-8 → InvalidData，真机库表名均为 UTF-8 可行）。
 
 ## 环境事实
 

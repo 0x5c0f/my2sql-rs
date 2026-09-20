@@ -4,3 +4,4 @@
 pub mod error;
 pub mod event;
 pub mod proto;
+pub mod table_map;
