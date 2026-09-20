@@ -102,8 +102,8 @@ pub fn parse_table_map(body: &[u8], with_crc: bool) -> Result<TableMapEvent, Bin
         .ok_or(BinlogError::TooShort)?
         .to_vec();
     pos += bw;
-    // 字符集段（可选；宽松解析，EOF 时置空不影响前面字段）
-    let charset = parse_charset_lenient(&body[pos..]);
+    // 字符集段（可选；非 WL#6494 精确形态一律报错，见 parse_charset）
+    let charset = parse_charset(&body[pos..], n_cols)?;
     Ok(TableMapEvent {
         table_id,
         schema,
@@ -155,34 +155,67 @@ fn decode_meta(data: &[u8], types: &[u8]) -> Result<Vec<u16>, BinlogError> {
     Ok(out)
 }
 
-/// 宽松解析字符集段（MySQL 5.6.3 WL#6494 布局）：首字节为内容总长，
-/// 等于 255 时转义——真实总长取后随 2B 小端；内容为逐列 LNE 整数序列。
-/// 字节不足或中途 EOF：停止并返回已解析部分/空表（可选段缺失是合法状态）。
-fn parse_charset_lenient(rest: &[u8]) -> Vec<u64> {
-    let Some(&first) = rest.first() else {
-        return Vec::new();
+/// 严格解析字符集段（MySQL 5.6.3 WL#6494 布局）：首字节为内容总长，
+/// 等于 255 时转义——真实总长取后随 2B 小端；内容须为**恰好 `n_cols` 条**完整
+/// LNE 整数、且不允许多余尾随字节。
+///
+/// 三种合法情形返回 `Ok`：
+/// - null_bits 之后**零字节**：pre-8.0 或无 metadata，`Ok(空)`；
+/// - 1B 总长前缀 + 恰好 `n_cols` 条完整 LNE：`Ok(charset)`；
+/// - 255 转义 → 2B LE 总长 + 恰好 `n_cols` 条完整 LNE：`Ok(charset)`。
+///
+/// 其余一律 `Err(InvalidData)`（D5 约束：不支持的元数据必须报错，不得猜测）：
+/// 截断的 LNE、条数不符、尾随多余字节、以及 MySQL 8.0 `binlog_row_metadata=FULL`
+/// 的 TLV optional metadata（2B LE total_length + 逐条 type(1B)+LNE长+值）——
+/// 后者与本 charset 形态不同，完整 TLV 解析推迟至 Task 15。
+fn parse_charset(rest: &[u8], n_cols: usize) -> Result<Vec<u64>, BinlogError> {
+    // 零尾随字节：合法（pre-8.0 或 metadata 段缺失）。
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+    let invalid = |why: String| {
+        BinlogError::InvalidData(format!(
+            "unsupported table_map optional metadata / charset section: {why}"
+        ))
     };
+    let first = rest[0];
     let (total, hdr) = if first == 255 {
-        match rest.get(1..3) {
-            Some(s) => (u16::from_le_bytes([s[0], s[1]]) as usize, 3usize),
-            None => return Vec::new(),
-        }
+        // 255 转义：真实总长取后随 2B 小端。
+        let s = rest.get(1..3).ok_or_else(|| {
+            invalid("255 escape marker present but fewer than 3 header bytes".into())
+        })?;
+        (u16::from_le_bytes([s[0], s[1]]) as usize, 3usize)
     } else {
         (first as usize, 1usize)
     };
-    let Some(vals) = rest.get(hdr..hdr + total) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
+    // 内容区必须覆盖到 rest 末尾——不足即截断，报错。
+    let vals = rest.get(hdr..hdr + total).ok_or_else(|| {
+        invalid(format!(
+            "declared length {total} exceeds available {}",
+            rest.len().saturating_sub(hdr)
+        ))
+    })?;
+    if hdr + total != rest.len() {
+        return Err(invalid(format!(
+            "{} trailing byte(s) after {total}-byte charset section (possible 8.0 TLV metadata)",
+            rest.len() - (hdr + total)
+        )));
+    }
+    // 内容须为恰好 n_cols 条完整 LNE。
+    let mut out = Vec::with_capacity(n_cols);
     let mut q = 0usize;
     while q < vals.len() {
-        match read_lne(vals, &mut q) {
-            Ok(v) => out.push(v),
-            // 尾部残缺：保留已读出的 collation id，不视为错误
-            Err(_) => break,
-        }
+        let v = read_lne(vals, &mut q)
+            .map_err(|_| invalid(format!("truncated length-encoded integer at byte {q}")))?;
+        out.push(v);
     }
-    out
+    if out.len() != n_cols {
+        return Err(invalid(format!(
+            "charset holds {} collation ids, expected n_cols = {n_cols}",
+            out.len()
+        )));
+    }
+    Ok(out)
 }
 
 /// MYSQL_TYPE_STRING(0xFE) 的“真实类型”还原（对齐 go-mysql/sqlgen 行为）：
@@ -279,37 +312,95 @@ mod tests {
         );
     }
 
-    /// 字符集段形态 1：1B 长度前缀 + 逐列 LNE（值 45 与 255）。
+    /// 字符集段形态 1：1B 长度前缀 + 恰好 n_cols(3) 条 LNE（255 以 0xFC 前缀编码）。
     #[test]
     fn charset_section_one_byte_length() {
         let mut b = body_minimal();
-        b.push(4); // charset 总长 4B
+        b.push(5); // charset 内容总长 5B：1B(45) + 3B(0xFC 255) + 1B(46)
         b.push(45); // LNE 45
         b.extend_from_slice(&[0xFC, 0xFF, 0x00]); // LNE 255（2 字节前缀）
+        b.push(46); // LNE 46
         let e = parse_table_map(&b, false).unwrap();
-        assert_eq!(e.charset, vec![45, 255]);
+        assert_eq!(e.charset, vec![45, 255, 46]);
     }
 
-    /// 字符集段形态 2：前缀字节 ==255 转义 → 后随 2B LE 总长。
+    /// 字符集段形态 2：前缀字节 ==255 转义 → 后随 2B LE 总长；恰好 n_cols(3) 条 LNE。
     #[test]
     fn charset_section_two_byte_escaped_length() {
         let mut b = body_minimal();
         b.push(255); // 转义标记
-        b.extend_from_slice(&[2, 0x00]); // 总长 2B LE
-        b.extend_from_slice(&[45, 46]); // 两条 LNE
+        b.extend_from_slice(&[3, 0x00]); // 总长 3B LE
+        b.extend_from_slice(&[45, 46, 250]); // 三条 LNE
         let e = parse_table_map(&b, false).unwrap();
-        assert_eq!(e.charset, vec![45, 46]);
+        assert_eq!(e.charset, vec![45, 46, 250]);
     }
 
-    /// 可选段读到一半 EOF：优雅停止，先前字段仍有效，charset 置空。
+    /// D5 约束：不支持的元数据必须报错而非猜测。声称总长 9 但只剩 2 字节——
+    /// 截断的 WL#6494 段（也可能是 8.0 TLV 被误读），必须 Err 而非静默置空。
     #[test]
-    fn charset_truncated_stops_gracefully() {
+    fn charset_truncated_is_error() {
         let mut b = body_minimal();
-        b.push(9); // 声称 9 字节，但只剩 2 —— charset 放弃，其余字段有效
+        b.push(9); // 声称 9 字节内容，实际只剩 2
         b.extend_from_slice(&[45, 46]);
-        let e = parse_table_map(&b, false).unwrap();
-        assert_eq!(e.n_cols, 3);
-        assert_eq!(e.charset, Vec::new());
+        let err = parse_table_map(&b, false).unwrap_err();
+        match &err {
+            BinlogError::InvalidData(msg) => {
+                assert!(
+                    msg.contains("unsupported table_map"),
+                    "error message must name the unrecognized section, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// 段完整但 LNE 条数 != n_cols：不是合法的 WL#6494 charset，报错。
+    #[test]
+    fn charset_wrong_collation_count_is_error() {
+        let mut b = body_minimal();
+        b.push(2); // 总长 2B，但只有 2 条，n_cols=3
+        b.extend_from_slice(&[45, 46]);
+        assert!(parse_table_map(&b, false).is_err());
+    }
+
+    /// 声明段之后仍有尾随字节（如 8.0 charset 段后所跟 optional metadata 的
+    /// 2B LE total_length + TLV 条目）：宽松读法会静默吞掉，现在必须报错。
+    #[test]
+    fn charset_trailing_bytes_is_error() {
+        let mut b = body_minimal();
+        b.push(3); // 恰好 3 条 LNE 的合法 charset……
+        b.extend_from_slice(&[45, 46, 250]);
+        b.extend_from_slice(&[0x06, 0x00]); // ……后面又跟 2 字节（8.0 opt-meta 长度头形态）
+        assert!(parse_table_map(&b, false).is_err());
+    }
+
+    /// 段内某条 LNE 中途截断（0xFC 两字节前缀只剩 1 字节）：报错，不返回残缺前缀。
+    #[test]
+    fn charset_truncated_lne_inside_is_error() {
+        let mut b = body_minimal();
+        b.push(3); // 总长 3B
+        b.extend_from_slice(&[45, 46, 0xFC]); // 第三条 0xFC 需要 2B 值，但段已结束
+        assert!(parse_table_map(&b, false).is_err());
+    }
+
+    /// 255 转义标记后不足 3 字节头：报错。
+    #[test]
+    fn charset_escape_marker_without_length_is_error() {
+        let mut b = body_minimal();
+        b.push(255); // 转义标记，但没有后随 2B 总长
+        assert!(parse_table_map(&b, false).is_err());
+    }
+
+    /// MySQL 8.0 `binlog_row_metadata=FULL`：null_bits 之后是 2B LE total_length +
+    /// TLV（type 1B + LNE 长 + 值）optional metadata，非 WL#6494 charset 形态——
+    /// 必须整体拒绝（完整 TLV 解析留 Task 15）。
+    #[test]
+    fn eight_zero_full_row_metadata_tlv_is_error() {
+        let mut b = body_minimal();
+        // opt-meta 原样：total_length=0x0006 LE，随后两条 TLV
+        b.extend_from_slice(&[0x06, 0x00, 0x02, 0x01, 0x01, 0x01, 0x04, 0x01]);
+        let err = parse_table_map(&b, false).unwrap_err();
+        assert!(matches!(err, BinlogError::InvalidData(_)), "got {err:?}");
     }
 
     /// brief Step2 指定两例：0x06 高字节补成 0x36（ENUM）；0xF6 原样透传（NEWDECIMAL）。

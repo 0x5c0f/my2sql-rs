@@ -111,10 +111,13 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
     `TableMapEvent.Decode` 为准（真实 MySQL 5.6+ 即此顺序，meta_len 为 LNE）。
   - 每列 meta 宽度表照抄 go-mysql `decodeMeta`：STRING/NEWDECIMAL 2B（高字节在前）、
     VAR_STRING/VARCHAR/BIT 2B LE、BLOB/FLOAT/DOUBLE/GEOMETRY/JSON/时间2族 1B、其余 0。
-  - 字符集段按简报的 5.6.3 WL#6494 宽松读法：1B 总长（=255 转义为后随 2B LE）+
-    逐列 LNE 序列；残段/EOF 置空不报错。**注意**：MySQL 8.0 的 optional metadata 是
-    TLV 格式（type 1B + LNE 长 + 值），本宽松读法对 8.0 binlog 的 charset 结果不可靠
-    （P1 无消费者，仅展示用）；5.7 的 signedness bitmap 亦未处理——均留 T15 差分校准。
+  - 字符集段按简报的 5.6.3 WL#6494 布局**严格**解析（审查修正：原宽松读法已废弃）：
+    零尾随字节 → `Ok(空)`（pre-8.0/无 metadata 合法）；否则要求长度前缀
+    （1B，=255 转义为后随 2B LE）+ **恰好 n_cols 条**完整 LNE 且无多余尾随字节，
+    任一不满足 → `Err(InvalidData("unsupported table_map optional metadata / charset
+    section: …"))`（D5：不支持的元数据必须报错、不得猜测）。MySQL 8.0
+    `binlog_row_metadata=FULL` 的 TLV optional metadata（2B LE total_length +
+    type/LNE长/值 条目）会被明确拒绝，完整 TLV 解析留 Task 15。
 - 遗留：table_map.rs 顶部 `#![allow(dead_code)]`；schema/table 用 `String::from_utf8`
   （非法 UTF-8 → InvalidData，真机库表名均为 UTF-8 可行）。
 
