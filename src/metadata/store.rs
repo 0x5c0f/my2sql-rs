@@ -243,10 +243,28 @@ fn cell_str(row: &Row, col: &str) -> Option<String> {
     }
 }
 
-/// online 单表懒查：SHOW FULL COLUMNS + SHOW INDEX（backtick 包裹标识符，
-/// 同 mysqlFuncs.go:132/254 的 `%s`.`%s` 形态）。
+/// online 单表懒查的 SHOW FULL COLUMNS 语句（标识符经 `quote_ident` 反引号
+/// 加倍，裁定 8 单通道——终审 #2：TABLE_MAP 名可含反引号（如 `a``b`），
+/// 裸插值会 breakout 注入 SHOW 语句；加倍转义是 MySQL 标准标识符引号规则）。
+pub(crate) fn show_columns_sql(db: &str, tb: &str) -> String {
+    use crate::sqlopen::encode::quote_ident;
+    format!(
+        "SHOW FULL COLUMNS FROM {}.{}",
+        quote_ident(db),
+        quote_ident(tb)
+    )
+}
+
+/// online 单表懒查的 SHOW INDEX 语句（转义口径同 [`show_columns_sql`]）。
+pub(crate) fn show_index_sql(db: &str, tb: &str) -> String {
+    use crate::sqlopen::encode::quote_ident;
+    format!("SHOW INDEX FROM {}.{}", quote_ident(db), quote_ident(tb))
+}
+
+/// online 单表懒查：SHOW FULL COLUMNS + SHOW INDEX（标识符经纯函数拼装，
+/// 形态同 mysqlFuncs.go:132/254 的 `%s`.`%s`，转义口径见 show_*_sql）。
 fn fetch_online(conn: &mut Conn, db: &str, tb: &str) -> Result<TableSchema, MetaError> {
-    let cols_sql = format!("SHOW FULL COLUMNS FROM `{db}`.`{tb}`");
+    let cols_sql = show_columns_sql(db, tb);
     let raw_cols: Vec<(String, String)> = conn
         .query_map(cols_sql, |row: Row| {
             (
@@ -256,7 +274,7 @@ fn fetch_online(conn: &mut Conn, db: &str, tb: &str) -> Result<TableSchema, Meta
         })?
         .into_iter()
         .collect();
-    let idx_sql = format!("SHOW INDEX FROM `{db}`.`{tb}`");
+    let idx_sql = show_index_sql(db, tb);
     let idx_rows: Vec<IdxRow> = conn
         .query_map(idx_sql, |row: Row| IdxRow {
             non_unique: cell_str(&row, "Non_unique")
@@ -460,6 +478,26 @@ mod tests {
         let (pk_idx, uk_idx) = crate::metadata::schema::key_indexes(&s, &tm);
         assert_eq!(pk_idx, vec![0]);
         assert!(uk_idx.is_empty());
+    }
+
+    #[test]
+    fn online_show_sql_escapes_hostile_identifiers() {
+        // 终审 #2：TABLE_MAP 来的库/表名直插 SHOW 语句 = 注入面。
+        // 反引号必须加倍（quote_ident 单通道，裁定 8）：x`y → `x``y`。
+        assert_eq!(
+            show_columns_sql("x`y", "a`b"),
+            "SHOW FULL COLUMNS FROM `x``y`.`a``b`"
+        );
+        assert_eq!(
+            show_index_sql("x`y", "a`b"),
+            "SHOW INDEX FROM `x``y`.`a``b`"
+        );
+        // 良性名不受影响（普通包裹与旧行为字节一致）
+        assert_eq!(
+            show_columns_sql("db", "tb"),
+            "SHOW FULL COLUMNS FROM `db`.`tb`"
+        );
+        assert_eq!(show_index_sql("db", "tb"), "SHOW INDEX FROM `db`.`tb`");
     }
 
     #[test]
