@@ -19,4 +19,9 @@ pub enum BinlogError {
     /// 字段值本身非法（如 event_size < header 长度、枚举值未知等），携带描述信息。
     #[error("invalid data: {0}")]
     InvalidData(String),
+    /// rows 事件携带 P1 不支持的 partial/未知附加语义（如 extra-info 未知
+    /// typecode；扩展口径：事件码 39 PARTIAL_UPDATE 由 T12 路由层同判），
+    /// 不做猜测性解码（D5）。构造点见 binlog::rows（Task 10）。
+    #[error("partial rows / unknown row-event extras are not supported in P1")]
+    PartialNotSupported,
 }
