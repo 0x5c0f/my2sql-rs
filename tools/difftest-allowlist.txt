@@ -16,7 +16,7 @@ RULE  ALW-BLOB-HEX         T15白名单(T13)：本侧 0xUPPERHEX vs 上游 X'low
 RULE  ALW-VARBINARY-STR    T15白名单候选(T9)：varbinary 合法 UTF-8 时本侧 Str 引号化 → text-bytes 桥双向覆盖，无须排除
 RULE  ALW-ZERO-TIMESTAMP   T15白名单(T6 裁定)：TIMESTAMP 秒=0 本侧 1970-01-01 00:00:00 vs go-mysql formatZeroTime 0000-00-00 00:00:00 → 仅此字面对互判等；fsp 后缀须逐字符一致 (eq/ZERO_A/B)
 RULE  ALW-INT-SIGN-WRAP    T15白名单(T5)：BIT(64) 高位置 1 本侧 UInt 正数 vs go-mysql int64 负数；unsigned 大数 → 整数按 mod 2^64 判等 (eq)
-RULE  ALW-FLOAT-WIDTH      T15白名单(T5/T7 派生)：FLOAT 边界值上游按 f64 全展开(3.4028234663852886e+38) 本侧 f32 最短(3.4028235e38) → 仅当双方有效数字≤17、一侧文本 f32-canonical(经 f32 round-trip 不变) 且两侧 pack 同 f32 bits 判等；DECIMAL(10,2) 相邻值两侧均非 canonical 不放行，DECIMAL(65,30) 高有效位天然被 sig>17 闸口保持严格 (eq/sig)
+RULE  ALW-FLOAT-WIDTH      T15白名单(T5/T7 派生)：FLOAT 边界值上游按 f64 全展开(3.4028234663852886e+38) 本侧 f32 最短(3.4028235e38) → 仅当双方有效数字≤17、一侧文本 f32-canonical(经 f32 round-trip 不变) 且该侧有效数字严格多于对侧、两侧 pack 同 f32 bits 判等；恰好 f32 可表示的 DECIMAL/BIGINT 相邻值(16777216/17、12345679.0/.9)位数不增不放行，DECIMAL(65,30) 高有效位天然被 sig>17 闸口保持严格 (eq/sig)
 RULE  ALW-JSON-IN-SET      T15白名单(上游 sqlgen.go GenUpdateSetPart)：decoded JSON 非 []byte → 上游 UPDATE SET 恒含 JSON 列（即使未变）本侧按实际 diff 省略 → seteq：多出的 SET 项仅当值为 JSON 文本才容忍，交集逐列严格；JSON 解码覆盖由 INSERT 组 + 矩阵内 JSON 值变更 UPDATE（真实进入交集严格比较）保证 (veq/seteq/jsonish)
 RULE  ALW-WHERE-PARENS     T15白名单(T13 审阅)：上游 WHERE 带括号/本侧裸连；IS null vs IS NULL；SET ", " vs ","；AND 序 → 结构解析（cond/split_kw/sorted），文本不敏感
 RULE  ALW-IDENT-BACKTICK   T13 审阅：本侧反引号加倍 vs 上游不加倍（上游产坏 SQL）→ 夹具规避该形态；矩阵内库表列名不含反引号

@@ -63,6 +63,13 @@ assert not veq(a, b), "DECIMAL boundary pair must stay red (f32-collapse leak)"
 a = P("INSERT INTO `d`.`t` (`f`) VALUES (3.14);")
 b = P("INSERT INTO `d`.`t` (`f`) VALUES (3.140000104904175);")
 assert veq(a, b), "f32-canonical float pair must stay green"
+#    残留漏洞守卫：一侧恰好 f32 精确可表示(≤7位短文本)时，canonical 侧必须自身
+#    携带 >7 位有效数字（真 Go 展开必满足），否则 DECIMAL/BIGINT 相邻值会漏绿
+for ta, tb in (("16777216", "16777217"), ("12345679.0", "12345678.9"),
+               ("8388609.0", "8388608.6"), ("16777216", "16777216.5")):
+    a = P(f"INSERT INTO `d`.`t` (`x`) VALUES ({ta});")
+    b = P(f"INSERT INTO `d`.`t` (`x`) VALUES ({tb});")
+    assert not veq(a, b), f"low-precision canonical leak: {ta} vs {tb} must stay red"
 
 # 8) JSON-in-SET：上游恒在 UPDATE SET 带 JSON 列；非 JSON 多余项/交集不等仍红
 a = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":1}' WHERE `id`=1;")

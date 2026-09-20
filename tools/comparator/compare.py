@@ -91,7 +91,12 @@ def eq(a, b):
             # (如 12345678.90/.91)两侧均非 canonical、f32 舍入同 bits 也不放行。
             fx, fy = float(a[1]), float(b[1])
             bx, by = struct.pack("!f", fx), struct.pack("!f", fy)
-            return bx == by and (struct.unpack("!f", bx)[0] == fx or struct.unpack("!f", by)[0] == fy)
+            if bx != by: return False
+            # canonical 侧有效数字须严格多于对侧：真 Go f64 展开必满足；而恰好 f32
+            # 精确可表示的 DECIMAL/BIGINT 相邻值(16777216/17、12345679.0/.9)两侧
+            # 位数不增，判红。
+            return ((struct.unpack("!f", bx)[0] == fx and sig(dx) > sig(dy))
+                    or (struct.unpack("!f", by)[0] == fy and sig(dy) > sig(dx)))
         except (InvalidOperation, ValueError, OverflowError): return False
     return False
 def jsonish(c): return c[0] == "text" and isinstance(jload(c[1]), (dict, list))
