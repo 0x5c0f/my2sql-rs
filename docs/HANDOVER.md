@@ -23,7 +23,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 - 分支：`feat/p1`（main 只有文档）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）
-- 状态：**Task 8 已完成**（JSON 二进制→紧凑文本 json.rs；`cargo test` 93+3/96 绿、clippy -D warnings、fmt 干净）
+- 状态：**Task 9 已完成**（值分发 decode_value + schema 结构 + rows 占位；`cargo test` 112+3/115 绿、clippy -D warnings、fmt 干净）
 
 ## 任务节点日志
 
@@ -275,6 +275,51 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   上限、严格 UTF-8、非有限 double 报错是对 go-mysql 的行为差异，
   T15 差分需列入白名单。
 
+### Task 9: 值分发 decode_value（value.rs / schema.rs / rows.rs 占位）
+
+- 做了什么：TDD（RED：todo!() 桩下 19/19 value 测试 panic 捕获后实现）；
+  `src/binlog/value.rs` 落地 `ColCtx{tp,meta,schema,tz_offset_secs}`（第 4 字段
+  = 裁定 1 偏差）、`decode_value`、`utf8_safe`、私有 `mod tp`（官方
+  const.go:102-140 码值）；`src/metadata/schema.rs` 仅定义
+  `SchemaCol{name,type_name,unsigned}` + `TableSchema{db,table,cols,pk,uks}`
+  （存取 T11）；`src/binlog/rows.rs` 占位（T10 接口草案，仅文档）；mod 接线。
+  fixture 全部取自 docker mysql:8.0.46 真机 26 列单行（2186B 行体逐列精确消费，
+  go-mysql 裁判逐列比对通过；捕获件留在 /tmp/t9probe 会话级，仓库未收）。
+- tp→变体映射表（分支图镜像 go-mysql row_event.go `decodeValue` :1004-1170；
+  权威行号附注）：
+
+  | tp | 变体 | 权威依据 |
+  |---|---|---|
+  | 6 NULL | `Null`，0B | :1167 default 之外特判（T2/裁判确认） |
+  | 1/2/3/8/9 整型 | `Int`/`UInt`(schema.unsigned) | decode_int（T5，ParseBinaryInt*） |
+  | 4/5 FLOAT/DOUBLE | `Double`（最短往返文本） | :1024-1033（8.0.17 起 meta=4/8，分发忽略） |
+  | 13 YEAR | `UInt` 1B+1900 | 真机实测（简报 2B 系 MariaDB，T5 已裁定） |
+  | 16 BIT | `UInt` 大端、meta 推宽 | decodeBit（T5） |
+  | 246 NEWDECIMAL | `Decimal`（meta=prec<<8\|scale） | :1036-1041（直存，T4 实测 0x0502） |
+  | 17/18/19 TIMESTAMP2/DATETIME2/TIME2、10 DATE | `Str`（T6 打包历法） | fsp=meta（1B TLV） |
+  | 7 TIMESTAMP(V1) | `Str` 4B **LE 秒**+tz | :1065-1072 ParseBinaryUint32（真机 LE 证实） |
+  | 12 DATETIME(V1) | `Str` 8B LE `YYYYMMDDHHMMSS` **无微秒** | :1073-1092（简报 micro*1e6 猜测被否） |
+  | 11 TIME(V1) | `Str` 3B LE `HHMMSS`（>24h 支持） | :1098-1106 |
+  | 252 BLOB | type_name 含 "text" → `Str`(过 utf8_safe) 否则 `Bytes`；前缀 = meta∈1..4 字节 LE | decodeBlob :1539-1563；判别谓词 sqlgen.go:114-118 / events.go:102-104 |
+  | 15/253 VARCHAR/VAR_STRING、254→CHAR 分支 | `Str`（过闸），前缀 = max_len<256?1B:2B LE | decodeString :1173-1185（meta=300→2B 双类型已测） |
+  | 245 JSON | `Json`（meta 宽 LE 定长前缀 + JSONB→T8） | FixedLengthInt=LE util.go:121-127；**裁定 6「LNE/read_lns」与权威不符，按权威** |
+  | 255 GEOMETRY | `Bytes` 原样（SRID+WKB 保真） | :1053-1061 同 blob 形态（裁定 7） |
+  | 254→247/248 ENUM/SET（STRING 伪装经前奏还原） | `UInt` 序号/位图（名称留 P2） | :1042-1051；真机 `fe..f701`/`f801` 证实 |
+  | 0/14/249-251/未知码 | `InvalidData` + `tracing::warn!`，pos 不动 | default 臂 :1167-1169；简报「Bytes 兜底」被否（宽度不可知必错行，兜底仅对宽度可知类型安全而它们已全覆盖） |
+
+- STRING 前奏（:1007-1022）关键发现：0xFE(CHAR) 与 0xF5-0xF8 均满足
+  `b0&0x30==0x30` → else 分支（length=b1=pack_length、1B 前缀）；此前速算
+  0xFE&0x30=0x20 有误，裁判运行+真机抓包双重否证并确认 else 形态。
+- 其余偏差/裁定：V1 TIMESTAMP 零秒输出 epoch 文本（T6 裁定延至 V1 保 V1/V2
+  一致，go-mysql formatZeroTime 差异入白名单①）；`utf8_safe` 用
+  `simdutf8::basic::from_utf8`（0.1.5 无 `validate` API，等价校验零拷贝）。
+- 豁免调整：移除 time.rs/decimal.rs/json.rs 顶部 `#![allow(dead_code)]`
+  （消费者已就位；json.rs 仅存 `Frame.header_size` 一处定点 allow）；
+  int.rs 保留（`ColumnValue::Missing` 待 T10 构造）；value.rs 保留至 T10、
+  schema.rs 保留至 T11。
+- 对后续任务的影响：见遗留清单新增三条（T2 事件码表勘误、T4 TLV 拒绝的
+  真机字节样本、varbinary→Str 白名单候选）。
+
 ## 环境事实
 
 - 本机：docker（镜像 mysql:5.6/5.7/8.0 已就绪，8.4 需拉取）、Go 工具链 /opt/go/bin、cargo/rustc 最新 stable
@@ -290,4 +335,7 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - [ ] T15 白名单：TIMESTAMP 秒=0 → 1970-01-01（T6 裁定，go-mysql formatZeroTime 输出 0000-00-00）
 - [ ] T15 白名单：DOUBLE Display 恒十进制无科学计数（Go %v 输出 1e+10 类）；BIT(64) 高位置 1 时本侧 UInt 正数 vs go-mysql int64 负数
 - [ ] T15 校准：8.0 TLV opt-meta 真实解析、5.7 signedness bitmap、T4 charset 形状拒绝的构造性误判
+- [ ] **T2 勘误（T9 真机证实，T10/T12 必须处理）**：event.rs 事件码表与实际 8.0 binlog 不符——真机 PREVIOUS_GTIDS=35、GTID=33/ANON_GTID=34、rows V2 事件头含 extra-info；event.rs 把 30/31/32 标成 V1 且 ANONYMOUS_GTID=119 错误。修正归属 T10（行事件读取含 extra-info 跳过）。
+- [ ] **T4 勘误（T9 真机捕获）**：8.0.46 真实 TLV optional-metadata 字节 `010140020dfcff00000b083f093f0a3f0b3f070100`（null_bits 后）——T4 严格 LNE 解析器会拒绝真实 8.0 table map；T15 TLV 完整解析前需放宽/分支（捕获件 /tmp/t9probe）。
+- [ ] T15 白名单候选：VAR_STRING(varbinary) 合法 UTF-8 时本侧 `Str`（utf8_safe 过闸），裁判 events.go 对 varchar/varbinary 非 "blob" 字样亦文本化——varbinary 二进制语义差异待 T15 对账确认。
 - [ ] T15 白名单（JSON 渲染三类，T8 审阅裁定，几乎每行都会触发）：① 对象键序 = 存储序(长度,memcmp)，go-mysql 经 map+Marshal 输出纯字典序；② double 文本 = MySQL 显示规则（12.0/1e21/-0.0），Go %v 为 12/1e+21/-0；③ 本侧 `<>&`、U+2028/9 原样输出，Go json.Marshal 会 HTML 转义

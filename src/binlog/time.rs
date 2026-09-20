@@ -16,9 +16,6 @@
 //! - 秒=0 的 TIMESTAMP2 按控制器裁定输出 `1970-01-01 00:00:00`（+tz），
 //!   而非 go-mysql 的 `formatZeroTime` 零值特例（裁定优先，见报告）。
 
-// 骨架阶段本模块尚无生产消费者（Task 9/10 接入），参照 Task 1-5 允许死代码。
-#![allow(dead_code)]
-
 use super::error::BinlogError;
 
 /// DATETIME2 整数部分 bias（go-mysql `DATETIMEF_INT_OFS`）。
@@ -143,6 +140,23 @@ pub fn decode_timestamp2(
     } else {
         text
     })
+}
+
+/// V1 TIMESTAMP（type 码 7，非打包旧形态）：4 字节 **小端** unsigned UTC 秒
+/// （go-mysql `decodeValue` :1065-1072 `ParseBinaryUint32`），按
+/// `秒 + tz_offset_secs` 输出本地时间文本。零秒与 TIMESTAMP2 同裁定输出
+/// epoch（T6 裁定在 V1/V2 间保持一致，go-mysql formatZeroTime 差异见
+/// task-9 报告）。仅 5.5 及以下 V1 事件产生（D6 不支持，尽职实现）。
+pub fn decode_timestamp_v1(
+    buf: &[u8],
+    pos: &mut usize,
+    tz_offset_secs: i32,
+) -> Result<String, BinlogError> {
+    let s = buf.get(*pos..*pos + 4).ok_or(BinlogError::TooShort)?;
+    let sec = u32::from_le_bytes(s.try_into().unwrap()) as i64;
+    *pos += 4;
+    let (y, mo, d, h, mi, se) = civil_from_epoch_secs(sec + tz_offset_secs as i64);
+    Ok(format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{se:02}"))
 }
 
 /// UTC 秒（可为负）→ (年, 月, 日, 时, 分, 秒)。手工历法换算（Hinnant

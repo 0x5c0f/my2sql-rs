@@ -41,9 +41,6 @@
 //! - 空输入返回空字符串（go-mysql `decodeJsonBinary` 对 0 长 data 返回空 slice，
 //!   对应 NULL-JSON-in-not-null-column 的历史场景，逐字镜像）。
 
-// 生产消费者在 Task 9（decode_value 分发），骨架阶段参照同级模块允许死代码。
-#![allow(dead_code)]
-
 use super::decimal::decode_decimal;
 use super::error::BinlogError;
 
@@ -131,6 +128,8 @@ struct Frame<'a> {
     is_small: bool,
     count: usize,
     idx: usize,
+    // 冗余记录供调试/后续任务；parse 内校验用局部变量完成
+    #[allow(dead_code)]
     header_size: usize,
     /// 对象键（已严格 UTF-8 校验），下标与值 entry 一一对应。
     keys: Vec<&'a str>,

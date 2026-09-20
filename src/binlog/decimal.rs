@@ -26,9 +26,6 @@
 //!   `[0,1,1,2,2,3,3,4,4]` 为 9 项，权威 `compressedBytes` 为 10 项
 //!   （索引 9=4 不可达，因余数恒 0..8），两处数值相同、长度取权威。
 
-// 骨架阶段本模块尚无生产消费者（Task 9 接入），参照 Task 1-6 允许死代码。
-#![allow(dead_code)]
-
 use super::error::BinlogError;
 
 /// 每「余数 0..9 位」所需字节数（go-mysql `compressedBytes` / MySQL
