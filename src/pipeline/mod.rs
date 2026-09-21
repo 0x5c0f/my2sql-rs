@@ -29,7 +29,7 @@ use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine, T
 use crate::pipeline::worker::{Job, Out, OutMode, build_out, worker_loop};
 use crate::repl::ReplSource;
 use crate::repl::checkpoint::{self, Checkpoint};
-use crate::repl::transport::{self, FrameStream, ReplError};
+use crate::repl::transport::{self, Frame, FrameStream, ReplError};
 use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
 
 /// 装配层错误（管道终止级：源文件级损坏/IO、schema 源不可用、写盘失败；
@@ -252,8 +252,13 @@ pub static REPL_INTERRUPT: AtomicBool = AtomicBool::new(false);
 /// 位点被主库 purge 的终止文案（简报逐字钉；`...` 为固定占位不是格式串）。
 pub(crate) const PURGED_HINT: &str =
     "replication position ... does not exist on master (binlog purged): choose a newer start";
-/// 认证失败 / 权限缺失的终止文案（简报逐字钉，1045 与 1227 家族共用）。
+/// 权限缺失的终止文案（简报逐字钉；1227 家族。fix round M1：1045 认证失败
+/// 自 spec §6 起即为另一终止类，不再共用本文案——见 [`AUTH_HINT`]）。
 pub(crate) const PRIV_HINT: &str = "user lacks REPLICATION SLAVE/CLIENT privilege";
+/// 认证失败（1045）的专属终止文案（fix round M1，spec §6 两终止类分立）：
+/// 动作是修 --uri 凭据，与 GRANT 无关——混写会把改密码的人引去改权限。
+pub(crate) const AUTH_HINT: &str = "authentication failed: the server rejected the credentials in --uri \
+                                    (wrong password, unknown user, or host not granted); fix the connection URI";
 /// resume 起点被 purge 的前缀（+ [`PURGED_HINT`] 逐字）。
 pub(crate) const RESUME_GONE_PREFIX: &str = "resume point is gone: ";
 /// 退避封顶秒（1s 起翻倍）。
@@ -426,13 +431,53 @@ pub(crate) fn bisect_index(
 /// 就地闭包，单测 = fake 工厂——重连纪律的被钉对象）。
 pub(crate) type Opener<'a> = dyn FnMut(&str, u32) -> Result<Box<dyn FrameStream>, ReplError> + 'a;
 
-/// datetime 定位的单文件探测：从 4 拉流取**首个数据事件**的 ts（源侧
-/// FDE/rotate/心跳自消化，ts=0 合成帧不产出）。任何开流/读取失败 → None
-/// （交 [`bisect_index`] 左收）。注：对活文件且服务端空闲时探测会阻塞至
-/// 下一事件（repl 心跳在场时由读超时兜底）——T6/T7 实况面。
-fn probe_first_ts(open: &mut Opener<'_>, file: &str) -> Option<u32> {
-    let stream = open(file, 4).ok()?;
-    let mut src = ReplSource::new(stream, file.to_string(), Filters::none());
+/// datetime 探针单文件墙钟硬顶（fix round I2）。缺省 heartbeat=30s 时
+/// 首个心跳 ≤30s 必达、探针即时落地；90s 覆盖「丢一轮心跳 + 读超时
+/// 2d+1s」的余量。超顶按探测失败（None → 二分左收，[`bisect_index`]
+/// 与上游 err→hi=mid-1 同型）——宁可定位保守，不可卡死整场 bisect。
+const PROBE_FIRST_TS_CAP: Duration = Duration::from_secs(90);
+
+/// 心跳事件 kind 字节：v1 0x1b（8.0.46 实测发送形态，spec §2 勘误-4）
+/// 与 v2 0x29（mysql_common 0.37.3 不解析，防御性一并认）。
+const HEARTBEAT_KINDS: [u8; 2] = [crate::binlog::event::EventType::HEARTBEAT, 41];
+
+/// 探针用流抽头（fix round I2 关键）：心跳帧被 [`ReplSource`] 内部消化、
+/// 泵外侧不可见，而「是否已追平活写尾部」正是由心跳报知的——抽头在帧
+/// 进入解码前窥探 kind 字节（19B 公共头 offset 4，与 parse_header 同源）：心跳 → 置旗标并以
+/// `Ok(None)` 终结本流。判别依据：服务端心跳只在 dump 追到实时写尾后
+/// 按周期发出；已闭档文件的事件是背靠背瞬发的——「第一帧即心跳」⟺
+/// 查询区间内不存在数据事件（≙ 空档，ts=0 右移语义）。其余帧原样透传，
+/// 解码权威仍是唯一的 ReplSource 链（零分叉不变）。
+struct ProbeTap {
+    inner: Box<dyn FrameStream>,
+    saw_heartbeat: Arc<AtomicBool>,
+}
+
+impl FrameStream for ProbeTap {
+    fn next_frame(&mut self) -> Result<Option<Frame>, ReplError> {
+        let frame = match self.inner.next_frame()? {
+            Some(frame) => frame,
+            None => return Ok(None),
+        };
+        if frame
+            .bytes
+            .get(4)
+            .is_some_and(|k| HEARTBEAT_KINDS.contains(k))
+        {
+            self.saw_heartbeat.store(true, Ordering::Relaxed);
+            return Ok(None);
+        }
+        Ok(Some(frame))
+    }
+}
+
+/// 工作线程侧消费环：抽头整体作为 transport 装进 ReplSource（解码权威
+/// 不变、心跳经抽头转成干净流终并留旗标）。首个数据事件 ts → Some(ts)；
+/// 流终/硬错 → 见过心跳即 Some(0)（活写尾部无数据 ≙ 空档右移），
+/// 否则 None（开流/断链失败左收）。
+fn probe_consume(tapped: ProbeTap, file: String) -> Option<u32> {
+    let saw_heartbeat = tapped.saw_heartbeat.clone();
+    let mut src = ReplSource::new(Box::new(tapped), file, Filters::none());
     loop {
         match src.next() {
             Ok(Some(ev)) => {
@@ -440,9 +485,53 @@ fn probe_first_ts(open: &mut Opener<'_>, file: &str) -> Option<u32> {
                     return Some(ev.timestamp);
                 }
             }
-            Ok(None) => return None,
-            Err(_) => return None,
+            Ok(None) | Err(_) => {
+                return if saw_heartbeat.load(Ordering::Relaxed) {
+                    Some(0)
+                } else {
+                    None
+                };
+            }
         }
+    }
+}
+
+/// datetime 定位的单文件探测：从 4 拉流，**首个数据事件** ts 定档；
+/// 首帧即心跳 = 已追平活写尾且区间无数据事件 → Some(0)（空档同权右移）。
+/// 开流失败/流断且未见过心跳 → None（交 [`bisect_index`] 左收）。
+///
+/// 上界钉死（fix round I2，替换本函数旧注释的「repl 心跳在场时由读超时
+/// 兜底」——该句是**反的**：heartbeat>0 时服务端每 d 有帧，2d+1s socket
+/// 读超时永不触发；heartbeat=0 时连接根本没设读超时，空闲主库静默即
+/// 无限阻塞）。真实上界 = 首帧落地（数据/心跳二分类）+ 工作线程隔离的
+/// `recv_timeout(cap)` 墙钟硬顶：对「一个字节都没有」的形态唯一有效的
+/// 就是后者。超顶场景（heartbeat=0 且主库全静默）残留一个阻塞读的工作
+/// 线程——至多各占一条复制连接，随本 run 后续同 server-id 建连/进程退出
+/// 而终结；用有界的连接冗余换「bisect 绝不被卡死」。
+fn probe_first_ts(open: &mut Opener<'_>, file: &str, cap: Duration) -> Option<u32> {
+    let stream = open(file, 4).ok()?;
+    let saw_heartbeat = Arc::new(AtomicBool::new(false));
+    let tapped = ProbeTap {
+        inner: stream,
+        saw_heartbeat,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_file = file.to_string();
+    let _ = std::thread::spawn(move || {
+        let _ = tx.send(probe_consume(tapped, worker_file));
+    });
+    match rx.recv_timeout(cap) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "repl: first-ts probe of {file} exceeded {}s wall-clock cap \
+                 — treating as probe failure (bisect goes left)",
+                cap.as_secs()
+            );
+            None
+        }
+        // 工作线程 panic/静默丢发送（消费环无 panic 路径，理论不可达）同按失败。
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
     }
 }
 
@@ -502,7 +591,16 @@ fn cp_start_for_retry(cp_path: Option<&Path>, fb_file: &str, fb_pos: u32) -> (St
                 );
                 (fb_file.to_string(), fb_pos)
             }),
-        Err(_) => (fb_file.to_string(), fb_pos),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (fb_file.to_string(), fb_pos),
+        // fix round M2：非 NotFound（权限/IO 抖动/EISDIR 等）静默回退会掩盖
+        // 盘上档位不可读的事实——与下方 serde 失败臂同响度留痕。
+        Err(e) => {
+            tracing::warn!(
+                "repl: checkpoint {} unreadable mid-run ({e}) — retrying from previous attempt start {fb_file}:{fb_pos}",
+                p.display()
+            );
+            (fb_file.to_string(), fb_pos)
+        }
     }
 }
 
@@ -529,7 +627,7 @@ fn locate_fresh(
                 .map(|(n, _, _)| n)
                 .collect();
             let idx = bisect_index(files.len(), want, &mut |i| {
-                probe_first_ts(open, &files[i])
+                probe_first_ts(open, &files[i], PROBE_FIRST_TS_CAP)
             })
             .ok_or_else(|| {
                 PipelineError::Config(
@@ -561,11 +659,16 @@ pub(crate) fn run_repl_with(
     let mut filters = Filters::from_config(cfg);
     let stop_wired = filters.stop.is_some() || filters.stop_ts.is_some();
     let resume_file = cfg.resume_file.clone();
-    // 终档路径：显式 --resume-file 原样续写；缺省落 {output-dir}/resume.json
-    // （--to-stdout 无目录 → 水位解除，重连按尝试起点回退=纯重复方向）。
-    let cp_path: Option<PathBuf> = resume_file
-        .clone()
-        .or_else(|| cfg.output_dir.as_ref().map(|d| d.join("resume.json")));
+    // P3 fix round（I1）：**读/写 checkpoint 路径分离**。写档恒为
+    // {output-dir}/resume.json（缺目录 = 无写档，同 --to-stdout 形态）；
+    // 读档 = 显式 --resume-file 优先。resume run 里消费的档是上一 run 的
+    // 审计产物，按 §5「旧产物字节不可变」须原样保留——若续写它，首个事务
+    // 水位就会把 run1 的 written_files 改写成 run2 清单：旧 manifest 蒸发、
+    // 且第二跳的 `read_verify(rf, rf.parent())` 双向对账当场失效。启动时以
+    // 消费档的位点给新目录**播种**一份 fresh 档，此后 mid-run 水位、每次
+    // 重连的 `cp_start_for_retry` 读取、epilogue 终档全部只认新目录路径。
+    let dir_cp: Option<PathBuf> = cfg.output_dir.as_ref().map(|d| d.join("resume.json"));
+    let cp_path: Option<PathBuf> = dir_cp.clone();
 
     // ── 定位：resume 优先（read_verify 对账），否则三态 ──
     // 对账目录 = checkpoint 的**所在目录**（written_files 描述的上一段产物
@@ -575,6 +678,17 @@ pub(crate) fn run_repl_with(
         Some(rf) => match checkpoint::read_verify(rf, rf.parent().unwrap_or(Path::new("."))) {
             Ok(cp) => {
                 is_resume_run = true;
+                // 播种写档（fix round I1）：新目录 fresh 档继承消费档的位点，
+                // written_files 清空——那是 run2 自己的账，与 A 目录实物无关。
+                // 同路径（用户故意把 resume-file 摆进新输出目录）跳过播种：
+                // 该布局下「就地续写覆盖」是用户自己的选择，不算破坏他人审计。
+                if let Some(wp) = cp_path.as_deref()
+                    && wp != rf.as_path()
+                {
+                    let mut seed = cp.clone();
+                    seed.written_files = Vec::new();
+                    checkpoint::write_atomic(wp, &seed)?;
+                }
                 (cp.file, cp.pos)
             }
             Err(checkpoint::CpError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -585,10 +699,17 @@ pub(crate) fn run_repl_with(
                 locate_fresh(cfg, &mut store, env.open, &filters)?
             }
             Err(e) => {
+                let wp_hint = match cp_path.as_deref() {
+                    Some(wp) => format!(
+                        "this run's own checkpoint would be written to {} (the consumed file stays untouched)",
+                        wp.display()
+                    ),
+                    None => "this run has no on-disk checkpoint (--to-stdout shape)".to_string(),
+                };
                 return Err(PipelineError::Config(format!(
                     "repl resume check of {} failed: {e} — repl never appends to existing .sql \
-                     artifacts; resume into a FRESH --output-dir (keep the checkpoint beside \
-                     the previous run's output; the registry must match the files on disk)",
+                     artifacts; resume into a FRESH --output-dir (keep the consumed checkpoint \
+                     beside the previous run's output — it is never rewritten; {wp_hint})",
                     rf.display()
                 )));
             }
@@ -678,7 +799,13 @@ pub(crate) fn run_repl_with(
                     rep.cause
                 )));
             }
-            FailKind::Auth | FailKind::Priv => {
+            FailKind::Auth => {
+                break Err(PipelineError::Config(format!(
+                    "{AUTH_HINT} (server: {})",
+                    rep.cause
+                )));
+            }
+            FailKind::Priv => {
                 break Err(PipelineError::Config(format!(
                     "{PRIV_HINT} (server: {})",
                     rep.cause
@@ -1829,10 +1956,11 @@ mod repl_tests {
     use clap::Parser;
 
     use super::{
-        FailKind, Locate, PRIV_HINT, PURGED_HINT, RESUME_GONE_PREFIX, ReplEnv, SERVER_ID_GRACE_MS,
-        bisect_index, classify_repl_failure, decide_locate, reconnect_backoff_secs, reconnect_warn,
-        run_repl_with,
+        AUTH_HINT, FailKind, Locate, PRIV_HINT, PURGED_HINT, RESUME_GONE_PREFIX, ReplEnv,
+        SERVER_ID_GRACE_MS, bisect_index, classify_repl_failure, decide_locate,
+        reconnect_backoff_secs, reconnect_warn, run_repl_with,
     };
+    use crate::binlog::event::EventType;
     use crate::config::{Cli, Command, Config};
     use crate::metadata::store::SchemaStore;
     use crate::repl::checkpoint::{self, Checkpoint};
@@ -2199,7 +2327,7 @@ mod repl_tests {
         );
         assert_eq!(opens.lock().unwrap().len(), 1, "终止面不重连");
 
-        // auth / 权限缺失
+        // auth（1045，fix round M1：专属可操作文案，不再与权限共用）
         let (dir, _out, cfg) = repl_cfg(&["--start-file", "mysql-bin.000001"]);
         let opens2: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
         let mut opener2 = {
@@ -2216,11 +2344,42 @@ mod repl_tests {
             interrupt: flag.clone(),
         };
         let e = run_repl_with(&cfg, store_for(&dir), &mut env2).expect_err("auth → 终止");
+        let s = e.to_string();
+        assert!(
+            s.contains(AUTH_HINT),
+            "须含逐字认证文案「{AUTH_HINT}」，got: {s}"
+        );
+        assert!(
+            !s.contains(PRIV_HINT),
+            "1045 文案不得再混入权限串误导排障方向，got: {s}"
+        );
+        assert_eq!(opens2.lock().unwrap().len(), 1);
+
+        // 权限缺失（1227 家族）：PRIV_HINT 原文不动（live 组钉过同款）
+        let (dir, _out, cfg) = repl_cfg(&["--start-file", "mysql-bin.000001"]);
+        let opens3: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
+        let mut opener3 = {
+            let opens = opens3.clone();
+            move |f: &str, p: u32| {
+                opens.lock().unwrap().push((f.to_string(), p));
+                Err(ReplError::MissingPriv(
+                    "Access denied; you need (at least one of) the REPLICATION SLAVE privilege"
+                        .into(),
+                ))
+            }
+        };
+        let mut env3 = ReplEnv {
+            open: &mut opener3,
+            wait: &mut wait,
+            now_ms: &mut clock,
+            interrupt: flag.clone(),
+        };
+        let e = run_repl_with(&cfg, store_for(&dir), &mut env3).expect_err("priv → 终止");
         assert!(
             e.to_string().contains(PRIV_HINT),
             "须含逐字权限文案「{PRIV_HINT}」，got: {e}"
         );
-        assert_eq!(opens2.lock().unwrap().len(), 1);
+        assert_eq!(opens3.lock().unwrap().len(), 1);
     }
 
     /// resume 起点被主库 purge → 逐字 purge 文案前缀 "resume point is gone: "；
@@ -2369,6 +2528,200 @@ mod repl_tests {
             *opens.lock().unwrap(),
             vec![("mysql-bin.000002".to_string(), 8u32)]
         );
+    }
+
+    /// I1（fix round）：resume run 的写档与读档分离——消费的 `--resume-file`
+    /// 是上一 run 的审计产物，字节不可变（§5「旧产物字节不可变」+ 第二跳
+    /// 仍可对其 `read_verify` 对账）；本 run 的水位/重连起点/终档全部落
+    /// **新输出目录** `{output-dir}/resume.json`（启动即以消费档位点播种）。
+    /// 修复前：首个事务水位即把 run1 档的 written_files 改写为 run2 清单
+    /// ——旧 manifest 蒸发且第二跳对账必炸（Stale）。
+    #[test]
+    fn resume_run_never_rewrites_consumed_checkpoint() {
+        // 「run1 产物」手工落盘：A=out（to_sql.1.sql + 与其对账的 resume.json，
+        // 位点 000003:456）——与 run1 epilogue 落档字节同型（同型已由
+        // ctrlc/水位族钉，此处不重复起真 run）。
+        let (dir, a_dir, base) = repl_cfg(&["--start-file", ""]);
+        std::fs::write(a_dir.join("to_sql.1.sql"), b"old-run-artifact").unwrap();
+        let rf = a_dir.join("resume.json");
+        checkpoint::write_atomic(
+            &rf,
+            &Checkpoint {
+                file: "mysql-bin.000003".into(),
+                pos: 456,
+                ts: "2026-09-21_12:00:00".into(),
+                written_files: vec!["to_sql.1.sql".into()],
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(&rf).unwrap();
+
+        // run2：从 A 的档接续，产物与写档落进新目录 B。
+        let b_dir = dir.join("out2");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let mut cfg = base;
+        cfg.resume_file = Some(rf.clone());
+        cfg.output_dir = Some(b_dir.clone());
+        let opens: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut opener = stop_after(1, &opens, &flag, None);
+        let mut wait = |_| {};
+        let mut clock = || 0u64;
+        let mut env = ReplEnv {
+            open: &mut opener,
+            wait: &mut wait,
+            now_ms: &mut clock,
+            interrupt: flag.clone(),
+        };
+        run_repl_with(&cfg, store_for(&dir), &mut env).expect("resume run 正常收尾");
+        assert_eq!(
+            *opens.lock().unwrap(),
+            vec![("mysql-bin.000003".to_string(), 456u32)],
+            "读起点仍取自 --resume-file"
+        );
+        // 消费档字节不可变，旧实物不受碰。
+        assert_eq!(
+            std::fs::read(&rf).unwrap(),
+            before,
+            "consumed resume.json 必须字节不变"
+        );
+        assert_eq!(
+            std::fs::read(a_dir.join("to_sql.1.sql")).unwrap(),
+            b"old-run-artifact"
+        );
+        // 新目录自有终档：位点=resume 起点（本 run 无新水位），
+        // written_files=run2 自己的空账（而非 A 清单的拷贝）。
+        let raw = std::fs::read(b_dir.join("resume.json")).expect("run2 终档必须落在新输出目录");
+        let cp: Checkpoint = serde_json::from_slice(&raw).unwrap();
+        assert_eq!((cp.file.as_str(), cp.pos), ("mysql-bin.000003", 456));
+        assert!(
+            cp.written_files.is_empty(),
+            "run2 账本不含 A 的产物: {:?}",
+            cp.written_files
+        );
+        // 两跳自洽：对 A（run1 档+目录）与对 B（run2 档+目录）的双向对账都过
+        // ——修复前 A 被 run2 epilogue 改写（written_files 蒸发）则第一行必红。
+        checkpoint::read_verify(&rf, &a_dir).expect("A 的审计档须仍可整档复用（第二跳前提）");
+        checkpoint::read_verify(&b_dir.join("resume.json"), &b_dir).expect("B 档/目录自洽");
+    }
+
+    /// I2（fix round）：空闲主库 + heartbeat 在场——流里只有心跳帧。
+    /// 心跳被 ReplSource 内部消化（外部不可见），修复前探针自旋等「下一个
+    /// 数据事件」：heartbeat>0 时服务端每 d 有帧、读超时 2d+1s 永不触发
+    /// （旧注释「由读超时兜底」恰好说反）→ 无界挂起。修复后：首心跳即
+    /// 判定「查询区间已到活写尾部且无数据事件」≙ 空档 ts=0（右移语义）。
+    #[test]
+    fn probe_first_ts_classifies_heartbeat_only_stream_as_tail() {
+        let mut opener = |_: &str, _: u32| -> Result<Box<dyn FrameStream>, ReplError> {
+            Ok(Box::new(FakeStream::new(vec![heartbeat_frame()])) as Box<dyn FrameStream>)
+        };
+        let got = super::probe_first_ts(&mut opener, "mysql-bin.000099", Duration::from_secs(5));
+        assert_eq!(
+            got,
+            Some(0),
+            "首心跳=活写尾部无数据事件，须即时落地而非等下一事件"
+        );
+    }
+
+    fn heartbeat_frame() -> Frame {
+        // 19B 公共头最小帧：kind=HEARTBEAT_LOG_EVENT(0x1b)、event_size=19、ts=0。
+        let mut b = vec![0u8; 19];
+        b[4] = EventType::HEARTBEAT;
+        b[9..13].copy_from_slice(&19u32.to_le_bytes());
+        Frame {
+            bytes: b,
+            binlog_hint: None,
+        }
+    }
+
+    /// 数据事件在场形态（修复不吞既有语义）：FDE 源侧消化不产出 → 其后
+    /// 首个真事件的 ts 即探测结果；尾随心跳不得抢先把结果改判成 Some(0)
+    /// （先数据后心跳的到达序 = 判定序）。
+    #[test]
+    fn probe_first_ts_returns_first_data_event_ts() {
+        let mut opener = |_: &str, _: u32| -> Result<Box<dyn FrameStream>, ReplError> {
+            Ok(Box::new(FakeStream::new(vec![
+                synth_frame(EventType::FORMAT_DESC, 1000, 116, &fde_body()),
+                synth_frame(EventType::XID, 1002, 143, &[7u8; 8]),
+                heartbeat_frame(),
+            ])) as Box<dyn FrameStream>)
+        };
+        let got = super::probe_first_ts(&mut opener, "mysql-bin.000099", Duration::from_secs(5));
+        assert_eq!(
+            got,
+            Some(1002),
+            "首个数据事件 ts 定档（心跳在其后，不参与）"
+        );
+    }
+
+    /// 墙钟硬顶钉死：一个字节都不发的静默流（heartbeat=0 空闲主库 + 连接
+    /// 无读超时的实况形态）→ 探针必须在 cap 量级内返回 None 脱身。
+    /// 修复前形态=在此永挂（循环版探针没有任何可触发检查点的输入）。
+    #[test]
+    fn probe_first_ts_is_hard_bounded_by_wall_clock() {
+        struct SilentStream {
+            silence: Duration,
+            done: bool,
+        }
+        impl FrameStream for SilentStream {
+            fn next_frame(&mut self) -> Result<Option<Frame>, ReplError> {
+                if !self.done {
+                    self.done = true;
+                    std::thread::sleep(self.silence); // 模拟无字段的阻塞读
+                }
+                Ok(None)
+            }
+        }
+        let cap = Duration::from_millis(80);
+        let mut opener = move |_: &str, _: u32| -> Result<Box<dyn FrameStream>, ReplError> {
+            Ok(Box::new(SilentStream {
+                silence: Duration::from_secs(2),
+                done: false,
+            }) as Box<dyn FrameStream>)
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            super::probe_first_ts(&mut opener, "mysql-bin.000099", cap),
+            None,
+            "静默超时按探测失败（二分左收）"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(1000),
+            "硬顶须快败，got {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// 文件同构无 CRC 帧（19B 公共头 + 体；event_size 自洽）。
+    fn synth_frame(kind: u8, ts: u32, log_pos: u32, body: &[u8]) -> Frame {
+        let size = (19 + body.len()) as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(&ts.to_le_bytes());
+        b.push(kind);
+        b.extend_from_slice(&9u32.to_le_bytes()); // server_id
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&log_pos.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // flags
+        b.extend_from_slice(body);
+        Frame {
+            bytes: b,
+            binlog_hint: None,
+        }
+    }
+
+    /// 最小合法 FDE 体（v4 / "8.0.46" / hdr_len 19 / alg=NONE，与
+    /// src/repl/source.rs 测试族的 fde_body 同构——那边冻结面不可共享）。
+    fn fde_body() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&4u16.to_le_bytes());
+        let mut sv = [0u8; 50];
+        sv[..6].copy_from_slice(b"8.0.46");
+        b.extend_from_slice(&sv);
+        b.extend_from_slice(&1600000000u32.to_le_bytes());
+        b.push(19);
+        b.extend_from_slice(&[27u8; 39]);
+        b.push(0); // checksum alg = NONE
+        b
     }
 
     /// §4 铁律：重连拉流起点 = checkpoint 位点，**绝不用内存中已读到的

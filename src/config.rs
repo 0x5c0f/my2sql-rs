@@ -409,6 +409,8 @@ impl Config {
     /// 2. `--resume-file` 与显式 start-* 互斥——位点三态（resume / now 哨兵 /
     ///    显式位点）只允许一态，同给即歧义；now 哨兵 = start_file 空且
     ///    start_pos==0（`repl_defaults` 钉），非哨兵即视为显式 start；
+    ///    2b.（fix round M3）`--start-datetime` 与非空 `--start-file` 两两
+    ///    互斥——同为显式定位来源，同给即「位点来源歧义」硬错；
     /// 3. `--resume-file` + `--to-stdout` 拒——checkpoint 的 written_files 需
     ///    与盘上产物对账（T3 契约），stdout 形态无从对账；
     /// 4. `--heartbeat-secs` 仅上限 3600（0 合法=禁用，spec §1）。
@@ -431,6 +433,17 @@ impl Config {
                 "repl: --resume-file {rf:?} conflicts with an explicit start position \
                  (位点歧义: pass either --resume-file, or the now sentinel \
                  --start-file \"\" --start-pos 0, or start-* — exactly one)"
+            ));
+        }
+        // M3（fix round，spec §1 三态两两互斥）：datetime 与非空 start-file 同为
+        // 显式位点来源，同给即歧义——validate 期硬错（run_repl_with 的
+        // decide_locate 曾静默偏好 datetime，掩盖误操作）。
+        if args.common.start_datetime.is_some() && !args.common.start_file.is_empty() {
+            return Err(format!(
+                "repl: --start-datetime and non-empty --start-file {:?} are both explicit \
+                 locate sources (位点歧义: pass exactly one — --start-datetime (bisect), \
+                 --start-file/--start-pos (direct), or neither (now sentinel))",
+                args.common.start_file
             ));
         }
         if args.resume_file.is_some() && args.to_stdout {
@@ -835,6 +848,59 @@ mod tests {
             Config::validate_repl(rargs(&["--uri", "mysql://x@y", "--resume-file", "/r.json"]))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn repl_rejects_start_datetime_with_explicit_start_file() {
+        // M3（fix round，spec §1 三态两两互斥）：datetime 与非空 start-file
+        // 同为显式位点来源，同给即歧义——validate 期硬错，不做运行期静默偏好。
+        let e = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--uri",
+            "mysql://x@y",
+            "--server-id",
+            "7",
+            "--start-file",
+            "f.000001",
+            "--start-datetime",
+            "2026-09-21 10:00:00",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("start-datetime"), "{e}");
+        assert!(e.contains("歧义"), "{e}");
+        // 不回退既有合法臂①：datetime 单独在场（start_file 保持空哨兵）→ Ok。
+        let c = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--uri",
+            "mysql://x@y",
+            "--server-id",
+            "7",
+            "--start-file",
+            "",
+            "--start-datetime",
+            "2026-09-21 10:00:00",
+        ]))
+        .unwrap();
+        assert!(c.start_datetime.is_some() && c.start_file.is_empty());
+        // 不回退既有合法臂②：start-file 直给（含显式 start_pos=4）→ Ok。
+        let c = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--uri",
+            "mysql://x@y",
+            "--server-id",
+            "7",
+            "--start-file",
+            "f.000001",
+            "--start-pos",
+            "4",
+        ]))
+        .unwrap();
+        assert_eq!((c.start_file.as_str(), c.start_pos), ("f.000001", 4));
+        // 不回退既有合法臂③：裸默认 = now 哨兵（repl_defaults 另钉，此处复抽）。
+        assert!(Config::validate_repl(rargs(&["--uri", "mysql://x@y"])).is_ok());
     }
 
     #[test]
