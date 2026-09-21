@@ -84,8 +84,16 @@ pub fn open(
 ) -> Result<Box<dyn FrameStream>, ReplError> {
     let opts = Opts::from_url(uri).map_err(|e| ReplError::Protocol(format!("invalid uri: {e}")))?;
     let mut conn = Conn::new(opts).map_err(map_mysql_error)?;
-    if let Some(d) = heartbeat {
-        let _ = conn.query_drop(format!("SET @master_heartbeat_period = {}", d.as_nanos()));
+    if let Some(d) = heartbeat
+        && let Err(e) = conn.query_drop(format!("SET @master_heartbeat_period = {}", d.as_nanos()))
+    {
+        // 不致命：降级为无心跳流——但必须留痕，T5 探活计时器否则
+        // 只会静默退化到读超时兜底（§6 死链探测口径变慢）。
+        tracing::warn!(
+            "heartbeat SET @master_heartbeat_period = {} failed, \
+             degrading to no-heartbeat repl stream: {e}",
+            d.as_nanos()
+        );
     }
     let req = BinlogRequest::new(server_id)
         .with_filename(file.as_bytes().to_vec())
@@ -107,11 +115,20 @@ impl FrameStream for MysqlFrameStream {
                 event
                     .write(mysql::binlog::BinlogVersion::Version4, &mut bytes)
                     .map_err(|e| ReplError::Protocol(format!("event rebuild failed: {e}")))?;
-                let binlog_hint = match event.read_data() {
-                    Ok(Some(mysql::binlog::events::EventData::RotateEvent(re))) => {
-                        Some(re.name().into_owned())
+                // 先以 19B 头里的 event kind 粗筛（零成本），仅 ROTATE 帧才
+                // 付 `read_data()` 全量解析——hint 只可能来自 RotateEvent，
+                // 其余事件免去每次 next_frame 的双重解析。
+                let binlog_hint = if event.header().event_type_raw()
+                    == mysql::binlog::EventType::ROTATE_EVENT as u8
+                {
+                    match event.read_data() {
+                        Ok(Some(mysql::binlog::events::EventData::RotateEvent(re))) => {
+                            Some(re.name().into_owned())
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                } else {
+                    None
                 };
                 Ok(Some(Frame { bytes, binlog_hint }))
             }

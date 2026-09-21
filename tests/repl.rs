@@ -126,6 +126,11 @@ fn synth_frame_export_is_byte_equal_through_repl_source() {
                 y.tm.is_some(),
                 "tm 有无（with_crc={with_crc}）"
             );
+            assert_eq!(
+                x.tm.as_ref().map(|t| t.table_id),
+                y.tm.as_ref().map(|t| t.table_id),
+                "tm table_id（with_crc={with_crc}）"
+            );
         }
         // 绝对口径抽查（防「双侧同错」对称盲区）：rows start = table_map
         // 起始、rotate 先旧名后切名、更名后事件记新名。

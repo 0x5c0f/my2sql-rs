@@ -18,7 +18,7 @@ pub use source::ReplSource;
 pub use transport::{Frame, FrameStream, ReplError};
 
 /// 无服务器单测注入件（简报 Step 1 口径）：`VecDeque` 假 `FrameStream`
-/// + `ReplSource::for_test` 构造器（`transport::open` 不碰）。
+/// + 模块级 `repl_source_for_test` 构造器（`transport::open` 不碰）。
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::VecDeque;
@@ -61,8 +61,8 @@ pub(crate) mod test_support {
         }
     }
 
-    /// 单测构造器（`ReplSource::for_test` 语义的模块级自由函数形态，
-    /// 供 source.rs 测试模块跨模块调用）：帧队列 + 首文件名，过滤全放行。
+    /// 单测构造器（`test_support::repl_source_for_test`：帧队列 +
+    /// 首文件名，过滤全放行），供 source.rs 测试模块跨模块调用。
     pub(crate) fn repl_source_for_test(frames: Vec<Frame>, first_binlog: String) -> ReplSource {
         ReplSource::new(
             Box::new(FakeStream::new(frames)),

@@ -944,4 +944,64 @@ mod tests {
         let mut s = crate::repl::test_support::repl_source_for_test(vec![fr(bare)], "f".into());
         assert!(matches!(s.next().unwrap_err(), BinlogError::InvalidData(_)));
     }
+
+    /// 负向钉（互钉之一）：with_crc 态下**真帧**（log_pos≠0、非合成）
+    /// CRC 尾被改 → 必 Err(ChecksumMismatch)（source.rs 硬闸的
+    /// `!crc32_ok(&full) → return Err(ChecksumMismatch)` 分支）。删该
+    /// 分支则本测试必红（XID 会照常产出）——与合成帧「验过才剥、不判
+    /// 损坏」的软臂形成硬/软两态，硬态仅此一处入口，由本测独占。
+    #[test]
+    fn real_frame_with_corrupted_crc_tail_is_checksum_mismatch() {
+        let mut p = Parity::new(true); // 真文件 FDE（alg=CRC32、Crc::Fde 尾）→ with_crc=true
+        p.push(EventType::FORMAT_DESC, 1000, &fde_body("8.0.46", Some(1)));
+        let xid_size = (EVENT_HEADER_SIZE + 8 + 4) as u32; // 头+体+CRC 尾
+        let mut xid = build_frame(
+            EventType::XID,
+            1002,
+            p.cursor + xid_size, // 真帧头位点（非 0 → 不走合成软臂）
+            0x0001,
+            &xid_body(42),
+            Crc::On,
+        );
+        let last = xid.len() - 1;
+        xid[last] ^= 0xFF; // 只改 CRC 尾字节：帧长不变，钉的是校验闸而非尺寸闸
+        p.raws.push(xid);
+        let mut s =
+            crate::repl::test_support::repl_source_for_test(p.frames(), "mysql-bin.000001".into());
+        // FDE 消化不产出、next() 循环至坏帧 → 首调用即硬错（互钉硬臂）
+        assert_eq!(s.next().unwrap_err(), BinlogError::ChecksumMismatch);
+    }
+
+    /// 负向钉（互钉之二）：帧总长与 header event_size 不符 → 帧自洽硬
+    /// 闸（`full.len() as u32 != h.event_size → Err(InvalidData)`）报
+    /// "frame size … != header event_size"。此闸先于 FDE 判定与 CRC 口
+    /// 径，故前置合法 FDE：若删分支，坏帧会被当合法 XID 正常产出（本
+    /// 测必红），而非落入其他错误臂——错误文案匹配独占该分支。
+    #[test]
+    fn frame_length_disagreeing_with_header_event_size_is_hard_error() {
+        let mut p = Parity::new(false); // 无 CRC 流：排除 checksum 干扰，独占尺寸闸
+        p.push(EventType::FORMAT_DESC, 1000, &fde_body("8.0.46", Some(0)));
+        let xid_end = p.cursor + (EVENT_HEADER_SIZE + 8) as u32;
+        let mut bad = build_frame(
+            EventType::XID,
+            1002,
+            xid_end,
+            0x0001,
+            &xid_body(42),
+            Crc::Off,
+        );
+        let header_size = u32::from_le_bytes([bad[9], bad[10], bad[11], bad[12]]); // event_size 字段
+        bad.extend_from_slice(&[0u8; 4]); // 帧体多出 4B：header event_size 不变 → 不符
+        assert_eq!(bad.len() as u32, header_size + 4);
+        p.raws.push(bad);
+        let mut s =
+            crate::repl::test_support::repl_source_for_test(p.frames(), "mysql-bin.000001".into());
+        // FDE 消化后循环取到坏帧 → 首调用即触闸
+        let e = s.next().unwrap_err();
+        assert!(
+            matches!(&e, BinlogError::InvalidData(m)
+                if m.contains("frame size") && m.contains("header event_size")),
+            "必须是帧自洽闸的专属错误，不得落入其他错误臂：{e:?}"
+        );
+    }
 }
