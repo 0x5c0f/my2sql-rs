@@ -256,4 +256,52 @@ impl Synth {
         }
         self.push(31, ts, &b)
     }
+
+    // ---------- P3 T2 追加：文件同构全帧导出（repl 对测用） ----------
+
+    /// 把内部字节流（magic + 无 CRC 帧序列）导出为**独立全帧**列表——
+    /// `Event::write` 产物的同构形态（`FrameStream` 逐帧交付口径）。
+    ///
+    /// - `with_crc = false`：按 `event_size` 自足切帧，原样返回；
+    /// - `with_crc = true`：重写为 CRC32 流——每帧 `event_size`/`log_pos`
+    ///   加 4（按新流真实累计位点重排），FDE(15) 的体尾 alg 字节置 1
+    ///   （置尾后即落 `len-5`，`handle_fde` 判定口径），帧尾追加
+    ///   `crc32(全帧前缀)`；FDE 校验按 `fde_checksum_ok` 特例仅掩
+    ///   flags 低字节的 BINLOG_IN_USE 位（bit 0）。
+    pub(crate) fn frame_bytes(&self, with_crc: bool) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut off = 4usize; // 跳过 magic
+        let mut cursor: u32 = 4; // 导出流的文件位点（帧起始）
+        while off < self.bytes.len() {
+            let mut f = self.bytes[off..off + 19].to_vec();
+            let size =
+                u32::from_le_bytes(self.bytes[off + 9..off + 13].try_into().unwrap()) as usize;
+            f.extend_from_slice(&self.bytes[off + 19..off + size]);
+            let evtype = self.bytes[off + 4];
+            if with_crc {
+                let new_size = (size + 4) as u32;
+                f[9..13].copy_from_slice(&new_size.to_le_bytes());
+                let end = cursor + new_size;
+                f[13..17].copy_from_slice(&end.to_le_bytes());
+                if evtype == 15 {
+                    f[19 + size - 20] = 1; // 体尾 alg 字节（len-5）置 CRC32
+                }
+                let mut h = crc32fast::Hasher::new();
+                h.update(&f[..17]);
+                if evtype == 15 {
+                    h.update(&[f[17] & !0x01, f[18]]); // 仅掩 BINLOG_IN_USE
+                } else {
+                    h.update(&f[17..19]);
+                }
+                h.update(&f[19..]);
+                f.extend_from_slice(&h.finalize().to_le_bytes());
+                cursor = end;
+            } else {
+                cursor += size as u32;
+            }
+            out.push(f);
+            off += size;
+        }
+        out
+    }
 }
