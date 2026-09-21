@@ -263,13 +263,17 @@ pub(crate) const AUTH_HINT: &str = "authentication failed: the server rejected t
 pub(crate) const RESUME_GONE_PREFIX: &str = "resume point is gone: ";
 /// 退避封顶秒（1s 起翻倍）。
 const BACKOFF_CAP_SECS: f64 = 30.0;
-/// 同因快速失败的连发窗口（毫秒）：两次同因失败间隔 ≥ 本窗即重置计数
-/// ——主库重启级故障（退避自然拉长后间隔必超窗）绝不被误杀；server-id
-/// 互踢循环（1236 特征或 FIX E 的裸强制断连形态）封顶后间隔 ~31s 仍
-/// < 60s 窗，第 3 连发必终止。
+/// 同因快速失败的连发窗口（毫秒）：两次同因失败间隔 ≥ 本窗即重置计数。
+/// 终审 FIX E 精细化后的真实角色：ServerIdConflict（1236 文案互踢形态）
+/// 仍由本窗独立兜底（旧口径逐字不变）；Disconnect 闸改按**零进度秒断**
+/// 计连发（[`FailureTracker::observe`]）——主库重启的失败-失败间隔 = 退避
+/// 本身（1s/2s/4s…封顶 30s×1.25=37.5s，恒 < 本窗），旧注释「退避自然拉长
+/// 后间隔必超窗」对封顶退避不成立，故重启恢复改由进度信号保护；本窗对
+/// Disconnect 退化为「间隔超窗 = 新一段故障」的第二道重置（互踢循环连发
+/// 间隔永不超窗，正常永不触发）。
 pub(crate) const SERVER_ID_GRACE_MS: u64 = 60_000;
 /// 同因秒断终止阈值（spec §6「连续 3 次同因秒断即终止报错」；适用范围
-/// ServerIdConflict + Disconnect，终审 FIX E）。
+/// ServerIdConflict + Disconnect〔零进度口径，FIX E 精细化〕，终审 FIX E）。
 const FAST_FAIL_LIMIT: u32 = 3;
 
 /// 位点三态 + resume 的判定结果（纯函数可测，控制器裁定：start_file 空
@@ -347,8 +351,16 @@ pub(crate) fn classify_repl_failure(e: &ReplError) -> (FailKind, String) {
     }
 }
 
-/// 同因连发计数器（间隔窗口重置；换因重置）。observe 返回含本次在内的
-/// 当前同因连发数；终止判定（≥3 且 kind==ServerIdConflict）在调用方。
+/// 同因连发计数器（换因重置；间隔超 grace 窗重置）。observe 返回含本次
+/// 在内的当前同因连发数；终止判定（≥3 且 kind∈{ServerIdConflict,
+/// Disconnect}）在调用方。分形态语义（终审 FIX E 精细化）：
+/// - `ServerIdConflict`（1236 文案）等：同因 + 间隔 < grace → +1，否则
+///   重置为 1（T5 原判逻辑，逐字保留）；
+/// - `Disconnect`：只计**连续零进度秒断**——该尝试 open 成功且一帧
+///   RawEvent 都未投递（register/dump 期同 id 互踢循环的签名，spec §6
+///   「连续 3 次同因秒断」）。投递过事件的串中断路径、以及开流即被拒
+///   （主库重启窗口形态：从未建立流，非「秒断」）一律把连发清零——
+///   重启恢复不误杀；真互踢恒为 3 连零事件秒断 → 仍第 3 连终止。
 #[derive(Debug, Default)]
 pub(crate) struct FailureTracker {
     last: Option<(FailKind, u64, u32)>,
@@ -358,11 +370,19 @@ impl FailureTracker {
     pub(crate) fn new() -> Self {
         Self::default()
     }
-    pub(crate) fn observe(&mut self, kind: FailKind, now_ms: u64) -> u32 {
+    /// `bare_break` = 本尝试开流成功且投递 **0** 个 RawEvent（裸秒断）。
+    /// 仅对 `Disconnect` 有意义；其余 kind 忽略该参（保持 T5 原逻辑）。
+    pub(crate) fn observe(&mut self, kind: FailKind, now_ms: u64, bare_break: bool) -> u32 {
         let streak = match self.last {
             Some((k, at, s)) if k == kind && now_ms.saturating_sub(at) < SERVER_ID_GRACE_MS => {
-                s + 1
+                if kind == FailKind::Disconnect {
+                    if bare_break { s + 1 } else { 0 }
+                } else {
+                    s + 1
+                }
             }
+            // 换因/宽间隔重开一段；Disconnect 非秒断臂不占连发位（清零）。
+            _ if kind == FailKind::Disconnect && !bare_break => 0,
             _ => 1,
         };
         self.last = Some((kind, now_ms, streak));
@@ -548,6 +568,9 @@ struct Pumper {
     src: ReplSource,
     sink: Arc<Mutex<Option<FailReport>>>,
     interrupt: Arc<AtomicBool>,
+    /// 本尝试是否已向消费侧投递过 ≥1 个 RawEvent（FIX E 精细化的逐尝试
+    /// 进度信号：`run_repl_with` 循环体每次尝试新建、随该次失败观测消费）。
+    progressed: Arc<AtomicBool>,
 }
 
 impl EventSource for Pumper {
@@ -564,7 +587,11 @@ impl EventSource for Pumper {
                 }
                 Err(e)
             }
-            ok => ok,
+            Ok(Some(ev)) => {
+                self.progressed.store(true, Ordering::Relaxed);
+                Ok(Some(ev))
+            }
+            Ok(None) => Ok(None),
         }
     }
 }
@@ -754,10 +781,14 @@ pub(crate) fn run_repl_with(
     let run_res: Result<(), PipelineError> = loop {
         attempts += 1;
         // 失败摘要：本轮的终止/重连分诊输入。None = 本轮无传输层失败。
+        // 本轮是否「裸秒断」= open 成功且 0 事件投递（互踢签名，进
+        // Disconnect 连发计数）；开流被拒恒 false（从未建立流，非秒断）。
         let opened = (env.open)(&file, pos);
+        let mut bare_break = false;
         let report: Option<FailReport> = match opened {
             Ok(stream) => {
                 let sink: Arc<Mutex<Option<FailReport>>> = Arc::new(Mutex::new(None));
+                let progressed = Arc::new(AtomicBool::new(false));
                 // FIX D：中断旗标直达解码环——空闲 master 恒心跳流上
                 // Pumper 的事件间隙检查无间隙可看，帧顶检查把 Ctrl-C
                 // 延迟钉在 ≤ 心跳周期（run_live 照常收尾：停泵→drain→
@@ -772,9 +803,11 @@ pub(crate) fn run_repl_with(
                     src,
                     sink: sink.clone(),
                     interrupt: env.interrupt.clone(),
+                    progressed: progressed.clone(),
                 });
                 match runner.run_live(pumper, &file, cp_path.as_deref()) {
                     Ok(_) => {
+                        bare_break = !progressed.load(Ordering::Relaxed);
                         if env.interrupt.load(Ordering::Relaxed) || stop_wired {
                             break Ok(()); // stop 命中 / Ctrl-C：优雅收尾出口①
                         }
@@ -786,6 +819,7 @@ pub(crate) fn run_repl_with(
                         })
                     }
                     Err(pe) => {
+                        bare_break = !progressed.load(Ordering::Relaxed);
                         let mut rep = sink.lock().unwrap_or_else(|p| p.into_inner()).take();
                         if let Some(r) = rep.as_mut() {
                             // 传输错误的 BinlogError 包装文本并进 cause（保真
@@ -833,12 +867,15 @@ pub(crate) fn run_repl_with(
             _ => {}
         }
         // ── 可重连面：同因秒断终止闸 → 退避 → checkpoint 起点重开 ──
-        let streak = tracker.observe(rep.kind, (env.now_ms)());
-        // 带 1236 特征的 server-id 冲突 3 连即终止（T5 原判）；终审 FIX E：
-        // 真实互踢常是**无特征的干净强制断连**（Disconnect）——tracker 的
-        // 同类 streak 语义保证所有间隔 < grace（任一宽间隔重置为 1，主库
-        // 重启级故障不误杀），故 Disconnect 同 3-strike 也按疑似互踢快速
-        // 失败，不再无限循环。
+        let streak = tracker.observe(rep.kind, (env.now_ms)(), bare_break);
+        // 带 1236 特征的 server-id 冲突 3 连即终止（T5 原判，间隔窗口径
+        // 不变）；终审 FIX E：真实互踢常是**无特征的干净强制断连**
+        // （Disconnect）；FIX E 精细化（终审复评阻断缺陷修正）：Disconnect
+        // 只计**连续零进度秒断**（bare_break = open 成功且 0 事件投递）——
+        // 主库重启时间线（串流中断带进度 + 重启窗口内开流被拒）会把连发
+        // 清零，走正常重连恢复；旧口径「同因 3 连即终止」在退避间隔恒
+        // < 60s 窗下于第 3 次失败即误杀（旧注释「退避拉长后间隔必超窗」
+        // 对封顶 37.5s 的退避不成立）。真互踢 = 3 连零事件秒断，仍终止。
         if matches!(rep.kind, FailKind::ServerIdConflict | FailKind::Disconnect)
             && streak >= FAST_FAIL_LIMIT
         {
@@ -2563,22 +2600,65 @@ mod repl_tests {
     }
 
     /// 同因 3 连秒断（server-id 互踢形态）→ 终止报错；纯计数臂（异因/
-    /// 宽间隔重置）一并钉死。
+    /// 宽间隔重置、FIX E 精细化的零进度口径）一并钉死。
     #[test]
     fn same_cause_fast_fail_three_terminates() {
         use super::FailureTracker;
         let mut t = FailureTracker::new();
-        assert_eq!(t.observe(FailKind::ServerIdConflict, 1_000), 1);
-        assert_eq!(t.observe(FailKind::ServerIdConflict, 2_000), 2);
-        assert_eq!(t.observe(FailKind::Disconnect, 3_000), 1, "换因即重置");
-        assert_eq!(t.observe(FailKind::ServerIdConflict, 4_000), 1);
+        assert_eq!(t.observe(FailKind::ServerIdConflict, 1_000, true), 1);
+        assert_eq!(t.observe(FailKind::ServerIdConflict, 2_000, true), 2);
         assert_eq!(
-            t.observe(FailKind::ServerIdConflict, 4_000 + SERVER_ID_GRACE_MS),
+            t.observe(FailKind::Disconnect, 3_000, true),
+            1,
+            "换因即重置（裸秒断占 1 位）"
+        );
+        assert_eq!(t.observe(FailKind::ServerIdConflict, 4_000, true), 1);
+        assert_eq!(
+            t.observe(FailKind::ServerIdConflict, 4_000 + SERVER_ID_GRACE_MS, true),
             1,
             "宽间隔（≥grace）重置——主库重启级故障不误杀"
         );
-        assert_eq!(t.observe(FailKind::ServerIdConflict, 5_000), 2);
-        assert_eq!(t.observe(FailKind::ServerIdConflict, 6_000), 3);
+        assert_eq!(t.observe(FailKind::ServerIdConflict, 5_000, true), 2);
+        assert_eq!(t.observe(FailKind::ServerIdConflict, 6_000, true), 3);
+        // FIX E 精细化：Disconnect 只计连续零进度秒断——非秒断（开流被拒/
+        // 有进度投递）清零；主库重启的 3 连 refused（间隔全 < grace 窗）
+        // 绝不触闸，真互踢的 3 连裸秒断仍在第 3 连到 3。
+        let mut d = FailureTracker::new();
+        assert_eq!(
+            d.observe(FailKind::Disconnect, 0, false),
+            0,
+            "串流中断带进度（重启时间线 F1）不种连发"
+        );
+        for t_ms in [1_000u64, 3_000, 7_000] {
+            assert_eq!(
+                d.observe(FailKind::Disconnect, t_ms, false),
+                0,
+                "开流被拒非秒断（t={t_ms}）——重启窗口连发恒 0，间隔全 < 窗也不误杀"
+            );
+        }
+        assert_eq!(
+            d.observe(FailKind::Disconnect, 9_000, true),
+            1,
+            "清零后秒断重计数"
+        );
+        assert_eq!(d.observe(FailKind::Disconnect, 10_000, true), 2);
+        assert_eq!(
+            d.observe(FailKind::Disconnect, 11_000, false),
+            0,
+            "连发中断（有进度/被拒）即清零"
+        );
+        assert_eq!(d.observe(FailKind::Disconnect, 12_000, true), 1);
+        assert_eq!(d.observe(FailKind::Disconnect, 13_000, true), 2);
+        assert_eq!(
+            d.observe(FailKind::Disconnect, 14_000, true),
+            3,
+            "3 连裸秒断到闸"
+        );
+        assert_eq!(
+            d.observe(FailKind::Disconnect, 14_000 + SERVER_ID_GRACE_MS, true),
+            1,
+            "宽间隔（≥grace）同因重开一段"
+        );
 
         // 装配面：假 transport 每次都以 server-id 1236 秒杀 → 第 3 次终止。
         let (_dir, _out, cfg) = repl_cfg(&["--start-file", "mysql-bin.000001"]);
@@ -2625,13 +2705,17 @@ mod repl_tests {
         assert!(!flag.load(Ordering::Relaxed), "终止路径不走中断旗标");
     }
 
-    /// 终审 FIX E 红件（互踢 = 裸断连形态）：真实 server-id 冲突常不发
-    /// 1236 特征包而是**干净强制断连**（主库踢双方）——旧闸只认
-    /// FailKind::ServerIdConflict（:835 修复前），此形态退避重试无限循环、
-    /// 永不报错。新契约：同因 Disconnect 3 连**秒**断（tracker 同款 streak
-    /// 语义即「全部间隔 < grace」，宽间隔重置为 1 → 主库重启级故障不误杀）
-    /// 同样终止，文案点名 server-id 冲突为主假设。假流在第 4 次 open 设
-    /// 逃逸门：修复前必然走到（expect 到 Ok → expect_err 红）；修复后
+    /// 终审 FIX E 红件（互踢 = 裸断连形态），精细化后仍是**互踢钉**：
+    /// 真实 server-id 冲突常不发 1236 特征包而是**干净强制断连**（主库踢
+    /// 双方）——旧闸（864c4a9 前）只认 FailKind::ServerIdConflict（:835
+    /// 修复前），此形态退避重试无限循环、永不报错。契约：同因 Disconnect
+    /// 3 连**零进度秒断**（每次 open 成功且 0 事件投递——本测试的三连全部
+    /// 满足，`FakeStream::with_tail(vec![], …)` 即开流即死）终止，文案点名
+    /// server-id 冲突为主假设。FIX E 精细化后主库重启不误杀的保障已移交给
+    /// **进度信号**（带事件投递的断流/开流被拒均清零连发，见
+    /// `master_restart_timeline_not_fast_failed`），而非旧注释宣称的宽间隔
+    /// 重置（退避封顶 37.5s < 60s 窗，对重启不成立）。假流在第 4 次 open
+    /// 设逃逸门：修复前必然走到（expect 到 Ok → expect_err 红）；修复后
     /// 恰 3 开 2 退避，绝不触及第 4。
     #[test]
     fn bare_disconnect_streak_three_terminates_as_serverid_suspect() {
@@ -2685,6 +2769,73 @@ mod repl_tests {
             "恰 3 次开流，不得触及逃逸门"
         );
         assert_eq!(waits.len(), 2, "仅前两次失败后进退避");
+    }
+
+    /// 终审 FIX E **精细化**红→绿（合并阻断缺陷：主库重启恢复被快速终止闸
+    /// 误杀）：重启时间线 = 尝试 1 串流中（FDE+XID 有事件投递）断流
+    /// Disconnect（t=0）→ docker 重启窗口内尝试 2-4 开流即被拒
+    /// （零进度但非「秒断」；失败-失败间隔 = 退避本身 1s/2s/4s，全
+    /// < 60s 窗——旧注释「退避自然拉长后间隔必超窗」对封顶退避数学上
+    /// 不成立）→ 尝试 5 主库回、置中断旗标干净收尾。旧闸口径（同因
+    /// Disconnect 3 连即终止）在尝试 3 即误杀本时间线（对现码必红）；
+    /// 新契约：Disconnect 只计**连续零进度秒断**（open 成功且 0 事件
+    /// 投递），有进度的尝试或开流被拒一律清零 → 正常重连恢复、Ok 收尾。
+    #[test]
+    fn master_restart_timeline_not_fast_failed() {
+        let (_dir, _out, cfg) = repl_cfg(&["--start-file", "mysql-bin.000001"]);
+        let opens: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut opener = {
+            let opens = opens.clone();
+            let flag = flag.clone();
+            move |f: &str, p: u32| {
+                let call = {
+                    let mut v = opens.lock().unwrap();
+                    v.push((f.to_string(), p));
+                    v.len()
+                };
+                match call {
+                    // 尝试 1：投递 ≥1 事件后断流（串中 kill，有进度——不得种下连发）
+                    1 => Ok(Box::new(FakeStream::with_tail(
+                        vec![
+                            synth_frame(EventType::FORMAT_DESC, 1000, 116, &fde_body()),
+                            synth_frame(EventType::XID, 1002, 143, &[7u8; 8]),
+                        ],
+                        ReplError::Disconnect("master restarted: forced shutdown of slave".into()),
+                    )) as Box<dyn FrameStream>),
+                    // 尝试 2-4：重启窗口 = 开流被拒（零进度但从未建立流，非秒断）
+                    2..=4 => Err(ReplError::Io(std::io::Error::other(
+                        "Connection refused (os error 111)",
+                    ))),
+                    // 尝试 5：主库回，起手置中断旗标 → 干净收尾出口
+                    _ => {
+                        flag.store(true, Ordering::Relaxed);
+                        Ok(Box::new(FakeStream::new(vec![])) as Box<dyn FrameStream>)
+                    }
+                }
+            }
+        };
+        let mut waits: Vec<Duration> = vec![];
+        let mut wait = |d: Duration| waits.push(d);
+        // observe 只在失败尝试发生：t = 0 / 1s / 3s / 7s（间隔全 < 60s 窗，
+        // 复刻真实退避节奏——宽间隔重置在这里救不了场，被钉的是零进度口径）。
+        let mut seq = [0u64, 1_000, 3_000, 7_000, 9_000, 12_000].into_iter();
+        let mut clock = move || seq.next().unwrap_or(12_000);
+        let mut env = ReplEnv {
+            open: &mut opener,
+            wait: &mut wait,
+            now_ms: &mut clock,
+            interrupt: flag.clone(),
+        };
+        let sum = run_repl_with(&cfg, store_for(&_dir), &mut env)
+            .expect("主库重启级 refused 风暴必须走正常重连恢复（不得按互踢误杀）");
+        assert_eq!(
+            opens.lock().unwrap().len(),
+            5,
+            "4 次失败 + 第 5 次成功收尾（误杀形态到不了第 5 次开流）"
+        );
+        assert_eq!(waits.len(), 4, "每次失败后各一次退避");
+        assert!(sum.files <= 1, "收尾产物完整（epilogue 照常过）: {sum:?}");
     }
 
     /// 终止面文案逐字（简报钉）：purge / auth / privilege；零重连零退避。
