@@ -2,7 +2,7 @@
 
 **Goal:** 新增第四子命令 `repl`：以 MySQL 从库协议（COM_REGISTER_SLAVE / COM_BINLOG_DUMP）连接主库，实时拉取 binlog 事件流，复用既有解码/SQL 生成/输出层，按事务边界流式产出 to-sql，支持安全位点 checkpoint、断点接续与自动重连。
 
-**Architecture:** 复制通道采用方案 A —— `mysql` crate（已在树 28.0.2）的 `binlog` feature 提供连接/认证/TLS/`BinlogStream` 帧协议管道；事件字节从 `ReplSource`（实现既有 `pipeline::source::EventSource` trait）喂入，之后与 file 模式**共用同一条解码→过滤→SQL 生成→分组→落盘链路，零分叉**。解码层（`src/binlog/*`）保持 P2 终审冻结的零改动不变量。
+**Architecture:** 复制通道采用方案 A —— `mysql` crate（已在树 28.0.2）的 `binlog` feature 提供连接/认证/`BinlogStream` 帧协议管道（勘误：TLS 需额外 feature 且 URI 参不透传，P3 不启用，见 §2 spike 实测-5）；事件字节从 `ReplSource`（实现既有 `pipeline::source::EventSource` trait）喂入，之后与 file 模式**共用同一条解码→过滤→SQL 生成→分组→落盘链路，零分叉**。解码层（`src/binlog/*`）保持 P2 终审冻结的零改动不变量。
 
 **Tech Stack:** Rust std::thread（无 async）、`mysql = { version = "28.0.2", features = ["binlog"] }`、crossbeam-channel、serde_json（checkpoint 文件）、docker（e2e 真容器）。
 
@@ -39,6 +39,25 @@ my2sql-rs repl --uri mysql://repl:pw@host:3306 --server-id <N>
 2. `BinlogStream` 交给我们的字节是**去掉 19 字节 packet 头与 ok 字节的事件体**（含 19 字节公共事件头），与我方 `RawEvent` 解析入口 `binlog::event` 逐级对齐——若 crate 已解析成 `mysql_common` 结构而非裸字节，则取其 `EventData`/原始 bytes 出口，仍以**我方解码器**为唯一解码权威（不许引入第二解码路径）；
 3. ROTATE / HEARTBEAT / 伪 BINLOG 事件（`mysql-bin.000001 pos 4` 重启头）透传形态；
 4. URI query 参数（如 `ssl-mode`）是否原样进 `Opts`（TLS 能力口径登记进 README）。
+
+### Spike 实测（2026-09-21, mysql 28.0.2 @ 8.0.46，`examples/repl_spike.rs` throwaway）
+
+**API 面勘误（以实测为准，本 spec 其余条目已按此口径）**：
+- 入口实为 `Conn::get_binlog_stream(self, BinlogRequest) -> Result<BinlogStream>`（**无 `get_binlog_dump`**）；**消耗 Conn**（repl 连接与元数据连接必须物理两条，§1 既定成立且被强制）。
+- `BinlogStream: Iterator<Item = mysql::Result<Event>>`；事件类型是 `mysql::binlog::events::Event`（mysql_common 0.37.3），**`SlicedEvent` 在本链路不存在**（brief 假设有误）。
+- `BinlogRequest` 由 `mysql` 直接 re-export：`BinlogRequest::new(server_id).with_filename(Vec<u8>).with_pos(u64)`（pos 缺省 4）。
+- 连接构造：`Conn::new(Opts::from_url(url)?)`（`Conn::from_url` 在 28.0.2 不存在）。
+- server 侧自动 `SET @master_binlog_checksum='ALL'` + `COM_REGISTER_SLAVE`（`register_as_slave` 私有、`get_binlog_stream` 内置，无需也不能手动重复）。
+
+**六问结论**：
+1. **完整原始事件字节（19B 头+体+CRC）可及——无需 §9 降级**。crate 将事件拆存 `header`(19B, Copy, 可序列化) + `data()`(CRC 已剥) + `checksum()`(原 4B) + `footer()`；`Event::write(Version4, w)` 整事件重序列化（CRC32 重算、FDE 的 checksum-alg desc 字节还原）。**实测重建字节与容器内 binlog 文件 `dd`+`od` 逐字节相同**（TABLE_MAP/WRITE_ROWS/QUERY 均验证）。已知例外仅两类合情场景：fake rotate 系 dump 线程合成（文件中本不存在）、流首 FDE 的 `BINLOG_IN_USE` 标志与闭档后文件态不同（crate 的 `calc_checksum` 已按官方口径处理该位）。→ `src/repl/` 喂我方解码器就用 `Event::write` 产物，file 模式解码链零分叉。
+2. **CRC32 剥离是 crate 做的**：`data()` 不含尾 4B，原值在 `checksum()`（`Option<[u8;4]>`，`footer().get_checksum_enabled()` 判开关）。但因结论 1 走 `Event::write` 重建**含 CRC 的完整文件同构字节**，repl/source.rs **不调 strip_checksum**，与我方 file 路径（含 CRC 校验）直接兼容。
+3. **FDE 恒在流首，且每连接先跟一个 fake ROTATE**：mid-file 起点实测流首 = `[ROTATE(合成): ts=0, hdr_flags=0x20(ARTIFICIAL), log_pos=0, 无 CRC, payload name=请求文件, position=0→is_fake()) , FDE(头 log_pos 清 0), 首个真事件(恰接请求 pos，实测 59438→+79B→59517 严丝合缝), …]`；从文件头 dump 时 FDE/PREVIOUS_GTIDS 为文件真字节（log_pos=126 正常）。**`--start-pos` 语义勘定**：位点链从 requested pos 起、合成两帧（fake rotate + mid-stream FDE）的 header log_pos **不得**用于 checkpoint 推进/链衔接；推进只用首个真事件之后各帧的 `next_log_pos`。
+4. **heartbeat 请求面：BinlogRequest/BinlogDumpFlags 无入口**（flags 仅 NON_BLOCK/THROUGH_POSITION/THROUGH_GTID，非 GTID 请求只剩 NON_BLOCK）。实测退路**可用且优于预期**：`get_binlog_stream` 前在同一 Conn 上 `SET @master_heartbeat_period = <secs×1e9>`（会话级，服务端读回 2000000000 确认）。到流形态：`EventType::HEARTBEAT_EVENT`(0x1b)、ts=0、**header log_pos=当前 dump 位点**、body=日志文件名（16B）、含 CRC；crate 不透明吞，原样交付（EventData::HeartbeatEvent），客户端自决跳过。注：mysql_common 0.37.3 不支持 HEARTBEAT_LOG_EVENT_V2(0x29)，但本 crate 的 ComRegisterSlave 注册形态下 8.0.46 实发 v1(0x1b)——5.6/5.7 矩阵件复核。→ `--heartbeat-secs` 即该 SET + 「连续 2×间隔无事件判死链」定时器（§6 口径成立）。
+5. **认证双过：caching_sha2 与 mysql_native_password（TCP）query+dump 全通**（replsha2/replnative 双用户实测）。**但 URI query 参不透传（§2-4 假设不成立）**：mysql 28.0.2 的 `Opts::from_url` 参数白名单（user/password/host/port/socket/db_name/prefer_socket/enable_cleartext_plugin/secure_auth/tcp_*/compress/stmt_cache_size/reset_connection）**无任何 ssl 项**，且**未知参数直接硬错 `Unknown URL parameter`**（`ssl-mode=PREFERRED` 实测被拒；ssl 需 crate feature native-tls/rustls + 程序化 SslOpts，默认 features 不含）。→ `--uri` 解析层自持 query 参白名单并自行剥离/映射，P3 不提供 TLS（README 差异清单如实登记，追加 23+ 一条）。
+6. **断链两形态，分类必须都覆盖**：①**优雅终止**（docker restart，服务端发流终止包）→ 迭代器**直接 `None`、无 Err**（与「正常到 stop 条件」不可分——**任何 None 且未达 stop 一律按断链进重连**，不得当自然 EOF 收尾）；②**硬断**（docker kill，TCP 断）→ `Some(Err(Error::IoError("server disconnected")))` 一条，随后流中毒（crate 内部 conn=None，后续恒 `None`）。`mysql::Error::is_connectivity_error()` 可作 §6 重连/终止分诊钩子（IoError/DriverError/CodecError=true，MySqlError=false——1045/1227/1236 落 MySqlError 走终止面）。
+
+**遗留登记**：spike 件 `examples/repl_spike.rs` 标 throwaway（Task 8 决定去留，`src/` 零引用已验）；本小节结论即 Task 1/2 字段形状依据。
 
 ## 3. 数据流与既有链路的接缝
 
