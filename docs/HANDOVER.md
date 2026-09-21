@@ -1396,6 +1396,43 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
    守卫适用面；本文件 T1–T9 节点齐 + 本节 DoD + 挂账更新。
    P1→P2 行为差异入差异清单 = 差异 16–22（承接 P1 清单 1–15）。
 
+## P3 Task 7: compat 矩阵 repl 族（5.6–8.4 × repl → 18 用例全绿）
+
+> P3 T0–T6 节点未逐条入档（live 证据见各任务提交与
+> `docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`），由 T8
+> 文档收口统一补记；本节先落 T7（本任务点名节点）。
+
+- 交付：`tools/compat-matrix.sh` 扩 work=`repl`（`run_case` 第 5 参派发
+  `repl_run`）+ repl 族 4 用例 + `REPL_ONLY=1` 调试入口；容器/灌流全复用
+  T6 `tools/repl-e2e-lib.sh`（零第二套）。矩阵文档 = docs/compat/matrix.md
+  「P3 Task 7 追加族」节：18 行 tsv 逐字 + 无 Go 裁判理由一句（spec §8）+
+  逐版本注记。
+- 用例形态 = Task 6 等价性总闸的矩阵化：钉 start 位点 `f0:p0` → **后台
+  灌流器**（tag=A\<序号\>）→ 灌流中 `FLUSH LOGS`（窗口跨档，T6 lib 契约
+  「跨档矩阵归 T7」兑现）→ `repl --stop-datetime D`（D=服务器钟+12s，
+  repl/file 共用同一停止谓词）优雅收尾 → B 段补灌（必须不可见）→
+  `docker cp` 取段 → file 模式同窗同旗标 to-sql → `diff -r -x resume.json`
+  零放宽比较 + DML 指纹非空闸。
+- 全量真跑：`make compat` 单次整跑 **18/18 PASS**（既有 14 + repl 4；
+  `out/compat-results.tsv` 逐字入 matrix.md）。repl 行：
+  `repl-5.6 equivalent=175335` / `repl-5.7 equivalent=146979` /
+  `repl-8.0 equivalent=143582` / `repl-8.4 equivalent=164487` bytes，
+  四版本 files=2（全部真跨档）、repl/file events 两侧逐例相等。
+- 版本面实测收获：① 心跳 `SET @master_heartbeat_period` 在 **5.6.51/5.7.44
+  均被接受**（降级告警 0 次/版本；spec §2 勘误-4 的 5.6/5.7 未证面补齐），
+  8.4 位点经 `SHOW BINARY LOG STATUS` 改口（lib 既有分支）；② server-id
+  逐例 7200+序号 递增，1236 同-id 踢线敏感性未触发（登记免疫方式）；
+  ③ 灌流器 5.7/8.0 各遇一次 1213 死锁（单条 UPDATE 二级索引扫描 ×
+  autocommit 插入；两侧消费同一份已落盘 binlog，等价性口径零影响，不重试
+  不放宽）；④ 版本差零命中：无任何字节分歧需要解释。
+- 生产代码改动：**无**（纯 harness/docs 增量；`src/binlog/` 零 diff 门禁
+  保持空，repl 侧无修复需求——无 TDD 红绿事件发生在本任务）。
+- 环境事实补记：新 worktree 首跑 difftest 族需 `reference/` 与
+  `tools/bin/` 存在（两者 git-ignored；缺 reference 时 repl 族不受影响、
+  14 旧族在步骤 [2/7] 即红——本轮实证过一次）。
+- 三门：`cargo test` / `cargo clippy --all-targets -- -D warnings` /
+  `cargo fmt --check` 收尾复跑（本轮结果见提交信息与 task-7 报告）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

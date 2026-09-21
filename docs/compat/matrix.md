@@ -1,4 +1,4 @@
-# MySQL 5.6–8.4 兼容矩阵（Task 17 + P2 Task 8）
+# MySQL 5.6–8.4 兼容矩阵（Task 17 + P2 Task 8 + P3 Task 7）
 
 执行：`make compat`（`tools/compat-matrix.sh`，逐用例日志 `out/compat-*.log`，
 结果表 `out/compat-results.tsv`）。裁判 = Go my2sql（reference 未改动）；
@@ -10,6 +10,11 @@
 - 用例数：**14**（`out/compat-results.tsv` 14 行 = P1 to-sql 族 8 +
   P2 flashback 族 4 + P2 stats 冒烟 2；无排除性缺行——stats 5.7/8.4
   为 spec §3.6 有意不跑，见下）
+- **P3 Task 7 增量大跑（2026-09-22）**：用例数 **18**（既有 14 + repl 族 4），
+  一次 `make compat` 全量整跑 **18/18 PASS**（`out/compat-results.tsv` 18 行
+  逐字抄录见文末 P3 节）；既有 14 行本轮全部同场复验、组数与下表逐项一致。
+  被测源码 commit = `aba2753`（P3 T6 修复头；本任务纯 harness 增量：
+  compat-matrix.sh 扩 work=repl，`src/binlog/` 零改动门禁保持空 diff）。
 - 被测源码 commit：P1 轮 = `b8f401c`（fix(task-12) FDE checksum 探针修正；
   其前为 a7c88eb）；P2 轮 = `51f79ae`（P2-T7 头；src/ 与 P1 判定相关代码未变，
   本轮仅扩 harness：run_case 增 WORK_TYPE 维 + 4+2 新用例行）
@@ -85,6 +90,72 @@ tools/compat-matrix.sh` 重跑生成（探针步骤全脚本化，声明自此�
 - **stats 5.7/8.4 有意不跑**：spec §3.6 省时裁决——stats 聚合逻辑与服务器版本
   无关（输入已是解码后事件流），5.6（最低版本）+ 8.0（主力版本）两点覆盖。
 
+## P3 Task 7 追加族（repl×4，2026-09-22 @ `aba2753`）
+
+**裁判口径（无 Go 裁判，spec §8 登记兑现）**：repl 族不做裁判差分——上游
+Go repl 无优雅停止、`log.Fatalf` 即崩、无 checkpoint/重连/心跳，不可作
+oracle；对照物 = **file 模式对同一 binlog 段、同一窗口/过滤/文本旗标组的
+逐字节产物**（`tests/repl.rs::repl_stream_equals_file_mode_byte_for_byte`
+等价性总闸的矩阵化，比较器 = `diff -r -x resume.json`，零放宽、零白名单——
+`resume.json` 是 repl 独有 checkpoint，非 SQL 产物，不构成内容豁免）。
+
+**用例形态**（每版本一例，容器用后即弃；复用 T6 `tools/repl-e2e-lib.sh`
+生命周期 + 灌流器，勿造第二套）：seed schema（5.6 JSON→LONGTEXT 自适应同
+tosql 族）→ 钉 start 位点 `f0:p0` → 后台灌流器（`p3e2e_feed_mixed` 每调用
+一轮、tag=A\<序号\> 值=f(tag,round) 纯函数）→ 灌流中 `FLUSH LOGS`（窗口
+**跨档**：兑现 T6 lib 契约「跨档矩阵归 T7」，repl 须经 ROTATE 跟档）→
+`repl --stop-datetime D`（D = 服务器钟 +12s，容器 TZ=UTC + `--time-zone
++00:00` 双侧同文同谓词）实时抓取优雅收尾 → kill 灌流器 → B 段补灌一轮
+（全 ts>D，两侧必须不可见）→ `docker cp` 取段 f0..f1 → file 模式同窗
+to-sql → `diff -r` 干净 + 指纹闸（A1doc1/A1trx5 在场、Bdoc1/JUNKRB 不在场、
+bytes>1000 防空）→ tsv 行 `PASS repl-<ver> equivalent=<n> bytes`。
+
+### 18 用例全量 `out/compat-results.tsv`（2026-09-22 run，逐字）
+
+```
+5.6	5.6-default	PASS groups A=19 B=19 aligned=19 green=19 red=0
+5.6	5.6-none	PASS groups A=19 B=19 aligned=19 green=19 red=0
+5.6	5.6-v1rows	PASS groups A=19 B=19 aligned=19 green=19 red=0
+5.7	5.7-default	PASS groups A=21 B=21 aligned=21 green=21 red=0
+5.7	5.7-none	PASS groups A=21 B=21 aligned=21 green=21 red=0
+8.0	8.0-default	PASS groups A=21 B=21 aligned=21 green=21 red=0
+8.4	8.4-default	PASS groups A=21 B=21 aligned=21 green=21 red=0
+8.4	8.4-caching_sha2-online	PASS (default auth, output == native-auth run)
+5.6	flashback-5.6	PASS groups A=19 B=19 aligned=19 green=19 red=0
+5.7	flashback-5.7	PASS groups A=21 B=21 aligned=21 green=21 red=0
+8.0	flashback-8.0	PASS groups A=21 B=21 aligned=21 green=21 red=0
+8.4	flashback-8.4	PASS groups A=21 B=21 aligned=21 green=21 red=0
+5.6	stats-5.6	PASS stats smoke: report total=32 to-sql DML lines=32
+8.0	stats-8.0	PASS stats smoke: report total=36 to-sql DML lines=36
+5.6	repl-5.6	PASS repl-5.6 equivalent=175335 bytes
+5.7	repl-5.7	PASS repl-5.7 equivalent=146979 bytes
+8.0	repl-8.0	PASS repl-8.0 equivalent=143582 bytes
+8.4	repl-8.4	PASS repl-8.4 equivalent=164487 bytes
+```
+
+### repl 族逐版本注记（`out/compat-repl-<ver>.log` EQUIV 行实证）
+
+| 用例 | 窗口 | 等价字节 | 实测注记 |
+|---|---|---|---|
+| repl-5.6 | mysql-bin.000004:861..stop@'2026-09-21 19:22:45'，跨档 000004..000005 | 175335 B（files=2，repl/file events 均 510） | **心跳 `SET @master_heartbeat_period` 在 5.6.51 被接受**（降级告警 0 次）——spec §2 勘误-4 只实测过 8.0，5.6/5.7 接受面自此补齐 |
+| repl-5.7 | mysql-bin.000003:1151..stop@'19:23:08'，跨档 000003..000004 | 146979 B（files=2，events 均 429） | 心跳 SET 接受（降级 0）；灌流器一轮遇 1213 死锁一轮中止（见下条口径注） |
+| repl-8.0 | mysql-bin.000003:1262..stop@'19:23:39'，跨档 000003..000004 | 143582 B（files=2，events 均 419） | 心跳 SET 接受（降级 0，与 T0 spike 口径一致）；1213 死锁同 5.7 出现一次 |
+| repl-8.4 | mysql-bin.000003:1657..stop@'19:24:05'，跨档 000003..000004 | 164487 B（files=2，events 均 480） | 心跳 SET 接受（降级 0）；位点走 `SHOW BINARY LOG STATUS`（lib 自动改口），认证 = native 修正形态 |
+
+- **1213 死锁注记**（5.7/8.0 各一次）：出现在**后台灌流器**的 docker exec
+  批次内（`UPDATE ... WHERE name=…` 二级索引扫描 × 并发 autocommit 插入），
+  mysql 客户端默认批内首错即止 → 该轮少灌几条。对等价性**零影响**：repl 与
+  file 两侧消费同一份已落盘 binlog，窗口指纹/字节比较照常成立；不重试、
+  不视为缺陷（矩阵裁判物是产物字节，不是灌流条数）。
+- **server-id 敏感性登记**：每用例 `7200+序号` 递增（本轮 7200/7201/7202/7203），
+  用例串跑、repl 进程退出即断连接、容器用后即弃——本轮**未触发** 1236
+  （含「A slave with the same server_uuid/server_id」形态）；该 1236 文案
+  两面性（purged vs 同 id 踢线）已在 spec §2 勘误钉档，同宿主并行跑多例时
+  保持本脚本的逐例递增 id 即可免疫。
+- **版本差零命中**：四个版本的 repl 产物与 file 模式同段**逐字节等**
+  （文件名集合、extra-info 头、SQL 体全同），未出现需要解释的字节分歧，
+  比较器未加任何豁免。
+
 ## 每版本排除/裁剪清单（矩阵级，非白名单放宽）
 
 - **5.6（tools/gen-data-5.6.sql，run-difftest 按 VER 自动选择）**：
@@ -114,11 +185,12 @@ tools/compat-matrix.sh` 重跑生成（探针步骤全脚本化，声明自此�
 ## 复现
 
 ```bash
-make compat                      # 全矩阵 14 用例（本轮实测约 4 分钟，需 docker + /opt/go/bin）
+make compat                      # 全矩阵 18 用例（P3-T7 实测约 10 分钟，需 docker + /opt/go/bin）
 VERSIONS="5.7" make compat       # 单版本调试（该版本跑 to-sql 双态 + flashback；stats 两例固定 5.6/8.0 仍跑）
 KEEP=1 VER=5.7 CKSUM=none bash tools/run-difftest.sh   # 失败保容器
 VER=5.6 V1ROWS=1 bash tools/run-difftest.sh            # 单跑 v1rows（含事件普查门）
 VER=8.4 WORK_TYPE=rollback bash tools/run-difftest.sh  # 单跑 flashback 差分
 VER=8.0 WORK_TYPE=stats bash tools/run-difftest.sh     # 单跑 stats 冒烟
 PROBE_ONLY=1 bash tools/compat-matrix.sh               # 单跑 8.4 探针（不碰全量 tsv）
+REPL_ONLY=1 VERSIONS="8.0" bash tools/compat-matrix.sh # 单跑 repl 族（结果落独立 tsv，最终记录仍以全量跑为准）
 ```
