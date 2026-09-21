@@ -58,11 +58,26 @@ fn on_event(seq: u64, cur_pos: u64, event: &mysql::binlog::events::Event, w: &mu
     let crc = event.checksum();
     let data_len = event.data().len();
 
-    // fake rotate: ROTATE with zero target position and header log_pos == 4
-    let fake_rotate = matches!(
-        event.read_data(),
-        Ok(Some(mysql::binlog::events::EventData::RotateEvent(re))) if re.is_fake() && h.log_pos() == 4
-    );
+    // Stream-head fake rotate (dump-thread synthetic "connection event"): ROTATE
+    // with the ARTIFICIAL header flag (0x20), ts=0 and *header* log_pos=0
+    // (measured). The *payload* `position` carries the requested start pos
+    // (measured: 4 and 292528), so `RotateEvent::is_fake()` (payload==0) is NOT
+    // a valid discriminator. Note: the EOF rotation frame (mid-stream, seq>0) is
+    // ALSO synthetic (ts=0/artificial/header log_pos=0, payload=4, CRC present,
+    // file truncated to 180B on close) — measured on-disk rotate bytes: none —
+    // but it announces a real file switch, so it stays labeled ROTATE.
+    let rotate_payload_pos = match event.read_data() {
+        Ok(Some(mysql::binlog::events::EventData::RotateEvent(re))) => Some(re.position()),
+        _ => None,
+    };
+    let fake_rotate = rotate_payload_pos.is_some()
+        && seq == 0
+        && (h.flags_raw() & 0x0020) != 0
+        && h.timestamp() == 0
+        && h.log_pos() == 0;
+    let rot_info = rotate_payload_pos
+        .map(|p| format!(" rotate_payload_pos={p}"))
+        .unwrap_or_default();
     let kind = if fake_rotate {
         "FAKE_ROTATE"
     } else if tname.contains("HEARTBEAT") {
@@ -78,7 +93,7 @@ fn on_event(seq: u64, cur_pos: u64, event: &mysql::binlog::events::Event, w: &mu
     let _ = writeln!(
         w,
         "seq={} {} type={} hdr_flags=0x{:04x} ts={} srv={} start_pos={} size={} next_log_pos={} \
-         data_len={} crc={} rebuilt_len={} rebuilt_eq_size={}",
+         data_len={} crc={} rebuilt_len={} rebuilt_eq_size={}{rot_info}",
         seq,
         kind,
         tname,
@@ -155,7 +170,15 @@ fn pump_stream(stream: BinlogStream, secs: u64, cap: usize) {
                 println!("STREAM_ERR {e:?}");
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(more) => println!("after_err_another_event={more:?}"),
-                    Err(_) => println!("after_err_stream_gives_up_or_blocks=as_observed"),
+                    // Deterministic, discriminating outcomes (measured: hard
+                    // disconnect reaches Disconnected — iterator None, sender
+                    // dropped by the finished spawn thread):
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        println!("after_err_probe=timeout_still_open_no_frame_within_100ms");
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        println!("after_err_probe=disconnected_stream_poisoned_next_is_none");
+                    }
                 }
                 break;
             }
