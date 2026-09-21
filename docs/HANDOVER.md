@@ -1183,6 +1183,60 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   按表 CHECKSUM 循环；④ T7 difftest WORK_TYPE=rollback 可直接复用本脚本
   的容器 idioms（无 bind mount + docker cp 出 binlog）。
 
+### P2 Task 7: 差分 harness WORK_TYPE 维度 + 比较器 rollback 规则
+
+- 做了什么：① `compare.py` rollback 模式（第三可选参 `rollback`）——
+  `load(d, mode)` 逐文件自适应双模绑定：A 侧（Go tmp 纯行倒置 → 注释漂尾、
+  KeepTrx 无 flag 注册恒 false 无 scaffold）语句缓冲 + 注释到达时绑定 key；
+  B 侧（我方 flashback 记录原子注释先行 + keep-trx scaffold + `-- WARNING`
+  头行）剥离裸 `commit;`/`begin;`/WARNING/SET NAMES 后沿用现绑定；
+  `_rb_struct` 结构断言钉含 scaffold 文件（begin数==commit数-1==事务段数、
+  每 begin 前一非空行为 commit;、末行 commit;——首部悬空 commit 为平价容忍，
+  上游 rollback_process.go:38 lastTrxIdx=0）；违例经 main 计 STRUCT-RED，
+  白名单不吞结构；值面零新逻辑（复用 veq/seteq/canon 全链）。
+  2sql 路径逐字节不变（mode 缺省走原循环）。② `selftest.py` 组 9 正反例：
+  scaffold 剥离不误吞真 DELETE / 结构红例三形态（缺尾 commit、begin 前非
+  commit、计数不配）/ A 漂尾绑定 vs B 原子同 key 判绿 / 镜像对不跨组误配 /
+  A 侧末行孤儿语句判红。③ `run-difftest.sh` `WORK_TYPE=2sql|rollback|stats`
+  （产物目录后缀 无/`-rb`/`-stats`）：步骤 4 裁判旗标直传、rollback 产物
+  存在性闸改 `rollback.*.sql`；步骤 5 子命令映射 to-sql/flashback；stats =
+  冒烟（裁判 stats 留档 go-stats/ 不参与退出码 + 我方 to-sql 基线语料 +
+  两报表存在 + Σinserts+updates+deletes（跳 `#` 尾注，列 5/6/7）== 同流
+  to-sql DML 行数内联 python 断言）；步骤 6 传第三参 rollback（仅 rollback）；
+  步骤 7 离线回放对 rollback 同跑（flashback --schema-file + diff -r）。
+  ④ 白名单登记 4 条：ALW-RB-COMMENT-DRIFT / ALW-RB-SCAFFOLD /
+  ALW-RB-WARN-HEADER / ALW-RB-TMP-NAME（含头文件 SET NAMES 沿用说明）。
+- **实跑暴露并修复的 T3/T5 挂空缺口**：`flashback --schema-dump` 被 parse
+  受理但 `run_flashback` 无消费点（步骤 7 离线回放因此缺 schema.json，
+  ENOENT 实红）——修复取「补消费」（与 run_to_sql 同款收口，5 行），
+  tests/flashback.rs 用例 7 `flashback_honors_schema_dump` 先行判红再转绿；
+  与 c522c33 对 to-sql inert 旗标「拒旗标」裁定同类的取舍论证写在测试
+  doc 注释（回滚与正向同为 SQL 文本产物，参数面同构 → 补消费非拒受理）。
+  stats 的 `--schema-dump`（CommonArgs 天然带入、无 SQL 产物）仍为惰性
+  旗标——未动，登记待 T8/T9 裁定。
+- **实跑计数（本任务内，全 GREEN，逐条原样）**：
+  `WORK_TYPE=rollback make difftest` → `comparator selftest: 9/9 groups ...
+  OK` + `groups A=21 B=21 aligned=21 green=21 red=0` + `OK difftest(rollback)
+  8.0: diff-green + replay-byte-identical`，exit 0；
+  `WORK_TYPE=stats make difftest` → `stats smoke: report total=36 to-sql
+  DML lines=36` + `OK difftest(stats-smoke) 8.0: reports present + DML
+  totals reconcile`，exit 0；
+  `make difftest`（2sql 回归）→ `groups A=21 B=21 aligned=21 green=21
+  red=0` + `OK difftest 8.0: diff-green + replay-byte-identical`，exit 0。
+  结构闸真实性突变自检（非 CI 路径）：对真实 `flashback.3.sql` 删尾行
+  commit; → `STRUCT-RED ... scaffold count mismatch: begin=15 commit=15
+  segments=15` + `STRUCT-RED ... missing tail commit`，red=2 exit 1。
+  真实件 scaffold 形态证实：rollback.3.sql 首行=语句+漂尾注释、零 begin;
+  行；flashback.3.sql 首行 SET NAMES、commit;=16/begin;=15（=事务段 15+1
+  口径含首悬空尾 commit）。
+- 全量闸：`cargo test` 294 绿（+1 = flashback_honors_schema_dump）、
+  clippy --all-targets 净、fmt 净。
+- 遗留/对后续影响：① stats 冒烟维度的列序断言（5/6/7）绑定现报表
+  字面形，若 T8 改窗体列须同步；② `_rb_struct` 仅在含 scaffold 文件上
+  触发——`--no-keep-trx` 产物（无 scaffold）结构面恒平凡通过，如 T8 要
+  钉该形态需另立断言；③ worktree 内 `reference/` 为实体拷贝（软链会让
+  go build `-o ../../tools/bin/...` 相对路径落到主库——实踩）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

@@ -11,12 +11,26 @@
 #   步骤 3.5（仅 V1ROWS=1）= binlog 事件类型普查（tools/event-census.py，纯 stdlib
 #   走读事件头，无需镜像内 mysqlbinlog）；产物 $OUT/EVENT_CENSUS.txt，
 #   硬断言行事件全 V1（23/24/25 齐、30/31/32 零），违例即用例 FAIL（T17 修复轮 1）。
+# P2-T7 扩展（均为环境开关，WORK_TYPE 缺省=2sql 时行为与 P1 逐字节一致）：
+#   WORK_TYPE=2sql|rollback|stats   工作类型维度（产物目录后缀：2sql 无 / rollback
+#     加 -rb / stats 加 -stats）：rollback = 裁判 -work-type rollback vs 我方
+#     flashback，比较器第三参 rollback（scaffold 剥离 + 注释漂尾绑定 + B 侧结构断言）；
+#     stats = 冒烟（不裁判比较）：我方 to-sql 产基线语料 + stats 两报表存在 +
+#     Σinserts+updates+deletes（跳 '#' 尾注行）== 同语料 to-sql DML 语句数；
+#     裁判 stats 输出仅留档 $OUT/go-stats/，不参与退出码。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 VER="${VER:-8.0}"
 NAME="my2sql-dt-${VER}"
-OUT="$ROOT/out/difftest-$VER${CKSUM:+-$CKSUM}${V1ROWS:+-v1rows}"
+WORK_TYPE="${WORK_TYPE:-2sql}"
+case "$WORK_TYPE" in
+  2sql)     SFX="" ;;
+  rollback) SFX="-rb" ;;
+  stats)    SFX="-stats" ;;
+  *) echo "WORK_TYPE must be 2sql|rollback|stats, got '$WORK_TYPE'" >&2; exit 2 ;;
+esac
+OUT="$ROOT/out/difftest-$VER${CKSUM:+-$CKSUM}${V1ROWS:+-v1rows}$SFX"
 rm -rf "$OUT" && mkdir -p "$OUT/go" "$OUT/rs" tools/bin
 trap 'rc=$?; if [ $rc -ne 0 ] && [ -n "${KEEP:-}" ]; then echo "FAILED(rc=$rc) — container $NAME kept for debug"; else docker rm -f "$NAME" >/dev/null 2>&1 || true; fi' EXIT
 
@@ -58,32 +72,87 @@ if [ -n "${V1ROWS:-}" ]; then
   python3 tools/event-census.py "data/$VER/$BIN" --assert-v1-only | tee "$OUT/EVENT_CENSUS.txt"
 fi
 
-echo "== [4/7] go oracle (-mode file -work-type 2sql, TZ=UTC)"
-(export TZ=UTC; cd "$OUT/go" && "$ROOT/tools/bin/my2sql-go" \
-   -mode file -work-type 2sql -mysql-type mysql \
-   -host 127.0.0.1 -port "$PORT" -user root -password "" \
-   -local-binlog-file "$ROOT/data/$VER/$BIN" \
-   -add-extraInfo -threads 4 -output-dir . ) > "$OUT/go.log" 2>&1 \
-   || { tail -20 "$OUT/go.log"; echo "go oracle FAILED"; exit 1; }
-# 裁判读不到 binlog 时仅 log error 且退出码 0（实踩）——产物存在性硬校验
-ls "$OUT"/go/forward*.sql >/dev/null 2>&1 || { echo "go oracle produced no forward sql"; exit 1; }
+if [ "$WORK_TYPE" = stats ]; then
+  echo "== [4/7] go oracle (-work-type stats) → 留档 $OUT/go-stats/（人工对照，不参与退出码）"
+  mkdir -p "$OUT/go-stats"
+  (export TZ=UTC; cd "$OUT/go-stats" && "$ROOT/tools/bin/my2sql-go" \
+     -mode file -work-type stats -mysql-type mysql \
+     -host 127.0.0.1 -port "$PORT" -user root -password "" \
+     -local-binlog-file "$ROOT/data/$VER/$BIN" \
+     -threads 4 -output-dir . ) > "$OUT/go-stats/go-stats.log" 2>&1 \
+     || echo "   go stats FAILED（输出已留档 $OUT/go-stats/，冒烟维度不据此判红）"
+else
+  echo "== [4/7] go oracle (-mode file -work-type $WORK_TYPE, TZ=UTC)"
+  (export TZ=UTC; cd "$OUT/go" && "$ROOT/tools/bin/my2sql-go" \
+     -mode file -work-type "$WORK_TYPE" -mysql-type mysql \
+     -host 127.0.0.1 -port "$PORT" -user root -password "" \
+     -local-binlog-file "$ROOT/data/$VER/$BIN" \
+     -add-extraInfo -threads 4 -output-dir . ) > "$OUT/go.log" 2>&1 \
+     || { tail -20 "$OUT/go.log"; echo "go oracle FAILED"; exit 1; }
+  # 裁判读不到 binlog 时仅 log error 且退出码 0（实踩）——产物存在性硬校验
+  if [ "$WORK_TYPE" = rollback ]; then
+    ls "$OUT"/go/rollback.*.sql >/dev/null 2>&1 || { echo "go oracle produced no rollback sql"; exit 1; }
+  else
+    ls "$OUT"/go/forward*.sql >/dev/null 2>&1 || { echo "go oracle produced no forward sql"; exit 1; }
+  fi
+fi
 
-echo "== [5/7] rust to-sql (online schema + dump)"
-./target/debug/my2sql-rs to-sql \
+# 我方子命令映射：2sql→to-sql / rollback→flashback（flashback 无 --to-stdout，其余参数同）
+if [ "$WORK_TYPE" = rollback ]; then RSUB=flashback; else RSUB=to-sql; fi
+echo "== [5/7] rust $RSUB (online schema + dump)"
+./target/debug/my2sql-rs $RSUB \
   --binlog-dir "data/$VER" --start-file "$BIN" \
   --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
   --add-extra-info --threads 4 --output-dir "$OUT/rs" \
   --schema-dump "$OUT/schema.json" > "$OUT/rs.log" 2>&1 \
   || { tail -20 "$OUT/rs.log"; echo "rust FAILED"; exit 1; }
 
-echo "== [6/7] semantic compare (A=go oracle, B=rust)"
-python3 tools/comparator/compare.py "$OUT/go" "$OUT/rs"
+if [ "$WORK_TYPE" = stats ]; then
+  echo "== [5.5/7] rust stats + 冒烟断言（两报表存在 + DML 总和配平）"
+  ./target/debug/my2sql-rs stats \
+    --binlog-dir "data/$VER" --start-file "$BIN" \
+    --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
+    --threads 4 --output-dir "$OUT/rs-stats" > "$OUT/rs-stats.log" 2>&1 \
+    || { tail -20 "$OUT/rs-stats.log"; echo "rust stats FAILED"; exit 1; }
+  python3 - "$OUT" <<'PYEOF'
+import sys, os, glob
+out = sys.argv[1]
+rep = [os.path.join(out, "rs-stats", n) for n in ("binlog_status.txt", "biglong_trx.txt")]
+missing = [p for p in rep if not os.path.isfile(p)]
+assert not missing, "stats report missing: " + ", ".join(missing)
+# 总和从 binlog_status.txt 数据行取（跳 '#' 尾注与表头；datetime 为下划线
+# 形单 token → 列序 binlog start stop startpos stoppos inserts updates deletes db tb）
+tot = 0
+for line in open(rep[0]):
+    s = line.split()
+    if line.startswith("#") or len(s) < 10 or not (s[5].isdigit() and s[6].isdigit() and s[7].isdigit()):
+        continue
+    tot += int(s[5]) + int(s[6]) + int(s[7])
+dml = sum(1 for fn in sorted(glob.glob(os.path.join(out, "rs", "*.sql")))
+          for l in open(fn) if l.strip().upper().startswith(("INSERT ", "UPDATE ", "DELETE ")))
+print(f"stats smoke: report total={tot} to-sql DML lines={dml}")
+assert tot == dml, f"stats total {tot} != to-sql DML {dml}"
+PYEOF
+else
+  echo "== [6/7] semantic compare (A=go oracle, B=rust)"
+  if [ "$WORK_TYPE" = rollback ]; then
+    python3 tools/comparator/compare.py "$OUT/go" "$OUT/rs" rollback
+  else
+    python3 tools/comparator/compare.py "$OUT/go" "$OUT/rs"
+  fi
+fi
 
+if [ "$WORK_TYPE" = stats ]; then
+  echo "OK difftest(stats-smoke) $VER${CKSUM:+ (checksum=$CKSUM)}: reports present + DML totals reconcile"
+  exit 0
+fi
 echo "== [7/7] offline schema replay (--schema-file, 与在线输出逐字节对差)"
-./target/debug/my2sql-rs to-sql \
+./target/debug/my2sql-rs $RSUB \
   --binlog-dir "data/$VER" --start-file "$BIN" \
   --schema-file "$OUT/schema.json" --time-zone +00:00 \
   --add-extra-info --threads 4 --output-dir "$OUT/rs-offline" > "$OUT/rs-offline.log" 2>&1 \
   || { tail -20 "$OUT/rs-offline.log"; echo "rust offline replay FAILED"; exit 1; }
 diff -r "$OUT/rs" "$OUT/rs-offline" || { echo "offline replay != online output"; exit 1; }
-echo "OK difftest $VER${CKSUM:+ (checksum=$CKSUM)}: diff-green + replay-byte-identical"
+# T17 同型隐患规避：裸 `[ ] &&` 失败在 set -e 下误杀 → 显式 if
+LABEL=""; if [ "$WORK_TYPE" = rollback ]; then LABEL="(rollback)"; fi
+echo "OK difftest$LABEL $VER${CKSUM:+ (checksum=$CKSUM)}: diff-green + replay-byte-identical"

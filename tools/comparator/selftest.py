@@ -82,4 +82,107 @@ a = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":2}' WHERE `id`=1;")
 b = P("UPDATE `d`.`t` SET `v`=2,`j`='{\"a\":1}' WHERE `id`=1;")
 assert not veq(a, b), "JSON SET intersection must stay strict"
 
-print("comparator selftest: 8/8 groups (4 brief cases + float-width guard + rule extensions) OK")
+# 9) P2-T7 rollback 模式：A 侧注释漂尾绑定 / B 侧记录原子 + keep-trx scaffold
+#    剥离 / B 侧结构断言（正反例）/ 镜像对不跨组误配。
+import io, contextlib
+from compare import load as _load
+
+def _hdr(s, e):
+    # datetime 为下划线形（constvar DATETIME_FORMAT_NOSPACE，与 HDR \S+ 一致）
+    return (f"# datetime=2026-09-21_10:00:00 database=dt table=t1 "
+            f"binlog=mysql-bin.000002 startpos={s} stoppos={e}")
+INS = "INSERT INTO `dt`.`t1` (`id`) VALUES (2);"
+DEL = "DELETE FROM `dt`.`t1` WHERE `id`=1;"
+UPD = "UPDATE `dt`.`t1` SET `v`=2 WHERE `id`=3;"
+# 镜像对（逆向 vs 正向文本）：同 WHERE 列集、SET/WHERE 值互换——须按 key 严格归组
+UPD_REV = "UPDATE `dt`.`t1` SET `v`=1 WHERE `id`=3 AND `v`=2;"
+UPD_FWD = "UPDATE `dt`.`t1` SET `v`=2 WHERE `id`=3 AND `v`=1;"
+K = lambda s, e: ("mysql-bin.000002", s, e)
+
+def _mkdir(files):
+    d = tempfile.mkdtemp()
+    for name, lines in files.items():
+        with open(os.path.join(d, name), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    return d
+
+def _main_rc(a, b, mode=None):
+    argv = ["compare.py", a, b] + ([mode] if mode else [])
+    saved, buf = sys.argv, io.StringIO()
+    sys.argv = argv
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = main()
+    finally:
+        sys.argv = saved
+    return rc, buf.getvalue()
+
+# A 侧（Go rollback.2.sql）：tmp 行序整体倒置 → 语句在前、其注释漂尾；
+# KeepTrx=false 默认 → 无任何 begin;/commit; scaffold。
+A_OK = _mkdir({"rollback.2.sql": [UPD_REV, _hdr(320, 460), INS, _hdr(200, 320), DEL, _hdr(100, 200)]})
+# B 侧（我方 flashback.2.sql）：SET NAMES 头 + -- WARNING 头行 + keep-trx
+# scaffold（首部悬空 commit 为平价——上游 lastTrxIdx=0 首块必注入）+ 记录原子（注释先行）。
+B_OK = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;", "-- WARNING: skipped 3 events, positions in stderr",
+    "commit;", "begin;", _hdr(320, 460), UPD_REV,
+    "commit;", "begin;", _hdr(200, 320), INS,
+    "commit;", "begin;", _hdr(100, 200), DEL, "commit;"]})
+ga, va = _load(A_OK, "rollback")
+gb, vb = _load(B_OK, "rollback")
+assert va == [] and vb == [], f"legal trees must have no structural violation: {va}{vb}"
+assert set(ga) == {K(100, 200), K(200, 320), K(320, 460)} == set(gb), "rb align keys failed"
+# scaffold 剥离不误吞真 DELETE：DEL 记录组恰 1 条 del 语句（裸 commit;/begin;
+# 与任何真语句文本不可同值，剥离安全）
+assert len(gb[K(100, 200)]) == 1 and gb[K(100, 200)][0][0] == "del", "scaffold skip ate DELETE"
+assert ga == gb, "A-side drift bind != B-side atomic bind"
+rc, _ = _main_rc(A_OK, B_OK, "rollback")
+assert rc == 0, "drift-vs-atomic rollback compare must go green"
+
+# 结构断言红例（白名单不吞结构：违例经 main 计入 red → 退出码 1）
+B_NOTAIL = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;",
+    "commit;", "begin;", _hdr(320, 460), UPD_REV,
+    "commit;", "begin;", _hdr(200, 320), INS,
+    "commit;", "begin;", _hdr(100, 200), DEL]})  # 缺尾 commit;
+_, v = _load(B_NOTAIL, "rollback")
+assert v and any("tail" in w for _, w in v), f"missing tail commit must be red: {v}"
+rc, out = _main_rc(A_OK, B_NOTAIL, "rollback")
+assert rc == 1 and "STRUCT-RED" in out, "structural red must survive to exit code"
+B_BADBEGIN = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;",
+    "commit;", "begin;", _hdr(320, 460), UPD_REV,
+    "begin;", _hdr(200, 320), INS,                              # begin 前非 commit
+    "commit;", "begin;", _hdr(100, 200), DEL, "commit;"]})
+_, v = _load(B_BADBEGIN, "rollback")
+assert v and any("preceding" in w for _, w in v), f"begin-without-commit must be red: {v}"
+B_BADCOUNT = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;",
+    "commit;", "begin;", _hdr(320, 460), UPD_REV,
+    "commit;", "begin;",                                        # 空段：begin(4) != commit-1(3)
+    "commit;", "begin;", _hdr(200, 320), INS,
+    "commit;", "begin;", _hdr(100, 200), DEL, "commit;"]})
+_, v = _load(B_BADCOUNT, "rollback")
+assert v and any("count" in w for _, w in v), f"count mismatch must be red: {v}"
+
+# 镜像对不跨组误配：A 两 key 各持逆向形，B 交换两语句体 → 组内判红（无跨 key 兜救）
+A_MIRROR = _mkdir({"rollback.2.sql": [UPD_FWD, _hdr(320, 460), UPD_REV, _hdr(100, 200)]})
+B_MIRROR = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;", "commit;", "begin;",
+    _hdr(320, 460), UPD_REV,                                    # 与 A 的 320 组文本不同形
+    "commit;", "begin;", _hdr(100, 200), UPD_FWD, "commit;"]})
+rc, _ = _main_rc(A_MIRROR, B_MIRROR, "rollback")
+assert rc == 1, "mirror pair must not be cross-group rescued"
+# 同 key 自洽（格式差异由既有规则吸收）→ 绿
+A_MIRROR2 = _mkdir({"rollback.2.sql": [UPD_FWD, _hdr(320, 460)]})
+B_MIRROR2 = _mkdir({"flashback.2.sql": [
+    "SET NAMES utf8mb4;", "commit;", "begin;",
+    _hdr(320, 460), "UPDATE dt.t1 SET v = 2 WHERE (id=3 AND v=1);", "commit;"]})
+rc, _ = _main_rc(A_MIRROR2, B_MIRROR2, "rollback")
+assert rc == 0, "same-key mirror text must stay green"
+
+# A 侧末行孤儿语句（无漂尾注释可绑）→ 解析违例，不得静默丢
+A_ORPHAN = _mkdir({"rollback.2.sql": [UPD_REV, _hdr(320, 460), INS]})
+_, v = _load(A_ORPHAN, "rollback")
+assert v and any("orphan" in w for _, w in v), f"orphan stmt must be red: {v}"
+
+print("comparator selftest: 9/9 groups (4 brief cases + float-width guard + rule extensions + rollback mode) OK")

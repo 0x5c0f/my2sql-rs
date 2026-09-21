@@ -2,7 +2,10 @@
 """Task 15 语义差分器：Go 裁判 vs my2sql-rs to-sql 输出。按 extra-info
 (binlog,startpos,stoppos) 对齐语句组；VALUES/WHERE/SET 字面量解析为值序列判等。
 规则权威 = tools/difftest-allowlist.txt；自测 = selftest.py。
-环境无 sqlparse（pip 不可用），按预案手写解析（stdlib only）。"""
+环境无 sqlparse（pip 不可用），按预案手写解析（stdlib only）。
+P2-T7：第三可选参 `rollback` = 回滚维度（裁判 rollback.{N}.sql vs 我方
+flashback.{N}.sql）——scaffold/WARNING/SET NAMES 剥离 + A 侧注释漂尾双模
+绑定 + B 侧 keep-trx 结构断言（STRUCT-RED 不入白名单），2sql 路径不变。"""
 import sys, re, json, glob, os, struct
 from decimal import Decimal, InvalidOperation  # noqa
 HDR = re.compile(r"^# datetime=\S+ database=\S+ table=\S+ binlog=(\S+) startpos=(\d+) stoppos=(\d+)$")
@@ -132,18 +135,79 @@ def parse_stmt(s):
         wi = find_kw(s, " WHERE ")
         return ("del", idn(s[12:wi]), tuple(sorted((cond(x) for x in split_kw(s[wi + 7:], " AND ", True)), key=repr)))
     raise ValueError("unknown stmt: " + s[:80])
-def load(d):
-    g = {}
+def load(d, mode=None):
+    """mode=None/"2sql"：注释先行绑定（现状逐字节不变）。mode="rollback"：
+    剥离 scaffold/WARNING/SET NAMES/空行；逐文件自适应绑定——A 侧（Go 行倒置）
+    语句缓冲 + 注释到达时绑定 key，B 侧（我方记录原子）注释先行；含 scaffold
+    的文件跑 keep-trx 结构断言（白名单不吞结构，违例随 main 计红）。"""
+    g, viol = {}, []
     for fn in sorted(glob.glob(os.path.join(d, "*.sql"))):
-        for line in (l.decode("utf-8", "surrogateescape").rstrip("\r\n") for l in open(fn, "rb")):
-            if line.startswith("# datetime="):
-                if not (m := HDR.match(line)): raise ValueError("bad extra-info: " + line[:80])
-                g.setdefault((m.group(1), int(m.group(2)), int(m.group(3))), [])
-            elif line.strip() and not line.upper().startswith("SET NAMES"):
-                g[list(g)[-1]].append(parse_stmt(line))
-    return g
+        lines = [l.decode("utf-8", "surrogateescape").rstrip("\r\n") for l in open(fn, "rb")]
+        if mode != "rollback":
+            for line in lines:
+                if line.startswith("# datetime="):
+                    if not (m := HDR.match(line)): raise ValueError("bad extra-info: " + line[:80])
+                    g.setdefault((m.group(1), int(m.group(2)), int(m.group(3))), [])
+                elif line.strip() and not line.upper().startswith("SET NAMES"):
+                    g[list(g)[-1]].append(parse_stmt(line))
+            continue
+        viol += _rb_struct(os.path.basename(fn), lines)
+        first = next((l.strip() for l in lines if not _rb_skip(l)), "")
+        if first.startswith("# datetime="):  # 记录原子（注释先行）：B 侧形态
+            for line in lines:
+                if _rb_skip(line): continue
+                if line.strip().startswith("# datetime="):
+                    if not (m := HDR.match(line.strip())): raise ValueError("bad extra-info: " + line[:80])
+                    g.setdefault((m.group(1), int(m.group(2)), int(m.group(3))), [])
+                elif g:
+                    g[list(g)[-1]].append(parse_stmt(line))
+                else:
+                    viol.append((os.path.basename(fn), "stmt-before-header"))
+        else:  # 注释漂尾（语句先行）：A 侧形态——语句缓冲，注释到达时绑定 key
+            pend = []
+            for line in lines:
+                if _rb_skip(line): continue
+                if line.strip().startswith("# datetime="):
+                    if not (m := HDR.match(line.strip())): raise ValueError("bad extra-info: " + line[:80])
+                    g.setdefault((m.group(1), int(m.group(2)), int(m.group(3))), []).extend(pend)
+                    pend = []
+                else:
+                    pend.append(parse_stmt(line))
+            if pend: viol.append((os.path.basename(fn), "orphan stmt without extra-info header"))
+    return (g, viol) if mode == "rollback" else g
+RB = ("begin;", "commit;")
+def _rb_skip(line):
+    s = line.strip()
+    return not s or s in RB or s.startswith("-- WARNING") or s.upper().startswith("SET NAMES")
+def _rb_struct(fn, lines):
+    """keep-trx scaffold 结构断言（钉 B 侧——A 侧 KeepTrx=false 天然无 scaffold
+    不触发）。违例 → (文件, 原因)。首部悬空 commit 为平价（上游 lastTrxIdx=0
+    首块必注入），故只断：begin==commit-1==事务段数；每 begin 前一非空行为
+    commit;；末行 commit;。"""
+    core = [l.strip() for l in lines
+            if l.strip() and not l.strip().upper().startswith("SET NAMES")
+            and not l.strip().startswith("-- WARNING")]
+    if not any(l in RB for l in core): return []
+    begins = [i for i, l in enumerate(core) if l == "begin;"]
+    commits = [i for i, l in enumerate(core) if l == "commit;"]
+    segs, in_run = 0, False
+    for l in core:
+        if l in RB: in_run = False
+        elif not in_run: segs += 1; in_run = True
+    v = []
+    if len(begins) != len(commits) - 1 or len(begins) != segs:
+        v.append((fn, f"scaffold count mismatch: begin={len(begins)} commit={len(commits)} segments={segs}"))
+    if any(i == 0 or core[i - 1] != "commit;" for i in begins):
+        v.append((fn, "begin without preceding commit"))
+    if core[-1] != "commit;": v.append((fn, "missing tail commit"))
+    return v
 def main():
-    A, B = load(sys.argv[1]), load(sys.argv[2])
+    mode = sys.argv[3] if len(sys.argv) > 3 else "2sql"
+    if mode == "rollback":
+        A, viol = load(sys.argv[1], "rollback")
+        B, vb = load(sys.argv[2], "rollback"); viol += vb
+    else:
+        A, B, viol = load(sys.argv[1]), load(sys.argv[2]), []
     ka, kb, red, green = set(A), set(B), len(set(A) ^ set(B)), 0
     for k in sorted(ka ^ kb): print("ONLY-IN-" + ("A" if k in ka else "B"), k, str((A if k in ka else B)[k][:1])[:160])
     for k in sorted(ka & kb):
@@ -152,6 +216,7 @@ def main():
         if len(sa) != len(sb) or -1 in taken:
             red += 1; print("DIFF", k, str(sa)[:220], " ||| ", str(sb)[:220])
         else: green += 1
+    for fn, why in viol: red += 1; print("STRUCT-RED", fn, why)  # 结构性违例不入白名单
     print(f"groups A={len(ka)} B={len(kb)} aligned={len(ka & kb)} green={green} red={red}")
     return 1 if red else 0
 if __name__ == "__main__": sys.exit(main())

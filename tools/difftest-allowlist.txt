@@ -23,6 +23,10 @@ RULE  ALW-IDENT-BACKTICK   T13 审阅：本侧反引号加倍 vs 上游不加倍
 RULE  ALW-SETNAMES-HEADER  T15白名单(T14)：SET NAMES utf8mb4; 头行仅本侧有 → load() 跳过
 RULE  ALW-EXTRAINFO-DTZ    T15白名单(T14)：extra-info datetime 字段主机 TZ vs 固定偏移 → 不进对齐键；时区配置对齐（见通用前提）
 RULE  ALW-COLCOUNT-STRICT  T15纪律(T11/T13)：binlog 宽于 schema 上游恒 fatal → 差分夹具不做中途 ALTER/DROP COLUMN（本侧默认 non-strict 与上游等价于等宽场景）
+RULE  ALW-RB-COMMENT-DRIFT  P2-T7(rollback 维度)：上游 rollback = tmp 纯行倒置 → extra-info 注释漂尾随其语句（A 侧「语句缓冲+注释到达绑定」）；本侧 flashback 记录原子注释先行（B 侧沿用 lead 绑定）→ compare.py load(d,"rollback") 逐文件自适应双模绑定，对齐键仍 (binlog,startpos,stoppos)
+RULE  ALW-RB-SCAFFOLD       P2-T7(rollback 维度)：Go KeepTrx=false（-keep-trx 无 flag 注册，零值恒 false）→ A 侧无 scaffold；本侧 keep-trx 默认开 → load(rollback) 剥离裸 commit;/begin; 行不入组（真语句恒不与裸 scaffold 同文本，DELETE 等不可误吞）；同时结构断言钉 B 侧：begin数==commit数-1==事务段数、每 begin 前一非空行为 commit;、文件末行 commit;（首部悬空 commit 为平价——上游 rollback_process.go:38 lastTrxIdx=0 首块必注入，spec erratum 裁定）；违例 STRUCT-RED 直计红，白名单不吞结构
+RULE  ALW-RB-WARN-HEADER    P2-T7(rollback 维度)：本侧文件头 "-- WARNING: skipped N events..." 行（skip-bad-event 产物）→ load(rollback) 剥离；SET NAMES 头行沿用 ALW-SETNAMES-HEADER
+RULE  ALW-RB-TMP-NAME       P2-T7(rollback 维度)：产物名前缀 rollback.{N}.sql（Go）vs flashback.{N}.sql（本侧）——比较器按目录聚合 *.sql 以 key 对齐，文件名非比较项；两侧隐藏 tmp（Go `.rollback.%d.sql` events.go:291 系 / 本侧 `.flashback.tmp*`）glob "*.sql" 天然不匹配（dotfile 排除），且 Go 反转后即删
 EXCL  ALW-NOCHANGE-UPDATE  T15白名单(T13)：UPDATE 行前后无变化 → 上游空 SET Fatalf。矩阵排除：所有 UPDATE 必改值（gen-data.sql 注释钉死）
 EXCL  ALW-MULTI-UK         挂账(T15 夹具约束 T11)：多 uk 表上游键选择 Go map 序不稳定。矩阵排除：每表 ≤1 候选 uk
 EXCL  ALW-EXPR-INDEX       挂账(T11)：表达式索引 Column_name="" 两边必分歧。矩阵排除：无表达式索引
