@@ -216,7 +216,9 @@ pub struct ReplArgs {
     /// checkpoint 文件路径（事务边界原子落盘，存在即从其记录的位点接续）
     #[arg(long)]
     pub resume_file: Option<PathBuf>,
-    /// 心跳探活间隔秒（0=禁用，有效范围 0..=3600，校验在 validate_repl）
+    /// 心跳探活间隔秒（0=禁用：死链探测与**空闲期 Ctrl-C/stop 即时停泵**
+    /// 同时失效——中断延迟以本周期为界；有效范围 0..=3600，校验在
+    /// validate_repl）
     #[arg(long, default_value_t = 30)]
     pub heartbeat_secs: u32,
     /// 输出到标准输出（与 --resume-file 互斥：checkpoint 需与盘上产物对账）

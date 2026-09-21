@@ -68,6 +68,7 @@ pub(crate) mod test_support {
             Box::new(FakeStream::new(frames)),
             first_binlog,
             Filters::none(),
+            None,
         )
     }
 }

@@ -104,7 +104,8 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
 ```bash
 # 7) repl 首跑：now 哨兵（--start-file ""，= 跑时 SHOW MASTER STATUS 取当前
 #    位点，只看新流量）；checkpoint 自动落 {output-dir}/resume.json（事务边界
-#    原子写）。不给 stop 条件即常驻拉流；Ctrl-C 优雅收尾（exit 130）。
+#    原子写）。不给 stop 条件即常驻拉流；Ctrl-C 优雅收尾（exit 130；
+#    空闲期响应延迟 ≤ 一个心跳周期，默认 30s——--heartbeat-secs 0 则失此保障）。
 ./target/release/my2sql-rs repl \
   --binlog-dir /nonused --start-file "" \
   --uri "mysql://root@127.0.0.1:$PORT" --server-id 9527 \
@@ -129,7 +130,9 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   配 `--resume-file` 时须显式带清零哨兵 `--start-file "" --start-pos 0`
   （`--start-file` 是 clap 级必填，清零即「无独立 start」，不与 resume 互斥）。
 - `--server-id` 必填无默认（差异 24）；`--heartbeat-secs` 默认 30（0=禁用，
-  连续 2×间隔无事件判死链走重连）；`--resume-file` 与 `--to-stdout` 互斥。
+  连续 2×间隔无事件判死链走重连；空闲 master 上 Ctrl-C/stop 的停泵延迟以
+  心跳周期为界——**0 同时禁用死链探测与空闲期即时中断**）；
+  `--resume-file` 与 `--to-stdout` 互斥。
 - 语义 = **每事务至少一次**：崩溃重放最多重复 checkpoint 之后的完整事务，
   绝不半途切开；重复段可由产物与 `written_files` 名单界定
   （kill-9 接续零丢失由 live 件 `repl_kill9_resume_zero_loss` 钉死）。

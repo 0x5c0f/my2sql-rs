@@ -55,6 +55,7 @@
 //!   [`ReplSource::transport_error`] 保真给 T5 重连分类学。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::binlog::error::BinlogError;
 use crate::binlog::event::{
@@ -86,13 +87,26 @@ pub struct ReplSource {
     /// 传输层错误快照（EventSource Err 类型冻结为 BinlogError，重连
     /// 分类学依赖的 ReplError 变体在此保真——T5 经 accessor 取）。
     transport_err: Option<ReplError>,
+    /// Ctrl-C/停止中断旗标（终审 FIX D）：帧循环**顶部门**检查，置位即
+    /// 帧边界干净停 `Ok(None)`。动机：空闲 master 的心跳被本层 `continue`
+    /// 内部消化，Pumper 的事件间隙检查在这种恒流上永无间隙可看——中断
+    /// 感知必须按帧节奏落地（延迟上界 = 心跳周期）。
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl ReplSource {
     /// 与 `FileReader::new(name, rdr, filters)` 同形构造器
-    /// （`src/binlog/file_reader.rs:70`）。链种子 = filters.start 中
-    /// 与首文件名一致的位点分量（请求起点），缺省 4（文件头）。
-    pub fn new(transport: Box<dyn FrameStream>, first_binlog: String, filters: Filters) -> Self {
+    /// （`src/binlog/file_reader.rs:70`）+ FIX D 中断旗标位。链种子 =
+    /// filters.start 中与首文件名一致的位点分量（请求起点），缺省 4
+    /// （文件头）。`interrupt = None` 用于无需停泵语义的路径（datetime
+    /// 定位探针——其限界在 `probe_first_ts` 的墙钟硬顶，中断反会伪造
+    /// 「开流失败」判定）。
+    pub fn new(
+        transport: Box<dyn FrameStream>,
+        first_binlog: String,
+        filters: Filters,
+        interrupt: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let chain = match filters.start.as_ref() {
             Some((f, p)) if *f == first_binlog => *p,
             _ => 4,
@@ -108,6 +122,7 @@ impl ReplSource {
             done: false,
             chain,
             transport_err: None,
+            interrupt,
         }
     }
 
@@ -258,6 +273,16 @@ impl EventSource for ReplSource {
             if self.done {
                 return Ok(None);
             }
+            // FIX D：帧顶中断门——心跳恒流下唯一与帧节奏同频的检查点；
+            // 置位即帧边界干净停（收尾链照常，at-least-once 不越界）。
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                self.done = true;
+                return Ok(None);
+            }
             // ---- 取帧 ----（Ok(None) 只留给消费方语义；生产断链在
             // transport 已折叠为 Err(Disconnect)，spike 实测-6①）
             let frame = match self.transport.next_frame() {
@@ -287,7 +312,10 @@ impl EventSource for ReplSource {
             }
             let t = h.event_type.0;
             // 心跳 0x1b：内部消化（不产出、不推链、不进 stop 判定——
-            // 其 ts=0/活位点均非数据事件口径，spec §6）。
+            // 其 ts=0/活位点均非数据事件口径，spec §6）。口径显式化
+            // （FIX D）：停位/停时判定同样不吃心跳——空闲 master 上
+            // stop-datetime 命中要等下一个数据事件到流才生效（行为不变）；
+            // Ctrl-C 中断在循环顶门按帧节奏落地，不受本臂影响。
             if t == EventType::HEARTBEAT {
                 continue;
             }
@@ -898,6 +926,7 @@ mod tests {
             Box::new(crate::repl::test_support::FakeStream::new(p.frames())),
             "mysql-bin.000001".into(),
             filters,
+            None,
         );
         let x1 = s.next().unwrap().unwrap();
         assert_eq!(x1.kind, RawKind::Xid);
@@ -944,6 +973,68 @@ mod tests {
         assert!(s.next().unwrap().is_none());
     }
 
+    /// 终审 FIX D 红件（空闲 master 心跳恒流 + 中断旗标）：只发心跳帧的
+    /// 慢流（≈20ms/帧）模拟写入静默但链路存活的主库。修复前形态：心跳被
+    /// `continue` 消化、循环内**无人看中断旗标**，`next()` 挂满整条假流
+    /// （≈HB_TOTAL×20ms）才耗尽返回——Pumper 的事件间隙检查在恒流下永无
+    /// 间隙，Ctrl-C/stop 评估停摆。新契约：循环顶检查旗标 → 置位后一帧
+    /// 节奏内 `Ok(None)` 干净停（延迟上界 = 心跳周期）。
+    #[test]
+    fn interrupt_stops_source_during_heartbeat_pulse() {
+        use std::time::{Duration, Instant};
+
+        const HB_TOTAL: usize = 50;
+        const PULSE_MS: u64 = 20;
+        struct SlowHeartbeatStream {
+            left: usize,
+        }
+        impl FrameStream for SlowHeartbeatStream {
+            fn next_frame(&mut self) -> Result<Option<Frame>, ReplError> {
+                if self.left == 0 {
+                    return Ok(None);
+                }
+                self.left -= 1;
+                std::thread::sleep(Duration::from_millis(PULSE_MS));
+                Ok(Some(fr(build_frame(
+                    EventType::HEARTBEAT,
+                    0,
+                    777_777,
+                    0x0020,
+                    b"mysql-bin.000001",
+                    Crc::Off,
+                ))))
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut s = ReplSource::new(
+            Box::new(SlowHeartbeatStream { left: HB_TOTAL }),
+            "mysql-bin.000001".into(),
+            Filters::none(),
+            Some(flag.clone()),
+        );
+        let t0 = Instant::now();
+        assert!(
+            s.next().unwrap().is_none(),
+            "旗标置位后必须给出干净停（Ok(None)），不得伪造错误"
+        );
+        setter.join().unwrap();
+        let el = t0.elapsed();
+        assert!(
+            el < Duration::from_millis(500),
+            "中断延迟必须落在心跳节奏量级；修复前形态挂到假流耗尽 \
+             (≈{}ms)：实测 {el:?} 越界",
+            HB_TOTAL as u64 * PULSE_MS
+        );
+    }
+
     /// 断链 ≠ 干净停止：上游 Err(Disconnect) → next() Err 且变体保真
     /// （T5 重连分类依赖）；Ok(None) 只留给消费方语义。
     #[test]
@@ -956,6 +1047,7 @@ mod tests {
             Box::new(no_tail),
             "mysql-bin.000001".into(),
             Filters::none(),
+            None,
         );
         assert!(s.next().unwrap().is_none()); // FDE 消化后流耗尽 → 干净 None
         assert!(s.transport_error().is_none(), "干净停止不记传输错误");
@@ -964,7 +1056,12 @@ mod tests {
             vec![],
             ReplError::Disconnect("stream ended without stop condition".into()),
         );
-        let mut s = ReplSource::new(Box::new(fake), "mysql-bin.000001".into(), Filters::none());
+        let mut s = ReplSource::new(
+            Box::new(fake),
+            "mysql-bin.000001".into(),
+            Filters::none(),
+            None,
+        );
         let e = s.next().unwrap_err();
         assert!(
             matches!(&e, BinlogError::InvalidData(m) if m.contains("disconnected")),
@@ -979,7 +1076,7 @@ mod tests {
             vec![],
             ReplError::Purged("1236 log has been purged".into()),
         );
-        let mut s = ReplSource::new(Box::new(fake), "m".into(), Filters::none());
+        let mut s = ReplSource::new(Box::new(fake), "m".into(), Filters::none(), None);
         assert!(s.next().is_err());
         assert!(matches!(s.transport_error(), Some(ReplError::Purged(_))));
     }

@@ -85,6 +85,7 @@ fn collect_repl(frames: Vec<Vec<u8>>) -> Vec<RawEvent> {
         Box::new(VecDequeStream::new(frames)),
         "mysql-bin.000001".into(),
         Filters::none(),
+        None,
     );
     let mut v = Vec::new();
     while let Some(e) = s.next().unwrap() {
@@ -2492,4 +2493,86 @@ fn repl_threads_gt1_watermark_boundaries() {
         "--add-extra-info".into(),
     ];
     cmp_to_file_mode(&bt, &run, &f0, &fm, &fwindow);
+}
+
+/// 终审 FIX D live 件（空闲 master + SIGINT → exit 130）：默认心跳 30s
+/// （不传 `--heartbeat-secs`——本件合同就是「默认心跳为中断延迟兜底」），
+/// 开流后主库全程静默（只有心跳帧）。修复前形态：ReplSource 把心跳
+/// `continue` 内部消化、帧循环无人看中断旗标，Ctrl-C 只能等传输层读
+/// 超时（2d+1s）——exit 130 与 stop 评估在空闲 master 上无限期停摆。
+/// 新契约：中断在 ReplSource 循环顶门按帧节奏落地 → 停泵→drain→
+/// checkpoint→exit 130，延迟 ≤ 一个心跳周期。硬超时 90s ≫ 30s 周期；
+/// resume.json 在场即收尾链完整（水位 = 定位起点、零产物零名单）。
+#[test]
+#[ignore = "requires live mysql 8.0 container (make repl-test 门: MY2SQL_TEST_URI+CTR)"]
+fn repl_sigint_idle_master_exits_130() {
+    live_gate();
+    let bt = Bt::new("sig");
+    let db = "p3tfxdsg";
+    bt.seed(db);
+    let (f0, p0) = bt.master_pos();
+    let run = bt.sub("run");
+    let ro = run.to_str().unwrap().to_string();
+    let p0s = p0.to_string();
+    let mut child = spawn_bin(&[
+        "repl",
+        "--binlog-dir",
+        "/nonused",
+        "--uri",
+        &bt.uri,
+        "--start-file",
+        &f0,
+        "--start-pos",
+        &p0s,
+        "--db",
+        db,
+        "--output-dir",
+        &ro,
+        "--server-id",
+        &sid(71),
+        "--threads",
+        "1",
+    ]);
+    // ≥2 个心跳周期（62s）：进程必须存活（心跳续命正常、不误判死链），
+    // 同时确证流已进「追平活写尾、按周期收心跳」的稳态形态。
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(62) {
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "空闲 {}s 时进程自行退出 = 心跳假死断链（非本件合同）",
+            t0.elapsed().as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    let pid = child.id().to_string();
+    let sig = ProcCommand::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .expect("spawn kill");
+    assert!(sig.success(), "kill -INT {pid} 失败: {sig}");
+    let t1 = Instant::now();
+    let out = wait_bounded(child, "sigint-idle", Duration::from_secs(90));
+    let esum = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "空闲 master SIGINT 必须 130 收尾（修复前停摆不返 = 本件红）\n日志:\n{esum}"
+    );
+    println!(
+        "[fixD] 空闲 {}s → SIGINT → exit 130，收尾延迟 {:?}",
+        t0.elapsed().as_secs(),
+        t1.elapsed()
+    );
+    let cp = read_cp(&run.join("resume.json")).expect("终档在场（130 收尾链完整）");
+    assert_eq!(
+        (cp.file.as_str(), cp.pos),
+        (f0.as_str(), p0),
+        "零事件空闲 run：终档 = 本次定位起点"
+    );
+    assert!(cp.written_files.is_empty(), "零事件不得有产物名单: {cp:?}");
+    checkpoint::read_verify(&run.join("resume.json"), &run).expect("终档自洽");
 }

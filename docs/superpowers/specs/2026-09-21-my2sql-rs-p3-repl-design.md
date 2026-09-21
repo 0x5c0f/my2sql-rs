@@ -93,7 +93,7 @@ ReplSource(EventSource) ──RawEvent──▶ pump（过滤/事务状态机/�
 - **心跳**：`--heartbeat-secs`（缺省 30，0=禁用）→ 服务端 HEARTBEAT_LOG_EVENT；连续 2×间隔无任何事件 → 判定死链（TCP 半开由心跳兜底），走重连路径。心跳事件不产生 SQL、不推 checkpoint。
 - **自动重连**：指数退避 1s → 30s 封顶 + 抖动，**无限次**；每次重连日志一行（`repl: reconnect #K in <backoff> at <file:pos>`），同一波故障日志限流。终止条件（不可恢复，立即非零退出并给可操作信息）：认证失败（1045）、缺 `REPLICATION SLAVE/CLIENT` 权限（1227 家族）、位点被 purge（1236）、server-id 冲突特征（表现为对端强制断连循环 → 连续 3 次同因秒断即终止报错，防无限互踢）。主库重启（container restart 级）走正常重连恢复。
 - **解码错误策略**：沿用 `--on-error` 语义（repl 面该旗标存在且默认 skip-bad-event；帧协议保证事件完整性，坏事件=真坏数据，与 file 模式同闸）；**解码器不得 panic 红线不变**（repl 直通路径无 catch_unwind 保护的 threads=1 形态同守——事件解析在 worker 线程内 panic 即整 run Err，口径与 P2 一致）。
-- Ctrl-C：收到 TERM/INT → 停止拉流 → 落当前完整事务 → checkpoint → exit 130 语义（文档口径）。
+- Ctrl-C：收到 TERM/INT → 停止拉流 → 落当前完整事务 → checkpoint → exit 130 语义（文档口径）。**空闲期延迟上界 = 心跳周期**（终审 FIX D）：心跳被解码环内部消化，中断检查钉在帧循环顶门——写入静默的主库上，下一个心跳帧到流即停泵；`--heartbeat-secs 0` 同时禁用死链探测与空闲期即时停泵（此时 Ctrl-C 停摆直到有真事件，属旗标语义自负）。stop-datetime/stop-position 同口径：只随**数据事件**生效，空闲 master 上命中要等下一个事件到流（登记行为，不修）。
 
 ## 7. 测试策略（全真实件）
 

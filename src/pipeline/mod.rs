@@ -477,7 +477,7 @@ impl FrameStream for ProbeTap {
 /// 否则 None（开流/断链失败左收）。
 fn probe_consume(tapped: ProbeTap, file: String) -> Option<u32> {
     let saw_heartbeat = tapped.saw_heartbeat.clone();
-    let mut src = ReplSource::new(Box::new(tapped), file, Filters::none());
+    let mut src = ReplSource::new(Box::new(tapped), file, Filters::none(), None);
     loop {
         match src.next() {
             Ok(Some(ev)) => {
@@ -537,8 +537,11 @@ fn probe_first_ts(open: &mut Opener<'_>, file: &str, cap: Duration) -> Option<u3
 
 /// 事件泵包裹件（T5 装配私有）：①Ctrl-C 旗标在**事件间隙**检查——置位
 /// 即 `Ok(None)` 干净停泵（run_live 收尾链照常：末事务 drain→flush→
-/// checkpoint）；②源侧传输错误快照进 sink（`BinlogError` 抹平了变体，
-/// 重连分类学从 [`ReplSource::transport_error`] 取回）。
+/// checkpoint）。FIX D 后中断**主门**已前置到 ReplSource 事件循环的帧顶
+/// （空闲 master 恒心跳流上事件间隙永不到来，源级旗标随构造注入），
+/// 本处检查留作解码后间隙的第二道兜底；②源侧传输错误快照进 sink
+/// （`BinlogError` 抹平了变体，重连分类学从 [`ReplSource::transport_error`]
+/// 取回）。
 struct Pumper {
     src: ReplSource,
     sink: Arc<Mutex<Option<FailReport>>>,
@@ -753,7 +756,16 @@ pub(crate) fn run_repl_with(
         let report: Option<FailReport> = match opened {
             Ok(stream) => {
                 let sink: Arc<Mutex<Option<FailReport>>> = Arc::new(Mutex::new(None));
-                let src = ReplSource::new(stream, file.clone(), filters.clone());
+                // FIX D：中断旗标直达解码环——空闲 master 恒心跳流上
+                // Pumper 的事件间隙检查无间隙可看，帧顶检查把 Ctrl-C
+                // 延迟钉在 ≤ 心跳周期（run_live 照常收尾：停泵→drain→
+                // flush→checkpoint→exit 130 语义）。
+                let src = ReplSource::new(
+                    stream,
+                    file.clone(),
+                    filters.clone(),
+                    Some(env.interrupt.clone()),
+                );
                 let pumper = Box::new(Pumper {
                     src,
                     sink: sink.clone(),
