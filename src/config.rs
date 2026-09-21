@@ -154,7 +154,8 @@ pub struct ToSqlArgs {
     /// 输出到标准输出
     #[arg(long)]
     pub to_stdout: bool,
-    /// 逐事件错误策略（默认 skip-bad-event = P1 robust-continue 行为不变）
+    /// 逐事件错误策略（仅 skip-bad-event = P1 robust-continue 行为不变；
+    /// stop 不适用正向模式，validate 即拒——flashback/stats 专属）
     #[arg(long, value_enum, default_value_t = OnError::SkipBadEvent)]
     pub on_error: OnError,
 }
@@ -289,6 +290,14 @@ impl Config {
     /// （由调用方决定展示/退出——`from_args` 走 `exit(2)`，测试直接 `unwrap_err`）。
     /// P2 T5：由 `validate` 直重命名而来，全部既有调用点同步改名。
     pub fn validate_to_sql(args: ToSqlArgs) -> Result<Config, String> {
+        // to-sql 流水线恒 best-effort（spec §3.5：坏事件计数跳过，P1 字节面
+        // 由 e2e 守卫），Stop 无消费点——受理即静默无效，validate 期拒绝
+        // （P2 T5 review 裁定；急停语义仅 flashback/stats 提供）。
+        if args.on_error == OnError::Stop {
+            return Err(
+                "--on-error stop is flashback/stats-only; to-sql is best-effort by design".into(),
+            );
+        }
         let mut cfg = build_common(&args.common)?;
         apply_sql(&mut cfg, &args.sql);
         cfg.to_stdout = args.to_stdout;
@@ -589,9 +598,12 @@ mod tests {
             (WorkType::ToSql, OnError::SkipBadEvent)
         );
         assert!(c.keep_trx); // 无消费的中性默认
-        let c =
-            Config::validate_to_sql(args(&["--uri", "mysql://x@y", "--on-error", "stop"])).unwrap();
-        assert_eq!(c.on_error, OnError::Stop);
+        // Review 裁定（P2 T5 fix）：to-sql 流水线恒 best-effort（spec §3.5），
+        // Stop 在此无消费——受理即静默无效，validate 期直接拒绝。
+        let e = Config::validate_to_sql(args(&["--uri", "mysql://x@y", "--on-error", "stop"]))
+            .unwrap_err();
+        assert!(e.contains("stop"), "{e}");
+        assert!(e.contains("flashback"), "{e}");
     }
 
     #[test]

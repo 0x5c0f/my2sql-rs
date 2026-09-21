@@ -32,7 +32,10 @@ fn flashback_help_shows_keep_trx_and_rejects_to_stdout() {
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    // clap 未知参数 → 解析失败出口 2（与 validate 错误同码），stderr 指名该旗标
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--to-stdout"), "{err}");
 }
 #[test]
 fn stats_help_shows_threshold_flags() {
@@ -70,4 +73,27 @@ fn bad_dml_value_rejected() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+}
+#[test]
+fn to_sql_rejects_on_error_stop() {
+    // P2 T5 review 裁定：to-sql 恒 best-effort，stop 无消费 → validate 期
+    // 拒绝并走 exit(2) 统一错误出口（不静默受理）。
+    let out = bin()
+        .args([
+            "to-sql",
+            "--binlog-dir",
+            "/tmp",
+            "--start-file",
+            "f",
+            "--uri",
+            "mysql://x@y",
+            "--on-error",
+            "stop",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("stop"), "{err}");
+    assert!(err.contains("flashback"), "{err}");
 }

@@ -1107,7 +1107,10 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   robust-continue」未动），且 skipped-WARNING 头行只存在于 flash 收尾，
   故该值在 to-sql 路径当前完全无行为分叉（默认 Skip 面 P1 字节零变）。
   T6-T8 若需真 stop 语义须扩 `stop_on_error` 并补 e2e；若维持现状建议
-  T9 文档标注。stats 参数范围校验自 clap 移入 `validate_stats` 后，
+  T9 文档标注。**Fix round-1 裁定（review）：上句作废——`validate_to_sql`
+  对 `--on-error stop` 直接 Err 拒绝（to-sql best-effort by design，spec
+  §3.5；stop 语义 flashback/stats 专属），静默无效暴露面收口，cementing
+  测试翻转 + 新增 subprocess 冒烟。** stats 参数范围校验自 clap 移入 `validate_stats` 后，
   difftest 包装层（T7）传参越界会走 exit 2 而非 clap usage——文案差异
   不涉行为。`fargs/sargs` helper 与 `args()` 同放 config.rs tests，
   真件 e2e（T6）可直接复用子命令串形态。
