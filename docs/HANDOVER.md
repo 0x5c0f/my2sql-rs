@@ -5,7 +5,10 @@
 
 ## 项目一句话
 
-Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），能力对齐 Go 版 my2sql 但 CLI 全新设计；`reference/my2sql-go/` 为行为参考与差分测试裁判（不入库、勿改动）。
+Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats / repl），
+能力对齐 Go 版 my2sql 但 CLI 全新设计；`reference/my2sql-go/` 为行为参考与
+差分测试裁判（不入库、勿改动）；repl 无 Go 裁判（上游不可作 oracle，
+README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 
 ## 关键决策记录（不可回退项）
 
@@ -21,8 +24,18 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 ## 当前进度
 
-- 分支：`feat/p2`（worktree `.qoder/worktrees/feat+p2`，base `main@205512b`；
-  P2 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`，
+- 分支：`worktree-feat+p3`（worktree `.qoder/worktrees/feat+p3`，base
+  `main@0905368`（= feat/p2 终审后合入态 v0.2.0-p2）；
+  P3 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`，
+  spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`；
+  SDD 台账 `.superpowers/sdd/2026-09-21-my2sql-rs-p3-repl/progress.md`）
+- **P3 计划 9 任务（T0–T8）全部完成（T0–T7 节点 + T8 收口齐）**：repl
+  （伪装 replica 拉流，to-sql 流式形态）交付——超集四件（checkpoint/resume、
+  自动重连、心跳探活、resume 防覆盖闸）+ 等价性总闸（repl==file 逐字节）；
+  live 套件 10/10、compat 矩阵 18/18，DoD 对账见「P3 DoD 对账」节。
+  待全分支终审后合入 main。
+- 前史（P2）：`feat/p2`（worktree `.qoder/worktrees/feat+p2`，base
+  `main@205512b`；P2 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`，
   spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p2-flashback-stats-design.md`；
   SDD 台账 `.superpowers/sdd/2026-09-21-my2sql-rs-p2-flashback-stats/progress.md`）
 - **P2 计划 9 任务全部完成（T1–T9 节点齐）**：flashback（记录原子逆序 +
@@ -1185,7 +1198,9 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 遗留/对后续影响：① 000004 partial 的「skip 也硬拒」现实进 T7 比较器/
   T9 文档口径（上游 my2sql-go 对 39 的处置是 nil 值继续——本侧选择源级
   拒收，差异登记 P1 T12 已有、T6 实测复核）；② stats Err 路径残留头行
-  文件如需收口属 P3 打磨（现语义 = 头行无尾注即「未完成」标记）；③ 脚本
+  文件如需收口属 P3 打磨（现语义 = 头行无尾注即「未完成」标记；
+  **P3 T8-debt `60a9019` 已收口 jsonl 面**：Err 路径两 jsonl 不存在
+  （drop-on-error），txt 两件保持该口径——见「P3 DoD 对账」6）；③ 脚本
   的 JSON dump 逐行 diff 依赖「单库单表、无触发器」前提，扩展多表时须换
   按表 CHECKSUM 循环；④ T7 difftest WORK_TYPE=rollback 可直接复用本脚本
   的容器 idioms（无 bind mount + docker cp 出 binlog）。
@@ -1396,11 +1411,164 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
    守卫适用面；本文件 T1–T9 节点齐 + 本节 DoD + 挂账更新。
    P1→P2 行为差异入差异清单 = 差异 16–22（承接 P1 清单 1–15）。
 
-## P3 Task 7: compat 矩阵 repl 族（5.6–8.4 × repl → 18 用例全绿）
+## P3 Task 0: 协议 spike（mysql crate binlog feature 六问，闸）
 
-> P3 T0–T6 节点未逐条入档（live 证据见各任务提交与
-> `docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`），由 T8
-> 文档收口统一补记；本节先落 T7（本任务点名节点）。
+- 提交：`826e2c9`（spike）+ 修复轮 `ba53aad`（三源一致），merge `84bf581`。
+  产物 = `examples/repl_spike.rs`（throwaway 诊断样例，按 T8 裁决保留，
+  `src/` 零引用）+ spec §2 六问结论勘误回填。
+- 六问全实答（关键口径，均真机 8.0.46 实测）：① 入口实为
+  `Conn::get_binlog_stream(self, BinlogRequest)`（**消耗 Conn** → repl 与
+  元数据必须物理两连接）；`Event::write` 重建字节与磁盘件 `dd`+`od`
+  **逐字节相同**（TABLE_MAP/WRITE_ROWS/QUERY 均验）→ 喂我方解码器零分叉，
+  无需 §9 降级；② CRC32 由 crate 剥（`checksum()` 存原 4B），走 `Event::write`
+  重建含 CRC 完整帧后 repl 路径不调 strip_checksum、与 file 含 CRC 校验直兼容；
+  ③ 流首恒 fake-rotate+FDE（合成帧 header log_pos=**0**、payload=请求文件/
+  起点；`is_fake()` 查 payload==0 故对合成首帧恒 false——判别只能靠
+  ARTIFICIAL(ts=0)+header0+seq0+流首位置）；EOF 换件 ROTATE 亦合成
+  （ts=0/pos=0/payload=4）→ **位置链禁经合成头、以请求 pos 种子**；
+  ④ 心跳无 BinlogRequest 入口，退路 `SET @master_heartbeat_period=<ns>`
+  预升级语句成立且优于预期：v1 心跳(0x1b) **header log_pos=活的主库写位**
+  （573729 实证=当时 SHOW MASTER STATUS），checkpoint 推进不消费其位点；
+  ⑤ caching_sha2 与 native 双认证全通；**URI query 参不透传**——`ssl-mode`
+  直接 `Unknown URL parameter` 硬错（P3 不提供 TLS → README 差异 26）；
+  ⑥ 断链两形态：优雅终止（docker restart）=迭代器**静默 None 无 Err**
+  （与 stop-EOF 不可分 → 分类器 stop 前任何 None 一律按断链重连）；
+  硬断（docker kill）=一次 `Err(IoError)` 后流中毒。
+- 评审：Needs fixes → 轮1 `ba53aad` 全闭合（原 Critical：fake rotate 头
+  log_pos 判 4 vs 真值 0，以捕获件裁定；原 Important：报告心跳位点口径
+  自相矛盾，同源裁定）。挂账 T7：心跳线形 5.6/5.7 复核（T7 已收口，
+  见该节；静默窗帧形仍 8.0-only → 新挂账）。
+
+## P3 Task 1: repl CLI/Config 面（validate_repl + run_repl 壳）
+
+- 提交：`c29b81b`，merge `366287d`。第四子命令 `Command::Repl(ReplArgs)`
+  （CommonArgs+SqlTextArgs flatten + `--server-id` 必填无默认 +
+  `--resume-file` + `--heartbeat-secs` 默认 30 + `--to-stdout`）；
+  `validate_repl`：uri 必填（`--schema-file` 不可替代）、resume×显式位点
+  「位点来源歧义」硬错、resume×to-stdout 互斥、heartbeat 0..=3600
+  （datetime×非空 start-file 的第三对互斥在 T5 修复轮并入——validate
+  终态见 src/config.rs 逐臂钉测）；
+  dispatch 走 `WorkType::Repl`（与既有惯例一致，评审实核）；main.rs
+  run_repl 壳。合并后 301 测试/clippy/fmt 绿、src/binlog 零 diff。
+- 评审 Approved 零 Critical/Important。裁决记录：`--to-stdout` 字段新增
+  采纳（spec 承诺逐语句 flush，拒绝组合测试需要该字段）；ReplSpec 不创建
+  （Interfaces 约束面无此形状）；**start_pos 默认 4 → 裸默认=now 需以
+  「start_file 空」为哨兵**（记为 T5 前置事实，T5 已带 live 钉）。
+- Minor 挂账（不修，终审视野）：bare repl exit-2 断言不具判别力（同测试
+  help 断言兜底）、heartbeat 错误文案缺 `repl:` 前缀、歧义案中英混排
+  （为钉「歧义」子串）、validate_repl 重设 keep_trx/on_error 默认=防御性
+  重复（与 validate_stats 同风格）。
+
+## P3 Task 2: FrameStream transport + ReplSource（文件同构帧）
+
+- 提交：`a7cebb5` → merge `3057324`（与 T3 的 mod.rs 并集按预定裁决解决，
+  零意外）→ 评审 Needs fixes → 修复轮 `cd2d3fe` + scoped re-review：
+  I5–I9 全 ADDRESSED、零断言删改。合并后全量 273+ 绿、binlog 冻结空。
+- 交付：`src/repl/transport.rs`（FrameStream：mysql BinlogStream → 帧迭代，
+  ReplError 面）+ `src/repl/source.rs`（ReplSource 实现
+  `pipeline::source::EventSource`，喂 `Event::write` 重建帧）。两测互钉：
+  重建帧 vs FileReader 逐字节同构 +
+  `tests/repl.rs::synth_frame_export_is_byte_equal_through_repl_source`
+  跨源钉；修复轮补两硬错分支负例——CRC
+  负例仅翻尾 CRC 字节保长度、帧长自洽负例 Parity(false)+Crc::Off 隔离，
+  均经去功能化双向验证。
+- 接口裁决（入 T5 前置事实包）：`ReplError::Disconnect(String)` 新增
+  （None-drop 语义无既有变体可表达）；trait Err 冻结为
+  `BinlogError::InvalidData("repl: …")`、ReplError 经
+  `ReplSource::transport_error()` 旁路供 T5 分类；双物理连接（heartbeat 预升级需独立
+  setup 连接）。
+- 挂账：1236 双义（purged vs server-id 冲突）split-by-message → T5 消费；
+  对抗服务器形态（Minor3/4）在信任边界内不修；TDD 次序偏差（实现先于
+  首跑红）评审明示 accept（编译级红+断链行为红存活）。
+
+## P3 Task 3: Writer 流式刷盘/防覆盖 + checkpoint 原子档
+
+- 提交：`cd9da06` → 修复轮 `dc1a9f4`（re-review clean：I1–I4 ADDRESSED）。
+  merge `4bbfa3d`。全量 34+281 绿。
+- 交付：Writer 流式模式开关（事务提交边界刷出，file 模式路径零扰动）+
+  no-clobber 闸（`create_new` 原子归零 TOCTOU）+ `src/repl/checkpoint.rs`
+  （serde_json 单对象、tmp+rename 原子替换、`write_atomic`/`read_verify`、
+  written_files 对账）。修复轮：`read_verify` 豁免自家 `.{ckpt}.tmp` 崩溃
+  残留（skip 不 unlink；异名 stray 仍硬 Stale，新测试钉）；written_files
+  段名校验 `CpError::Malformed`（T4/T5 dispatch 需补 catch-all 臂）；
+  crash≠power-fail 耐久注记。
+- LOW drift 登记不修：目标为目录时 create_new 走 EISDIR 原始错而非钉文案
+  （仍是硬错不覆盖）。
+
+## P3 Task 4: Runner 泵泛化 + 提交边界 checkpoint 水位
+
+- 提交：`313e9a1`。评审 Approved 零 Critical/Important-blocking。
+- 交付：`run_pump` 经 `dyn EventSource` 泛化（原 pump_one_file 抽取重构，
+  file 模式**字节面不变**——逐函数归一化比对核实、e2e 守卫）+ 水位数学
+  （commit 边界才推 checkpoint：pop-before-flush 只在失效路径多滞后不说
+  谎；flush→snapshot→write 序在码；水位对 Reorder pop 契约双向无洞）。
+- 交后续注记（均已兑现/入档）：threads>1 水位用例 T6 必补（→ T6b mtw 件，
+  并挖出 pump_parallel 真缺陷）；pump-Err 与 drain-Err 主次吞次=T5 运维面；
+  opening_binlog 回退污染 file 模式=当前不可达（ckpt_out 永不上弦），T5
+  禁把 arm 逻辑上提；run_live 返回后 ckpt_out 保持 Some（复用 Runner 换
+  src 续泵是预期姿势）。
+
+## P3 Task 5: run_repl 装配（三定位/resume/退避重连/SIGINT）
+
+- 提交：轮2 `0247f92`（轮1 达 150 轮上限截断，WIP 全存活盘点入台账）→
+  评审 Needs fixes → 修复轮 `7fea609` + scoped re-review 全 ADDRESSED
+  零附带损伤（338 测试绿）。
+- 交付：`run_repl`——位点三态定位（now 哨兵 live 弹版 / file+pos / datetime
+  二分+逐事件过滤）、checkpoint resume（read_verify 四臂对账）、指数退避
+  重连 1s→30s 封顶+抖动无限次、终止类硬错映射（1045 拆独立句、1227 家族、
+  1236 按 msg 拆 Purged vs ServerId 冲突、server-id 冲突 3-strike 秒断门）、
+  SIGINT drain（Ctrl-C → 完整事务落盘 → checkpoint → exit 130）、双物理
+  连接、`ReplEnv` 测试缝（8 文件 ~1300 行装配 + list_binlogs）。
+  live 两件（now/purge）真跑绿 15.02s；三门+冻结全过。
+- 修复轮两项 Important：I1 resume 跑把更新写回被消费的旧 resume.json
+  （毁上一轮 written_files 审计清单）→ **resume 落新 dir、旧档不可变**、
+  文案对齐；I2 `probe_first_ts` 空闲当前件可永挂（缓解注记方向反了）→
+  探针限界（PROBE_CAP=90s）。裁决入册：datetime+start-file 共存改 validate
+  硬错（T1 面缺口）；3-strike 门按 spec 字面（登记 T7 矩阵 1236 敏感性风险，
+  T7 实测未触发）。
+- Minor 挂账（终审视野，其中三条转正入「遗留/挂账清单」）：live 测试失败
+  路径容器/DB/temp 泄漏、ctrlc 进程单次安装、Purged 列恒 None（后随
+  `SHOW BINARY LOGS` 第三列正名 = Encrypted，T6b P1' 修复）、
+  pipeline/mod.rs 已 2600+ 行（repl 装配块 ~570 逻辑行可迁
+  src/repl/assembly.rs——plan 钉了调用点故不迁）。前注 T6：N1 静默主库
+  日期件 Ctrl-C 最长 (log2 files)×90s 后落地；N2 heartbeat>85s 退化保守
+  （左移零损向）；N3 同路径词法守卫豁免面内。
+
+## P3 Task 6: repl live e2e 套件（等价性总闸 + kill-9/restart/矩阵件）
+
+- 拆单：6a=等价性总闸+`tools/repl-e2e-lib.sh`+Makefile `repl-test`
+  （提交 `6a78347`，5 件对齐）；6b=kill-9 两跳+restart+位点/停止/心跳/
+  threads>1 水位矩阵（轮1、轮2 先后触 150 轮闸，轮3 提交 `2941dfb`）；
+  评审合并过一次门 → Needs fixes → 修复轮 `aba2753` → scoped re-review
+  CLEAN 零附带损伤。
+- **等价性总闸（P3 核心不变量）真机首过**：同窗混合 DML（2 表/JSON/BLOB/
+  中文/10 行事务/回滚事务）repl==file `to_sql.3.sql` **11016B==11016B、
+  sha256 同 `93937bc1…`**，窗口 `mysql-bin.000003:6617..17807`
+  （ledger Task 6a 行；`tests/repl.rs::repl_stream_equals_file_mode_byte_for_byte`）。
+- 轮1/2 挖出两个 live-only 真缺陷并 TDD 钉死：P1' `src/metadata/store.rs`
+  `SHOW BINARY LOGS` 第三列 8.0 实为 Encrypted 'No' 串 → `Row::get::<u32>`
+  panic 炸穿 datetime 定位（`col_u32` from_value_opt 非 panic 通道 + 单测）；
+  P2' `src/repl/source.rs` rotate 链复位口径：真 rotate 后链留旧档尾位 →
+  假干净收尾吞新档全部事件（改名即复位 payload 新档位点，红钉
+  `real_rotate_renames_chain_so_eof_switch_cannot_falsely_stop`）。
+  控制方首轮亲跑 8/2 的两红根因：F1=harness 只扫 stderr 而 tracing 默认
+  写 stdout（生产无恙，测试面修）；F2=`pump_parallel` 真缺陷——源静默时
+  阻塞 `next()` 不 reap → threads>1 水位停摆（relay thread + 20ms
+  recv_timeout 修 + 红钉单测 `parallel_watermark_advances_while_source_idle`）。
+  评审确认三块 live-only 生产改动全部正确（col_u32 非 panic、rotate 复位
+  不可回归、pump relay 关停序+终帧语义等价）。
+- 评审 Important：reconcile n>m OOB（重复容忍比对首次真调用即炸）→
+  min(n,m) 界定 + 合成 dup 钉测 `reconcile_dup_shape_synthetic`（评审员
+  独立复现红）。轮1 顺手清 5 Minor（vacuous 自检删、kill9 torn 路径可达
+  且跨源真比对、Encrypted 正名、Bt 泄漏、lib 窗口契约注）。
+- 最终全量：`make repl-test` **10 passed / 0 failed / 476.76s**（T6b 轮3
+  控制方亲跑；restart 件 2×、mtw 件 3× 无翻转）；非 live 341 绿/clippy
+  -D/fmt/binlog 冻结空（T8 本轮复跑 342 绿 = +fix 轮新测）。
+- 挂账新增（fix 报告 + 评审注，转「遗留/挂账清单」）：live dup 路径无天然
+  覆盖（restart 跑 n==m，由合成测独扛——勿把绿 restart 读作 dup 覆盖）；
+  `parse_blocks` 对首行 SET NAMES 残缺静默丢而非报 torn。
+
+## P3 Task 7: compat 矩阵 repl 族（5.6–8.4 × repl → 18 用例全绿）
 
 - 交付：`tools/compat-matrix.sh` 扩 work=`repl`（`run_case` 第 5 参派发
   `repl_run`）+ repl 族 4 用例 + `REPL_ONLY=1` 调试入口；容器/灌流全复用
@@ -1433,6 +1601,76 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 三门：`cargo test` / `cargo clippy --all-targets -- -D warnings` /
   `cargo fmt --check` 收尾复跑（本轮结果见提交信息与 task-7 报告）。
 
+## P3 DoD 对账（spec §10 + plan 验收清单，Task 8 收尾）
+
+> 取证纪律同 P2 节：每条 = 证据命令 + 结果摘要；引用既往真实跑显式标注
+> commit 与出处；本轮（T8 工作树 @ 基线 `9fe74b3`）能便宜复跑的均已复跑。
+> docker 件不重跑（T6b 轮3 / T7 为控制方亲验真跑，台账逐字引用）。
+
+1. **等价性总闸 + 矩阵**（spec §10-1 / §7-1）——
+   - 8.0 主件：引 `6a78347` 真跑（ledger Task 6a 行，不重跑 docker）：
+     窗口 `mysql-bin.000003:6617..17807` 混合 DML（2 表/JSON/BLOB/中文/
+     10 行事务/回滚事务），repl==file `to_sql.3.sql` **11016B == 11016B**、
+     sha256 同为 `93937bc1deaccf8b412f7359aea7dc648636e6cd9ca23a15f0b27062bd808052`。
+   - `make repl-test` live 全量：引 T6b 轮3 控制方亲跑（/tmp/p3-t6b-live-run.log
+     证据入 ledger Task 6b 行）：**10 passed / 0 failed / 476.76s**；
+     restart 件 2×、threads>1 水位件 3× 复跑无翻转。
+   - `make compat` 18 用例：引 `500b6cf` 单轮真跑 18/18 PASS（既有 14 同场
+     复验；tsv 逐字已入 docs/compat/matrix.md）——repl 行 equivalent=
+     **175335 / 146979 / 143582 / 164487 bytes**（5.6/5.7/8.0/8.4），
+     四版本 files=2 全真跨档、repl/file events 两侧逐例相等。
+2. **kill-9 resume + 容器重启重连**（spec §10-2）——
+   `tests/repl.rs::repl_kill9_resume_zero_loss`（两跳：已提交事务零丢 +
+   重复仅整事务、written_files 可界定）与 `repl_survives_server_restart`
+   （docker restart → 退避重连从 checkpoint 续拉、终产物与基准等价）均在
+   上条 repl-test 全绿轮内；checkpoint 单测族（write_atomic/read_verify/
+   四臂对账/水位）随 `cargo test` 同闸（T8 本轮 342 绿）。
+   注（勿误读）：live dup 路径无天然覆盖（restart 跑 n==m），由合成测
+   `reconcile_dup_shape_synthetic` 独扛（新挂账 #6）。
+3. **三门 + 全量回归 + 冻结门禁**（spec §10-3 / 验收清单 1、4）——
+   T8 本轮真复跑（本工作树 @ 9fe74b3）：
+   - `cargo test`：**342 passed / 0 failed / 11 ignored**（lib 306 +
+     cli 8 + e2e 9 + flashback 7 + fuzz_seed 2 + repl 非 live 2 + stats 8；
+     ignored = lib 1 + repl live 10，live 组实跑=上条 10/10）；P1/P2 全量
+     回归含于其中 + compat 18/18 同场（既有 14 族 `500b6cf` 复验）。
+   - `cargo clippy --all-targets -- -D warnings`：净（T8 本轮）。
+   - `cargo fmt --check`：净（T8 本轮）。
+   - **bench 免跑核验（plan T8 Step 2）**：`git diff main..HEAD -- src/binlog/`
+     与 `git diff main..HEAD -- benches/` **双双空**（T8 本轮实测，`wc -l` =
+     0/0）→ P3 无解码热路径与基准面改动，**吞吐数字按 P2 态引用**
+     （docs/bench/p1.md 基线 + docs/bench/p2.md 回归闸 finding），P3 不重跑 bench。
+4. **文档收口**（spec §10-4）——README：repl 矩阵行 ✅（18 用例口径）、
+   快速上手 repl 例句 7)/8)（flags 逐一对 ReplArgs/validate_repl 实核；
+   provenance=live 套件同款，不冒充本轮手跑）、差异登记 23–27（承接 P2
+   清单 1–22；spec §8 五则 + TLS 件入册）、`make repl-test` 入差分测试节、
+   examples/repl_spike.rs「诊断样例」注；本文件：T0–T6 节点补档（替换
+   原「未逐条入档」注）、本节 DoD、挂账消费 + P3 新挂账 7 条；
+   matrix.md 18 行（T7 已落，本轮仅链接）。
+5. **卫生门禁**（spec §10-5 / 验收清单 6）——`reference/` 零改动
+   （git-ignored 从未入库：`git log main..HEAD --name-only | grep
+   ^reference/` 空，T8 本轮实测）；`grep -rn repl_spike src/` **空**
+   （T8 本轮实测，exit 1；spike 件保留于 examples/）；spec §2 字节口径
+   已经 Task 0 spike 实证回填（勘误随 `ba53aad` 同批提交）。
+6. **P2 挂账两项消费完毕**（验收清单 5）——`60a9019`（merge `2e26bca`，
+   评审 Approved 且实跑复核：26==26/0/0、36==36 磁盘独立重点数、mtime 序
+   合法，台账原话）：① stats Err 路径 JSONL 收口（drop-on-error：Err 路径
+   两 jsonl **不存在**、txt 两件保持既有口径；单元 + 集成双红→绿，集成件
+   `tests/stats.rs::stats_err_path_leaves_no_partial_jsonl`，成功路径字节
+   不变）；② difftest `--dml insert`×stats 冒烟维度（真跑 `[5.6/7]
+   inserts=26 updates=0 deletes=0 == to-sql(--dml insert) INSERT lines=26`，
+   同轮回归 `[5.5/7] report total=36 == to-sql DML lines=36`）——台账两处
+   挂账条已勾销（见下表 T8-debt 消费注）。
+   注：①的失败运行会毁上一份好 JSONL（create 即 O_TRUNC + Drop unlink），
+   合同合法「absent」——运维向一句话入新挂账 #1。
+
+## P3 挂账消费/新增一览
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| P2 挂账：stats Err 路径 JSONL 头收口（P2 T6 节点遗留②/P2 T9 移交） | ✅ 消费（`60a9019`） | DoD-6；挂账清单原条勾销 |
+| P2 挂账：`--dml`×stats 裁判维度（P2 T9 挂账） | ✅ 消费（`60a9019`） | DoD-6；挂账清单原条勾销 |
+| P3 新挂账 7 条（T5/T6/T7 终审视野转正） | ⏳ 入册 | 「遗留/挂账清单」节 P3 块 |
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -1452,6 +1690,9 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - SDD 台账：`.superpowers/sdd/2026-09-20-my2sql-rs-p1/progress.md`（git-ignored，恢复上下文先读它）
 - SDD 台账（P2）：`.superpowers/sdd/2026-09-21-my2sql-rs-p2-flashback-stats/progress.md`
   （git-ignored；任务简报/评审 diff/各任务报告同目录）
+- SDD 台账（P3）：`.superpowers/sdd/2026-09-21-my2sql-rs-p3-repl/progress.md`
+  （git-ignored；任务简报/评审 diff/各任务报告同目录；live 套件证据
+  `/tmp/p3-t6b-live-run.log`）
 
 ## 遗留/挂账清单
 
@@ -1490,14 +1731,50 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
     无尾注（stats_process.go:262-265 收尾仅冲刷窗口）——格式/落点由本
     计划简报裁定；比较器已约定跳 `#` 行（T7），该行不受裁判差分保护，
     改动须同步 run-difftest 冒烟内联脚本。
-  - [ ] `--dml` 过滤与上游 stats 计数一致性**未做裁判差分**：T9 仅源码
+  - [x] ~~`--dml` 过滤与上游 stats 计数一致性**未做裁判差分**：T9 仅源码
     路径核对（上游 FilterSqlLen 于 com.go:75-101 拦 rows、query/xid
-    直通 = 我方 prepare 过滤位形），差分维度 P3 再说（承 T7 口径）。
+    直通 = 我方 prepare 过滤位形），差分维度 P3 再说（承 T7 口径）。~~——
+    **P3 T8-debt 消费（`60a9019`）**：`tools/run-difftest.sh` 新增 [5.6/7]
+    `--dml insert`×stats 双通道配平（真跑 inserts=26 updates=0 deletes=0
+    == to-sql(--dml insert) INSERT lines=26；Σupdates/Σdeletes=0 即 dml
+    过滤器跨通道语义一致钉），同轮回归 [5.5/7] 36==36 不变。
   - [ ] bench 判定工装（P3/P4）：若要判定 P2 未解析的 −3.2% 代码增量，
     需 `governor=performance` + `taskset` 钉 8 P 核重做 A/B（~30 分钟）；
     threads 1→8 并行效率 2.5× 的 P1 挂账保留。证据 docs/bench/p2.md
     「后续动作」节（T9 移入本条统一索引）。
-- [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
+- **P3 T8 新增挂账（repl 收尾登记，均不修、入终审/P4 视野）**：
+  - [ ] **stats 失败运行会毁上一份好 JSONL**：`60a9019` 的 drop-on-error
+    取 create 即 O_TRUNC + Drop unlink——本次 Err 运行不留半成品，但
+    **上一轮成功的 JSONL 也一并销毁**（合同合法「absent」语义）。运维需
+    知晓：报表以最后一次**成功** run 为准；temp+rename 原子替换留作
+    范围决定未做（T8-debt 台账注记同源）。
+  - [ ] **live 测试工装失败路径泄漏**（T5/T6 Minor 转正）：repl live 件
+    失败时容器/DB/temp 目录不清理（成功路径有 EXIT trap）；ctrlc 处理器
+    **进程级单次安装**（同进程二次装配回退默认直杀、130 语义失效——
+    生产单 run 无碍，测试同进程多 run 注意）；`SHOW BINARY LOGS` 第三列
+    8.0 实为 **Encrypted**（恒 None 的 Purged 语义误读已正名，`col_u32`
+    非 panic 通道钉死，列面消费保持）。
+  - [ ] **pipeline/mod.rs 已 2600+ 行**：repl 装配块 ~570 逻辑行可迁
+    `src/repl/assembly.rs`——plan 钉死调用点在 pipeline/mod.rs 故本批
+    未迁（纯搬运、无行为变更，留 P4 或终审裁决）。
+  - [ ] **restart 件的 dup 路径无天然 live 覆盖**：重连续拉实测恒 n==m
+    （无重复段），at-least-once 重复合并面仅由合成钉测
+    `tests/repl.rs::reconcile_dup_shape_synthetic` 独扛——**终审勿把
+    绿 restart 读作 dup 覆盖**（T6 评审注逐字）。
+  - [ ] `parse_blocks` 对**首行 `SET NAMES` 残缺**静默丢弃而非报 torn
+    （T6 fix 轮观察，backlog：语义上是「丢一个必然无 SQL 的头行」，
+    与真 torn 帧的报错口径存在窄缝隙）。
+  - [ ] **心跳帧线形 5.6/5.7 仅验过「SET 被接受」**（T7 收口），**静默
+    窗（idle 真发心跳帧）形态仍 8.0-only**——矩阵窗口皆流量驱动、无
+    idle 段（T0 挂账的残余半面，留 P4 多版本 idle 件）。
+  - [ ] **compat repl 族两口径**（T7 评审 Minor）：跨档 ROTATE 产物差异
+    仅 warn 不判红（files=2 计数闸兜底）；DML 指纹只钉 round-1 前置批
+    （若 1213 类死锁杀在 round1 前置批，会**严格向误红**而非漏红——
+    可接受方向，改口径须重跑矩阵）。
+- [x] ~~P3：repl 模式（另出计划；认证含 caching_sha2）~~——T0–T8 全部
+  完成（本表上方「P3 Task 0–7」节点 + 「P3 DoD 对账」节），caching_sha2
+  与 native 双认证 spike 钉死、8.4 矩阵经 `SHOW BINARY LOG STATUS` 改口
+  通过；待全分支终审合入。
 - [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 4 件——终审 #1
   补第 4 件 `decimal_full_group_overflow.bin`，DECIMAL 满组溢出 repro +
   `tests/fuzz_seed.rs` 构造器/再生通道 FUZZ_SEED_REGEN=1）、影子库端到端回放、

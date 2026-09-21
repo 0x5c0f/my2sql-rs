@@ -1,16 +1,17 @@
 # my2sql-rs
 
-MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / stats），
+MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / stats / repl），
 能力对齐 Go 版 [my2sql](https://github.com/ultradb/my2sql)（本仓库内
 `reference/my2sql-go/` 作为行为参考与差分裁判），但 CLI 全新设计、无 async
-（std::thread + crossbeam-channel）。当前处于 **P2：file 模式 to-sql /
-flashback / stats 三个工作形态已达发布标准**；复制协议模式（repl）在 P3。
+（std::thread + crossbeam-channel）。当前处于 **P3：file 模式 to-sql /
+flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）已达发布
+标准**（flashback/stats × repl 明确不做，见 spec §0）。
 
 ## 功能矩阵
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| `to-sql` file 模式（binlog 目录离线读取） | ✅ | `make compat` 14 用例全绿（= to-sql 族 8 + flashback 族 4 + stats 冒烟 2，逐字结果见 [docs/compat/matrix.md](docs/compat/matrix.md)） |
+| `to-sql` file 模式（binlog 目录离线读取） | ✅ | `make compat` 既有 14 用例全绿（= to-sql 族 8 + flashback 族 4 + stats 冒烟 2；P3 后 `make compat` 整跑为 18 用例 = +repl 族 4，逐字结果见 [docs/compat/matrix.md](docs/compat/matrix.md)） |
 | MySQL 5.6 / 5.7 / 8.0 / 8.4 | ✅ | ROW 格式；full/minimal/noblob 镜像；CRC32/NONE 校验和；V1/V2 rows 事件（V0 硬拒，见下文差异 6） |
 | 在线 schema（`--uri`） | ✅ | mysql://user@host:port；8.4 caching_sha2 与 native 双通过 |
 | 离线 schema 回放（`--schema-file` / `--schema-dump`） | ✅ | 无 DB 可解码；导出→回放逐字节一致（difftest 第 7 步硬闸）；三形态（to-sql/flashback/stats）均消费 `--schema-dump` |
@@ -19,7 +20,7 @@ flashback / stats 三个工作形态已达发布标准**；复制协议模式（
 | 输出形态（`--output-dir/--to-stdout/--file-per-table/--add-extra-info/--no-db-prefix/--full-columns` 等） | ✅ | |
 | `flashback`（反向/回滚 SQL，记录原子逆序 + keep-trx 事务脚手架） | ✅ | Go `-work-type rollback` 裁判差分 4 版本全绿（`flashback-{5.6,5.7,8.0,8.4}`）+ `WORK_TYPE=rollback make difftest` + 活库正逆对账（`tools/flashback-reconcile.sh`）；DDL 反向明确不做（D5） |
 | `stats`（窗口×表 DML 行数 + 大/长事务识别，两报表 + JSONL） | ✅ | `stats-{5.6,8.0}` 冒烟绿（报表 DML 总和 == 同流 to-sql 行数）；上游报表字节面复刻，**不做**裁判差分（spec §3.6，理由见差异 22） |
-| repl 模式（伪装 replica 拉流） | ❌ | P3 |
+| repl 模式（伪装 replica 拉流，to-sql 流式形态） | ✅ | 事务边界 checkpoint + `--resume-file` 接续 + 指数退避自动重连 + 心跳探活（超集四件，见差异 23）；**等价性总闸**：repl 与 file 模式同 binlog 段产出逐字节一致；`make repl-test` live 件 10 项全绿、`make compat` 18 用例（既有 14 + repl×4 版本，逐字见 matrix.md）；**不做**与 Go 裁判差分（上游 repl 不可作裁判，理由见差异 25）；TLS 不提供（差异 26） |
 | DDL 回滚 / `--apply` 直写库 / MariaDB / 8.0.1 default_metadata | ❌ | 明确不做（设计决策 D5） |
 | fuzz 正式接入 / 影子库端到端回放 / musl 静态性能 | ❌ | P4（musl 构建本身已可用，见 docs/bench/p1.md） |
 
@@ -96,6 +97,45 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
 # mysql-bin.000003  2026-09-21_07:30:31 2026-09-21_07:30:31 1605       34706      7        1        0        dt              t_all
 ```
 
+同一区间做**复制协议持续拉流**（repl；形态与 `tests/repl.rs` live 件及
+`tools/compat-matrix.sh` repl 族同款，该套件实测全绿——逐字证据账见
+`docs/HANDOVER.md`「P3 DoD 对账」节；需真实主库，可直接用上面 1)-2) 起的实例）：
+
+```bash
+# 7) repl 首跑：now 哨兵（--start-file ""，= 跑时 SHOW MASTER STATUS 取当前
+#    位点，只看新流量）；checkpoint 自动落 {output-dir}/resume.json（事务边界
+#    原子写）。不给 stop 条件即常驻拉流；Ctrl-C 优雅收尾（exit 130）。
+./target/release/my2sql-rs repl \
+  --binlog-dir /nonused --start-file "" \
+  --uri "mysql://root@127.0.0.1:$PORT" --server-id 9527 \
+  --time-zone +00:00 --output-dir out/repl \
+  --stop-datetime "$(date -u -d '+30 seconds' '+%Y-%m-%d %H:%M:%S')"
+# repl done: events=N, statements=N, files=N, errors=0
+# （--binlog-dir 在 repl 下为 clap 占位——事件字节来自复制流，不读本地文件）
+
+# 8) 中断（含 kill -9）后从 checkpoint 接续：**必须换新的 --output-dir**
+#    （repl 永不 append 既有产物，防覆盖闸见差异 23）；--resume-file 指旧档，
+#    并按位点三态哨兵显式清零（--start-file "" --start-pos 0）。
+./target/release/my2sql-rs repl \
+  --binlog-dir /nonused --start-file "" --start-pos 0 \
+  --uri "mysql://root@127.0.0.1:$PORT" --server-id 9528 \
+  --time-zone +00:00 --output-dir out/repl-2 \
+  --resume-file out/repl/resume.json
+```
+
+- 位点三态互斥（validate 硬错「位点来源歧义」）：now 哨兵
+  `--start-file ""` / `--start-file F [--start-pos P]`（pos 默认 4）/
+  `--start-datetime T`（二分 `SHOW BINARY LOGS` 定位后逐事件过滤）；
+  配 `--resume-file` 时须显式带清零哨兵 `--start-file "" --start-pos 0`
+  （`--start-file` 是 clap 级必填，清零即「无独立 start」，不与 resume 互斥）。
+- `--server-id` 必填无默认（差异 24）；`--heartbeat-secs` 默认 30（0=禁用，
+  连续 2×间隔无事件判死链走重连）；`--resume-file` 与 `--to-stdout` 互斥。
+- 语义 = **每事务至少一次**：崩溃重放最多重复 checkpoint 之后的完整事务，
+  绝不半途切开；重复段可由产物与 `written_files` 名单界定
+  （kill-9 接续零丢失由 live 件 `repl_kill9_resume_zero_loss` 钉死）。
+- 一键回归：`make repl-test`（起一次性 mysql:8.0 容器跑 tests/repl.rs 全部
+  live 件，`VER=5.7 make repl-test` 换版本；单轮实测 10 passed / 0 failed / 476.76s）。
+
 收尾清理：`docker rm -f my2sql-dt-8.0`。
 
 ## 差分测试（正确性底座）
@@ -107,9 +147,13 @@ make difftest   # 7 步：comparator 自检 → 构建 Go 裁判+Rust → mysql:
                 # → 双方各自 to-sql → 语义比较（白名单闸口）→ 离线回放逐字节对差
                 # WORK_TYPE=rollback|stats make difftest → flashback 裁判差分 /
                 #   stats 冒烟配平（同 7 步骨架，产物目录加 -rb/-stats 后缀）
-make compat     # 全版本矩阵 14 用例：5.6/5.7/8.0/8.4 × {差分, checksum 双态,
-                # V1 rows 探针, 8.4 caching_sha2} + flashback×4 + stats 冒烟×2，
+make compat     # 全版本矩阵 18 用例：5.6/5.7/8.0/8.4 × {差分, checksum 双态,
+                # V1 rows 探针, 8.4 caching_sha2} + flashback×4 + stats 冒烟×2
+                # + repl 族×4（repl==file 逐字节等价，无 Go 裁判，见差异 25），
                 # 结果表 docs/compat/matrix.md
+make repl-test  # repl live e2e 套件（一次性 mysql:8.0 容器：等价性总闸、kill-9
+                # 接续、容器重启自动重连、位点三态/stop/心跳、threads>1 水位；
+                # VER=<版本> 换镜像，--test-threads=1 串行）
 make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustfmt
 ```
 
@@ -122,6 +166,8 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
 - 需要 docker。除差分测试（`make difftest`/`make compat`）外不需要 Go 工具链。
 - 吞吐基线：`bash tools/gen-bench-binlog.sh && cargo bench --bench decode`
   （输入缺失或 debug 编译档时 bench 自动跳过，不影响 `cargo test --all-targets`）。
+- `examples/repl_spike.rs` 为 P3 Task 0 协议 spike 的**诊断样例**（throwaway，
+  按裁决保留供排障复跑；`src/` 对其零引用，不参与任何测试/发布链路）。
 
 ## 与上游 Go my2sql 的行为差异（摘录）
 
@@ -203,9 +249,40 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
     冒烟配平（报表 DML 总和 == 同流 to-sql 行数）为准；裁判 stats 输出
     仅作人工对照留档 `out/difftest-*-stats/go-stats/`。
 
+P3（repl）追加：
+
+23. **repl = 对上游 repl 的功能超集（四件）**（P3，spec §8）：
+    ① 事务边界 checkpoint + `--resume-file` 断点接续（at-least-once 语义，
+    `written_files` 审计清单对账）；② 指数退避自动重连（1s→30s 封顶+抖动，
+    无限次；认证/权限/purge/server-id 冲突为终止类硬错）；③ 心跳探活
+    （`--heartbeat-secs`，连续 2×间隔无事件判死链，TCP 半开兜底）；
+    ④ resume 防覆盖闸（自设安全语义：repl 永不 append 既有文件，接续产物
+    永远进新 `--output-dir`，冲突启动即硬错并列出冲突名）——上游
+    `-mode` 断线即 `log.Fatalf` 终，四件全无对应物。
+24. **repl 强制显式 `--server-id`（无默认）**：上游有默认值——同宿主
+    server-id 冲突表现为对端强制断连的静默互踢，我方拒绝代答；另以
+    「连续 3 次同因秒断即终止报错」防无限互踢。
+25. **repl 不做裁判差分**（P3，spec §8）：上游 Go repl 无优雅停止、
+    `log.Fatalf` 即崩、syncer 泄漏、无 checkpoint/重连/心跳，不具备裁判
+    资格——正确性以**内部等价性总闸**替代：同段 binlog 上 repl 与 file
+    模式产出逐字节一致（8.0 主件 + 5.6/5.7/8.0/8.4 矩阵 4/4，
+    `make repl-test`/`make compat` 钉死，逐字见 docs/compat/matrix.md）。
+26. **repl `--uri` 不提供 TLS**：mysql 28.0.2 的 URL 参白名单不含任何 ssl
+    项且未知参数（如 `ssl-mode`）直接硬错（spike 实测）；TLS 需 crate
+    feature + 程序化 SslOpts，P3 不启用，如实登记。
+27. **上游 repl quirk 不继承清单**（P3，spec §8）：`repl.go:96` Fatalf
+    吞错误参数、start-pos 无 table-map 时 `tbMapPos=0`、RawData 丢弃、
+    charset 硬编码 utf8——均采我方 file 模式既有正确行为（与裁判差分
+    同源的解码权威唯一性：repl 事件经 `Event::write` 重建为与磁盘文件
+    逐字节同构的帧后喂同一解码器，零第二解码路径）。
+
 ## 文档
 
 - 设计权威：`docs/superpowers/specs/2026-09-20-my2sql-rust-design.md`
+- P2 设计/计划：`docs/superpowers/specs/2026-09-21-my2sql-rs-p2-flashback-stats-design.md`、
+  `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`
+- P3 repl 设计/计划：`docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`、
+  `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`
 - 进度/决策/白名单台账：[docs/HANDOVER.md](docs/HANDOVER.md)
 - 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)（P1 基线）、
   [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）
