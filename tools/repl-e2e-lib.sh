@@ -14,6 +14,9 @@
 #     值文本只由 (tag, round) 决定、无时钟 → 同参数重复灌流逐字节同构。
 #     tag 是测试的窗口指纹：A 段（stop 前）产物必须含 'Adoc1'/'Atrx5'，
 #     B 段（stop 后）必须不见 'Bdoc1'，回滚垃圾必须不见 'JUNKRB'。
+#   * 单档窗口假设：等价性总闸 / kill9 接续 / mtw 水位各件的断言按「灌流窗口
+#     内不跨 binlog 档」设计（含 f==f0 直断）——master 侧 FLUSH/自发轮转会把
+#     它们打成假红；跨档矩阵归 T7，勿拿本套件的跨档红当缺陷证据。
 #   * 版本自适应（T7 免参数）：seed 探测 SELECT VERSION()——5.6 无 JSON 类型
 #     （json 列降级 LONGTEXT，灌流器只用字符串 JSON 字面量 + 普通 UPDATE，
 #     不触 JSON_* 函数面，两形态共用）；5.7+/8.x 真 JSON 列。

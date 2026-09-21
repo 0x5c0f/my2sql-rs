@@ -219,7 +219,7 @@ impl SchemaStore {
     }
 }
 
-/// `SHOW BINARY LOGS` 单行 → (Log_name, File_size, Purged?)（列按**索引**
+/// `SHOW BINARY LOGS` 单行 → (Log_name, File_size, Encrypted?)（列按**索引**
 /// 读取，5.6 列名一致性不做赌注）。第三列 5.6 镜像不存在、5.7+/8.x 实为
 /// Encrypted 'Yes'/'No' 串形态——best-effort 走 [`col_u32`]：非数值即
 /// None（datetime 二分定位只消费前两列；矩阵复核登记 T7）。

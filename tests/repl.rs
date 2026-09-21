@@ -805,8 +805,15 @@ impl Bt {
     /// 跨重启稳定才谈得上「重连恢复」。
     fn new_pinned(slug: &str, hostport: Option<u16>) -> Bt {
         let sfx = format!("p3t6b{slug}-{}", std::process::id());
+        let ctr = format!("p3e2e-8-0-{sfx}");
         let port_arg = hostport.map(|p| format!(" {p}")).unwrap_or_default();
-        let out = libf(&format!("p3e2e_container_start 8.0 {sfx}{port_arg}"));
+        let call = format!("p3e2e_container_start 8.0 {sfx}{port_arg}");
+        // docker run 成功但后续步骤（如 wait_healthy 超时）失败时 Bt 尚未构造、
+        // 析构 rm -f 不会跑——失败路径显式清容器再上抛 panic（不泄漏容器）。
+        let out = libf_try(&call).unwrap_or_else(|(rc, err)| {
+            let _ = ProcCommand::new("docker").args(["rm", "-f", &ctr]).output();
+            panic!("lib `{call}` rc={rc:?} stderr={err}（ctr {ctr} 已尽力清理）");
+        });
         let uri = out
             .trim_end()
             .lines()
@@ -822,15 +829,8 @@ impl Bt {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).expect("mkdir bt root");
-        eprintln!(
-            "[t6b:{slug}] ctr=p3e2e-8-0-{sfx} uri={uri} root={}",
-            root.display()
-        );
-        Bt {
-            ctr: format!("p3e2e-8-0-{sfx}"),
-            uri,
-            root,
-        }
+        eprintln!("[t6b:{slug}] ctr={ctr} uri={uri} root={}", root.display());
+        Bt { ctr, uri, root }
     }
     fn sub(&self, name: &str) -> std::path::PathBuf {
         let d = self.root.join(name);
@@ -997,6 +997,8 @@ struct Blk {
     start: u32,
     stop: u32,
     dt: String,
+    db: String,
+    tbl: String,
     stmts: Vec<Vec<u8>>,
 }
 
@@ -1012,12 +1014,16 @@ fn parse_blocks(bytes: &[u8]) -> (Vec<Blk>, Option<Vec<u8>>) {
             start: u32::MAX,
             stop: u32::MAX,
             dt: String::new(),
+            db: String::new(),
+            tbl: String::new(),
             stmts: Vec::new(),
         };
         for kv in h.split_whitespace().skip(1) {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
                     "datetime" => b.dt = v.to_string(),
+                    "database" => b.db = v.to_string(),
+                    "table" => b.tbl = v.to_string(),
                     "binlog" => b.binlog = v.to_string(),
                     "startpos" => b.start = v.parse().unwrap_or(u32::MAX),
                     "stoppos" => b.stop = v.parse().unwrap_or(u32::MAX),
@@ -1061,8 +1067,8 @@ fn parse_blocks(bytes: &[u8]) -> (Vec<Blk>, Option<Vec<u8>>) {
 }
 
 /// 目录内全部 .sql（按 binlog 序号升序）拼成的块序列；torn 容忍版（活体轮询
-/// 用：writer 追加瞬间可能读到半行）。返回 (块列, 是否有 torn)。
-fn dir_blocks_tolerant(dir: &Path) -> (Vec<Blk>, bool) {
+/// 用：writer 追加瞬间可能读到半行）。返回 (块列, 末块 torn 原始字节)。
+fn dir_blocks_tolerant(dir: &Path) -> (Vec<Blk>, Option<Vec<u8>>) {
     let mut files: Vec<(u64, std::path::PathBuf)> = Vec::new();
     for e in std::fs::read_dir(dir).expect("read dir") {
         let p = e.expect("entry").path();
@@ -1075,18 +1081,22 @@ fn dir_blocks_tolerant(dir: &Path) -> (Vec<Blk>, bool) {
     }
     files.sort();
     let mut v = Vec::new();
-    let mut torn = false;
+    let mut torn: Option<Vec<u8>> = None;
     for (_, p) in files {
         let (mut b, t) = parse_blocks(&std::fs::read(&p).expect("read sql"));
         v.append(&mut b);
-        torn |= t.is_some();
+        torn = torn.or(t);
     }
     (v, torn)
 }
 
 fn dir_blocks(dir: &Path) -> Vec<Blk> {
     let (v, torn) = dir_blocks_tolerant(dir);
-    assert!(!torn, "对照/基准目录不得有 torn 块: {}", dir.display());
+    assert!(
+        torn.is_none(),
+        "对照/基准目录不得有 torn 块: {}",
+        dir.display()
+    );
     v
 }
 
@@ -1101,13 +1111,17 @@ fn first_blk_with(bs: &[Blk], pat: &[u8]) -> Option<usize> {
 }
 
 /// 通用「不间断基准 vs 中断产物」对齐求解器：merged = SB[..j] ++ SB[i..]
-/// （i ≤ j：i..j 为回绕重复段）。返回 (j, i, 重复块)。等值退化 (n, n)。
+/// （i ≤ j：i..j 为回绕重复段，重复长恒 = n-m，j 选回绕位）。返回 (j, i, 重复块)。
+/// 等值退化 (n, n)。语义为**整块**等值：半事务字节流级重放不在解空间内，
+/// 落入分歧 panic 臂 = 总闸按设计拒绝（writer 只在事务界重放，故非缺陷面）。
 fn reconcile(merged: &[Blk], sb: &[Blk]) -> (usize, usize, Vec<Blk>) {
     let (n, m) = (merged.len(), sb.len());
     assert!(m > 0, "基准不得为空（假绿禁止）");
     assert!(n >= m, "产物块数 {n} < 基准 {m} = 有事件缺失（零缺失违背）");
-    let mut best: Option<(usize, usize)> = None; // (dup 最小 = j 最大)
-    for j in (0..=n).rev() {
+    let mut best: Option<(usize, usize)> = None; // dup 长恒 = n-m；j 只选回绕位（取最大合法解）
+    // 上界 min(n,m)：j>m 时 `sb[..j]` 越界（n>m 恰是重连 dup 常态——T6
+    // review fix 1，合成件 reconcile_dup_shape_synthetic 钉死）。
+    for j in (0..=n.min(m)).rev() {
         let i = m as isize - (n - j) as isize;
         if i < 0 || i > j as isize {
             continue;
@@ -1168,14 +1182,49 @@ fn merge_reconcile(merged_dir: &Path, base_dir: &Path) -> (Vec<Blk>, Vec<Blk>, u
     let sb = dir_blocks(base_dir);
     let mb = dir_blocks(merged_dir);
     let (j, i, dup) = reconcile(&mb, &sb);
-    assert_eq!(
-        mb.len(),
-        j + sb.len() - i,
-        "reconcile 形状自检（merged={} j={j} i={i} base={}）",
-        mb.len(),
-        sb.len()
-    );
+    // 形状恒等式 n = j + m - i 由 reconcile 的解定义 (i = m-(n-j)) 代数兑现，
+    // 作为断言是空转——dup 语义的真钉子外移至合成件
+    // reconcile_dup_shape_synthetic（T6 review fix 1/2）。
     (sb, dup, i, j)
+}
+
+/// 合成 dup 件（非 live）：merged 比基准**长**（重连整事务回绕重复，n > m）
+/// 时 reconcile 必须解出 (j, i, dup=sb[i..j]) 而非越界 panic——循环上界若
+/// 用 n，`sb[..j]` 在首个迭代 j=n>m 即 slice index out of range（T6 review
+/// 实锤的 Important）。dup 形态为**整块**重复：块内（半事务字节流）重放在
+/// 整块等值语义下不可表达，会走 reconcile 的分歧 panic 臂 = 总闸正确拒绝。
+fn synth_blk(tag: &str) -> Blk {
+    Blk {
+        binlog: "mysql-bin.000001".into(),
+        start: 4,
+        stop: 8,
+        dt: "1970-01-01_00:00:00".into(),
+        db: "synth".into(),
+        tbl: "t".into(),
+        stmts: vec![format!("INSERT INTO t VALUES ('{tag}');\n").into_bytes()],
+    }
+}
+
+#[test]
+fn reconcile_dup_shape_synthetic() {
+    let sb: Vec<Blk> = (0..10u32).map(|k| synth_blk(&format!("b{k}"))).collect();
+    let (m, i, j) = (sb.len(), 4usize, 7usize);
+    // merged = SB[..j] ++ SB[i..]：回绕重复段 = sb[i..j]（3 块）
+    let mut mb: Vec<Blk> = sb[..j].to_vec();
+    mb.extend_from_slice(&sb[i..]);
+    assert!(mb.len() > m, "合成件前提：dup 非空即 n > m");
+    let (rj, ri, dup) = reconcile(&mb, &sb);
+    assert_eq!((rj, ri), (j, i), "回绕点须唯一解出（块值互异）");
+    assert_eq!(dup, sb[i..j], "dup 必须正是基准 [i..j) 段");
+    // 等值退化（n == m）：(m, m) + 空 dup
+    let (ej, ei, edup) = reconcile(&sb, &sb);
+    assert_eq!((ej, ei), (m, m));
+    assert!(edup.is_empty());
+    // 非 dup 形态（内容分歧）仍须红：把回绕后缀换成别的内容
+    let mut bad = mb.clone();
+    bad[mb.len() - 1] = synth_blk("zzz");
+    let r = std::panic::catch_unwind(|| reconcile(&bad, &sb));
+    assert!(r.is_err(), "不可对齐形态必须 panic（假绿禁止）");
 }
 
 /// 抢一个瞬空端口给钉死映射用（绑定即释，race 窗口可忽略——单跑串行）。
@@ -1411,7 +1460,9 @@ fn repl_kill9_resume_zero_loss() {
 
     // ── (d) 两段合并 vs 基准：零缺失 + 重复=单一在飞事务前缀且可列出 ──
     let sb = dir_blocks(&d3);
-    let s1 = dir_blocks(&d1);
+    // seg1 走 tolerant 口：writer 行原子刷盘，torn 末块只可能是 kill 与
+    // write 同刻相撞的残行——残行出现即须逐字节核验（不是删掉的死分支）。
+    let (s1, torn1) = dir_blocks_tolerant(&d1);
     let s2 = dir_blocks(&d2);
     assert!(sb.len() > 50, "基准块数过少（{}）疑流量未进窗", sb.len());
     let iw = first_blk_with(&sb, b"'W1',").expect("基准必含 bigtrx 首块");
@@ -1429,21 +1480,20 @@ fn repl_kill9_resume_zero_loss() {
     for k in 0..s1.len() {
         assert_eq!(s1[k], sb[k], "seg1 块 {k} 与基准分歧（前缀性破坏）");
     }
-    let n_torn = {
-        let f = std::fs::read_dir(&d1)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| p.extension().is_some_and(|x| x == "sql"))
-            .expect("seg1 sql");
-        let (b, t) = parse_blocks(&std::fs::read(&f).unwrap());
-        assert_eq!(b.len(), s1.len());
-        if let Some(torn) = &t {
-            // torn 块必须是基准下一块的字节前缀（且仍是 W 事务内部）
-            let expect = dir_bytes_of_block(&sb[s1.len()]);
+    let n_torn = match &torn1 {
+        Some(torn) => {
+            // torn 块必须是基准下一块的字节前缀（头行含真 db/table 的忠实
+            // 重建比对，dir_bytes_of_block）；该下一块仍是 W 事务内部块
+            // ⇒ torn 落在 bigtrx 流内的判定由前缀关系一并兑现。
+            let nb = sb
+                .get(s1.len())
+                .expect("torn 末块在基准必须有下一块（seg1 不得越写）");
+            let expect = dir_bytes_of_block(nb);
             assert!(expect.starts_with(torn), "torn 块非基准块字节前缀");
-            assert!(blk_has_raw(torn, b"'W"));
+            assert!(blk_has(nb, b"'W"), "torn 对应基准块须为 bigtrx 块");
+            true
         }
-        t.is_some()
+        None => false,
     };
     // seg2 = 基准自水位起点的完整后缀（resume 从边界重放 = 全等）
     let i = sb.iter().position(|b| b.start >= cp.pos).expect("后缀起点");
@@ -1508,10 +1558,12 @@ fn blk_has_raw(bytes: &[u8], pat: &[u8]) -> bool {
     bytes.windows(pat.len()).any(|w| w == pat)
 }
 
+/// 块 → Writer 原始字节忠实重建（头行格式与 src/output.rs 逐字段对齐：
+/// 真 database/table，非占位串——torn 前缀核验用）。
 fn dir_bytes_of_block(b: &Blk) -> Vec<u8> {
     let mut v = format!(
-        "# datetime={} database=x table=y binlog={} startpos={} stoppos={}\n",
-        b.dt, b.binlog, b.start, b.stop
+        "# datetime={} database={} table={} binlog={} startpos={} stoppos={}\n",
+        b.dt, b.db, b.tbl, b.binlog, b.start, b.stop
     )
     .into_bytes();
     for s in &b.stmts {
