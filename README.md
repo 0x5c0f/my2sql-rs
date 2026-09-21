@@ -130,8 +130,9 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   配 `--resume-file` 时须显式带清零哨兵 `--start-file "" --start-pos 0`
   （`--start-file` 是 clap 级必填，清零即「无独立 start」，不与 resume 互斥）。
 - `--server-id` 必填无默认（差异 24）；`--heartbeat-secs` 默认 30（0=禁用，
-  连续 2×间隔无事件判死链走重连；空闲 master 上 Ctrl-C/stop 的停泵延迟以
-  心跳周期为界——**0 同时禁用死链探测与空闲期即时中断**）；
+  连续 2×间隔无事件判死链走重连；空闲 master 上 Ctrl-C 停泵延迟以心跳周期
+  为界——**0 同时禁用死链探测与空闲期即时中断**；`--stop-datetime`/
+  `--stop-pos` 仍需等下一个真实事件才判定）；
   `--resume-file` 与 `--to-stdout` 互斥。
 - 输出目标必须显式（终审 FIX F）：`--output-dir` 与 `--to-stdout` 二选一，
   两者皆缺启动即拒——**repl 绝不写当前工作目录**；`--resume-file` 恒需
