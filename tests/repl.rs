@@ -367,3 +367,335 @@ fn repl_refuses_purged_start() {
     );
     std::fs::remove_dir_all(&out).ok();
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// P3 T6a：等价性总闸（spec §7-1）——repl 无 Go 裁判（§8），「repl 流 ≡
+// file 模式同段重跑，逐字节」**就是**正确性权威本身。
+//
+// 编排（全量复用 tools/repl-e2e-lib.sh，T7 矩阵同一对函数）：
+//   1. seed_schema（t_doc 含 JSON+BLOB、t_ord）——DDL 全部落在窗口之前；
+//   2. 原子 SHOW MASTER STATUS 取 (f0,p0) → 灌混合 DML 段 A（3 轮：双表
+//      insert/update/delete + 10 行显式事务 + 回滚事务 + JSON/BLOB/中文值）
+//      → 再取 (f1,p1) → 灌段 B（stop 之后的流量，两侧必须均不可见）；
+//   3. repl 子进程：显式 file+pos 起止（不用 stop-datetime——安静主库的
+//      事件驱动收尾在本件无须冒险，钉死显式位点窗口）；
+//   4. docker cp 取 [f0..f1] 区段 binlog → 同窗同旗标跑 to-sql 子进程；
+//   5. 比较器 = 双侧全部 .sql **原始字节逐一相等** + 文件名集合相等 +
+//      系统 `diff -r -x resume.json` rc=0 双保险。选项对平由「同一 window
+//      参数组拼两侧 argv」结构性保证（--dml 双侧同为缺省全量、
+//      --add-extra-info 双侧同开、--db 同名单；--server-id/--heartbeat-secs
+//      为 repl 独有且只触传输层，不入产物字节）。
+//      若两侧有差 = 真缺陷——不削弱比较器、不加排除项，diff 原文上报。
+//
+// 跑法：`make repl-test`（lib 起唯一名容器 + EXIT trap 清场，导出
+// MY2SQL_TEST_URI / MY2SQL_TEST_CTR）。产物留档：MY2SQL_T6_KEEP=<dir>
+// 把整个工作目录（repl/ file/ bins/）拷入该路径。
+// ────────────────────────────────────────────────────────────────────────────
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::{Command as ProcCommand, Stdio};
+
+/// source 正交件并调一个函数（灌流器/取段与 T7 矩阵同源同码）。
+fn libf(call: &str) -> String {
+    let lib = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/repl-e2e-lib.sh");
+    let out = ProcCommand::new("bash")
+        .arg("-c")
+        .arg(format!("set -euo pipefail; source '{lib}'; {call}"))
+        .output()
+        .unwrap_or_else(|e| panic!("spawn bash for `{call}`: {e}"));
+    assert!(
+        out.status.success(),
+        "lib `{call}` rc={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("lib stdout utf8")
+}
+
+/// 原子位点：一条 SHOW MASTER STATUS 同回 File+Position（8.4 1064 →
+/// SHOW BINARY LOG STATUS，与 src/metadata/store.rs 同臂）。
+fn master_pos(conn: &mut mysql::Conn) -> (String, u32) {
+    let mut rows: Vec<mysql::Row> = match conn.query("SHOW MASTER STATUS") {
+        Ok(r) => r,
+        Err(mysql::Error::MySqlError(m)) if m.code == 1064 => conn
+            .query("SHOW BINARY LOG STATUS")
+            .expect("8.4 SHOW BINARY LOG STATUS"),
+        Err(e) => panic!("SHOW MASTER STATUS: {e}"),
+    };
+    let row = rows
+        .pop()
+        .expect("SHOW MASTER STATUS returns exactly one row (log-bin on)");
+    let file: String = row.get(0).expect("File column");
+    let pos: u64 = row.get(1).expect("Position column");
+    (file, pos as u32)
+}
+
+/// 跑 my2sql-rs 二进制（真 CLI 面 = 产品路径），带硬超时防静默挂死。
+fn run_bin(args: &[&str], label: &str, deadline: Duration) -> std::process::Output {
+    let mut child = ProcCommand::new(env!("CARGO_BIN_EXE_my2sql-rs"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("[{label}] spawn: {e}"));
+    let t0 = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .unwrap_or_else(|e| panic!("[{label}] try_wait: {e}"))
+            .is_some()
+        {
+            break;
+        }
+        if t0.elapsed() > deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("[{label}] {args:?} exceeded {deadline:?}（stop 未到点？）");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("[{label}] collect: {e}"));
+    eprintln!(
+        "[{label}] rc={:?} stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// 目录内全部 .sql（名字 → 原始字节）。resume.json 等非 .sql 天然不在集合
+/// （repl 侧独有的 checkpoint 产物，file 侧无对应物——比较器只钉 SQL 面）。
+fn sql_map(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut m = BTreeMap::new();
+    for e in std::fs::read_dir(dir).unwrap_or_else(|er| panic!("read {}: {er}", dir.display())) {
+        let p = e.expect("dir entry").path();
+        if p.extension().is_some_and(|x| x == "sql") {
+            let name = p
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            let old = m.insert(name, std::fs::read(&p).expect("read sql"));
+            assert!(old.is_none(), "重复 .sql 名不应存在");
+        }
+    }
+    m
+}
+
+/// 首个差异字节偏移 + 双上下文摘录（红例上报用，禁虚账）。
+fn diff_report(name: &str, a: &[u8], b: &[u8]) -> String {
+    let off = a
+        .iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.len().min(b.len()));
+    let win = |s: &[u8]| {
+        let lo = off.saturating_sub(40);
+        String::from_utf8_lossy(&s[lo..s.len().min(off + 40)]).into_owned()
+    };
+    format!(
+        "{name}: 字节漂移 @offset {off} (repl len={}, file len={})\n  repl 上下文: {:?}\n  file 上下文: {:?}",
+        a.len(),
+        b.len(),
+        win(a),
+        win(b)
+    )
+}
+
+#[test]
+#[ignore = "requires live mysql container (make repl-test): MY2SQL_TEST_URI + MY2SQL_TEST_CTR"]
+fn repl_stream_equals_file_mode_byte_for_byte() {
+    let uri = live_uri();
+    let ctr = std::env::var("MY2SQL_TEST_CTR")
+        .expect("MY2SQL_TEST_CTR required（binlog docker cp 的容器名；make repl-test 自动导出）");
+    let db = "p3t6eq".to_string();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("my2sql-p3t6eq-{nanos}"));
+    for d in ["repl", "file", "bins"] {
+        std::fs::create_dir_all(root.join(d)).expect("mkdir work dirs");
+    }
+
+    // panic 也必须清场（db + 临时目录；容器由 make 的 EXIT trap 负责）——
+    // 失败现场先落 KEEP 路径或原地保留并打印，绝不静默蒸发。
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<String> {
+        let mut notes = Vec::new();
+        let repl_out = root.join("repl");
+        let file_out = root.join("file");
+        let bins = root.join("bins");
+        let mut conn = mysql::Conn::new(uri.as_str()).expect("live connect");
+        libf(&format!("p3e2e_seed_schema {ctr} {db}"));
+        let (f0, p0) = master_pos(&mut conn);
+        libf(&format!("p3e2e_feed_mixed {ctr} {db} 3 A"));
+        let (f1, p1) = master_pos(&mut conn);
+        libf(&format!("p3e2e_feed_mixed {ctr} {db} 1 B"));
+        assert_eq!(f0, f1, "本件窗口须在同一 binlog（矩阵跨档件归 T6b/T7）");
+        assert!(p1 > p0, "窗口必须前进：{f0}:{p0} .. {f1}:{p1}");
+
+        // ── 双侧共用的窗口/过滤/文本旗标组（对平=结构性，不靠人肉对齐）──
+        let window: Vec<String> = vec![
+            "--uri".into(),
+            uri.clone(),
+            "--start-file".into(),
+            f0.clone(),
+            "--start-pos".into(),
+            p0.to_string(),
+            "--stop-file".into(),
+            f1.clone(),
+            "--stop-pos".into(),
+            p1.to_string(),
+            "--db".into(),
+            db.clone(),
+            "--add-extra-info".into(),
+        ];
+        let sid = (4260 + std::process::id() % 1000).to_string();
+        let (ro, fo, bd) = (
+            repl_out.to_str().unwrap(),
+            file_out.to_str().unwrap(),
+            bins.to_str().unwrap(),
+        );
+
+        let mut repl_args: Vec<&str> = vec!["repl", "--binlog-dir", "/nonused"];
+        repl_args.extend(window.iter().map(String::as_str));
+        repl_args.extend([
+            "--output-dir",
+            ro,
+            "--server-id",
+            &sid,
+            "--heartbeat-secs",
+            "10",
+        ]);
+        let r = run_bin(&repl_args, "repl", Duration::from_secs(150));
+        assert!(r.status.success(), "repl 须 exit 0（stderr 见上）");
+        let rsum = String::from_utf8_lossy(&r.stdout).into_owned();
+        assert!(
+            rsum.contains("repl done") && rsum.contains("errors=0"),
+            "repl 摘要须含 done+零错误: {rsum}"
+        );
+
+        libf(&format!("p3e2e_capture_binlogs {ctr} {f0} {f1} {bd}"));
+        let mut file_args: Vec<&str> = vec!["to-sql", "--binlog-dir", bd];
+        file_args.extend(window.iter().map(String::as_str));
+        file_args.extend(["--output-dir", fo]);
+        let f = run_bin(&file_args, "to-sql", Duration::from_secs(150));
+        assert!(f.status.success(), "file 模式须 exit 0");
+        let fsum = String::from_utf8_lossy(&f.stdout).into_owned();
+        assert!(
+            fsum.contains("to-sql done") && fsum.contains("errors=0"),
+            "file 摘要须含 done+零错误: {fsum}"
+        );
+
+        // ── 总闸：同窗同旗标，两路 .sql 逐字节 ──
+        let a = sql_map(&repl_out);
+        let b = sql_map(&file_out);
+        assert_eq!(
+            a.keys().collect::<Vec<_>>(),
+            b.keys().collect::<Vec<_>>(),
+            "文件名单集合须一致（命名族 to_sql.[db.table.]N.sql，N=binlog 序号）"
+        );
+        assert!(!a.is_empty(), "双侧不得同为空（假绿禁止）");
+        let mut total = 0usize;
+        for name in a.keys() {
+            let (x, y) = (&a[name], &b[name]);
+            total += x.len();
+            println!("  {name}: repl={}B file={}B", x.len(), y.len());
+            assert!(
+                x.starts_with(b"SET NAMES utf8mb4;\n"),
+                "{name} 缺 SET NAMES 头"
+            );
+            if x != y {
+                notes.push(diff_report(name, x, y));
+            }
+        }
+        println!(
+            "== T6a 等价性总闸: {} 文件 / {total}B 逐字节比对 ==",
+            a.len()
+        );
+        assert!(total > 1000, "产物过小（{total}B）疑未灌到流量");
+
+        // 系统 diff -r 复验（公共口径镜像；唯一排除项 resume.json =
+        // repl 独有 checkpoint，非 SQL 产物，不构成内容豁免）
+        let d = ProcCommand::new("diff")
+            .args(["-r", "-x", "resume.json", ro, fo])
+            .output()
+            .expect("spawn diff");
+        assert!(
+            d.status.success(),
+            "diff -r 非干净: stdout={}",
+            String::from_utf8_lossy(&d.stdout)
+        );
+        println!("  diff -r -x resume.json repl/ file/ → clean (rc=0)");
+
+        // ── 内容反空闸：混合 DML 各形态必须真实进窗（防「同为空」假绿）──
+        let text: String = b
+            .values()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
+        let markers: Vec<String> = vec![
+            format!("INSERT INTO `{db}`."),
+            format!("UPDATE `{db}`."),
+            format!("DELETE FROM `{db}`."),
+            "Adoc1".into(),          // 段 A 首轮（JSON+BLOB+中文行）
+            "Atrx5".into(),          // 多行事务成员
+            "0x00FF10DE2AD0".into(), // BLOB 十六进制渲染
+            "中文".into(),           // utf8mb4 透传
+            r#"{\"r\":1,"#.into(),   // JSON 文本形态（8.0 归一化+SQL 转义后）
+        ];
+        for marker in &markers {
+            assert!(
+                text.contains(marker.as_str()),
+                "产物必须含混合 DML 指纹 {marker:?}"
+            );
+        }
+        for forbidden in ["Bdoc1", "Btrx1", "JUNKRB", "Blast"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} 不得入产（stop 后流量/回滚事务泄漏）"
+            );
+        }
+        assert!(
+            repl_out.join("resume.json").is_file(),
+            "repl 终档 checkpoint 应在场（非 SQL 产物，不入比对）"
+        );
+        println!("窗口 {f0}:{p0} .. {f1}:{p1}；repl 摘要 {rsum}；file 摘要 {fsum}");
+        notes
+    }));
+
+    // ── 无论成败先清场 ──
+    let failed = body.is_err();
+    let keep = std::env::var("MY2SQL_T6_KEEP").unwrap_or_default();
+    if !keep.is_empty() {
+        std::fs::create_dir_all(&keep).ok();
+        let st = ProcCommand::new("cp")
+            .arg("-r")
+            .args([root.to_str().unwrap(), keep.as_str()])
+            .status();
+        println!(
+            "T6_KEEP: 现场已拷入 {keep}/ (spawn rc={st:?})，工作目录 {}",
+            root.display()
+        );
+    }
+    if !failed && keep.is_empty() {
+        std::fs::remove_dir_all(&root).ok();
+    } else if keep.is_empty() {
+        eprintln!("T6a 失败现场保留于 {}", root.display());
+    }
+    if let Ok(mut c) = mysql::Conn::new(uri.as_str()) {
+        c.query_drop(format!("DROP DATABASE IF EXISTS {db}")).ok();
+    }
+    let notes = match body {
+        Ok(n) => n,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    assert!(
+        notes.is_empty(),
+        "等价性总闸红例（真缺陷，不削弱比较器）:\n{}",
+        notes.join("\n")
+    );
+}
