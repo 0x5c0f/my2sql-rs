@@ -843,6 +843,43 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   run-difftest 须保持 7 步契约；gen-data.sql 改动必须同步 gen-data-5.6.sql
   （文件头已钉注释）；8.4/5.6 镜像已在本机（后续无需再拉）。
 
+### P2 Task 1: sqlopen 语义反转（WorkKind + 逆向 UPDATE + 完整性硬规则）
+
+- 做了什么：`src/sqlopen/dml.rs` 新增 `pub enum WorkKind { ToSql, Flashback }`
+  （`Debug, Clone, Copy, Default(#[default]=ToSql), PartialEq, Eq`）、
+  `DmlBuilder` 增 `kind` 字段与构造器 `DmlBuilder::flashback(opts)` /
+  访问器 `kind()`、统一分派入口 `dml_for(RowsKind, tm, s, rows)`
+  （Flashback 下 Write↔Delete 互换、Update 透传）；`updates()` 按 kind
+  镜像取位（SET=before/WHERE=after，签名不变，正向逐字节不变）；两条
+  完整性硬规则——a) `plan()` 中 Flashback 遇 `Align::Padded` 由 warn 升级
+  为 `SqlError::Value(BinlogError::InvalidData)`（消息含 `flashback`，
+  对齐上游 events.go:87 fail-hard）；b) `cell()` 中 Flashback 命中
+  `ColumnValue::Missing` → InvalidData 并提示 `binlog_row_image=FULL`。
+  模块头补「P2 反转口径」文档段。
+- **实现钉死口径（T2/T3/T4 消费）**：`WorkKind`、`DmlBuilder::{new,flashback,
+  kind}`、`dml_for` 签名与分派表（简报原文）；`opts()/inserts/deletes/updates`
+  不变；`DmlBuilder::default()` 仍 = ToSql（worker.rs 既有测试零改动）。
+- **简报对账（Step 6 测试 vs Step 7 代码片段）**：Step 7 的 `cell()` 闸门只在
+  被访问列触发，而 Flashback `deletes()` 的 WHERE 仅触键列——测试
+  `flashback_missing_value_error_hints_row_image_full` 要求非键位 Missing 也
+  报错，故补 `deletes()` 入口的 Flashback 整行预检（对 `p.cols` 逐列过
+  `cell()`），`inserts/updates` 天然逐列访问无需预检。行为以钉死测试为准。
+- **门禁偏差登记**：Step 7 手写 `impl Default for WorkKind` 触
+  `clippy::derivable_impls`（-D warnings 硬闸），改为
+  `#[derive(Default)] + #[default] ToSql`——语义逐字等价（Default=ToSql）。
+- 上游对照：`-work-type` rollback 分派 `base/context.go:186` +
+  `base/events.go:62`、出货面 `base/rollback_process.go`；SQL 生成面对照
+  `base/sqlgen.go` `ifRollback` 形参（:137/:237/:288）与包装 :233/:284。
+  不继承上游「JSON 恒进 SET」quirk（spec §3.1，正反向着皆然，本侧按实际
+  diff；ALW-JSON-IN-SET 白名单容忍裁判多出项），测试
+  `flashback_update_unchanged_json_not_in_set` 钉死。
+- 测试：TDD 三轮 RED→GREEN（dml_for 分派 / updates 反转细节 / 两硬规则），
+  dml.rs 22→27 测试；全量 `cargo test` 绿、clippy -D warnings 净、fmt 净。
+- 遗留/对后续影响：`dml_for` 是 T3 worker 唯一入口（现 worker 仍直调
+  inserts/deletes/updates，T3 切换）；Padded 硬规则使 flashback 对「中途
+  DROP COLUMN」矩阵场景整事件报错（宁缺毋漏口径，T6/T7 差分需按此归入
+  错误计数而非输出差集）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

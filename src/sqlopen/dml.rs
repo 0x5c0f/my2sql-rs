@@ -36,10 +36,27 @@
 //!   即默认一行一语句，`None`→1）。
 //! - **Missing 值**（裁定 3）：唯一来源是 8.0.1 partial rows，T10 decode_rows
 //!   已在解码层拒收——值位置命中即 InvalidData 硬错误（防御性，非出货路径）。
+//!
+//! **P2 反转口径**（`WorkKind::Flashback`，上游对照 `base/sqlgen.go` 的
+//! `ifRollback` 形参：:137/:237/:288 与包装 :233/:284、调用面
+//! `base/events.go` 的 rollback 分支）：
+//! - `dml_for` 为事件→SQL 唯一分派入口：Flashback 下 Write↔Delete 互换
+//!   （INSERT 事件出 DELETE、DELETE 事件出 INSERT），UPDATE 复用 `updates()`
+//!   签名、镜像取位 SET=before / WHERE=after（正向 ToSql 与 P1 逐字节一致）。
+//! - 硬规则 a（宁缺毋漏）：`Align::Padded`（dropped 列 → 旧镜像不可靠）在
+//!   Flashback 下从 warn 升级为逐事件 InvalidData——对齐上游
+//!   `events.go:87` fail-hard；正向分支不变。
+//! - 硬规则 b：任意可引用列 `Missing`（MINIMAL row image/partial）在
+//!   Flashback 下报 InvalidData 并提示 `binlog_row_image=FULL`——`cell()`
+//!   闸门 + `deletes()` 整行预检（其 WHERE 仅触键列，须显式扫全行）。
+//! - **不继承**上游「JSON 列恒进 SET」quirk（spec §3.1；上游 GenUpdateSetPart
+//!   对 decoded JSON 的 []byte 断言失败 → 未变化 JSON 也入 SET，正反向着
+//!   皆然）：本侧正/逆向均按实际 diff 省略未变化 JSON 列，差分白名单
+//!   ALW-JSON-IN-SET 容忍裁判多出的 JSON 项。
 
 use crate::binlog::error::BinlogError;
 use crate::binlog::int::ColumnValue;
-use crate::binlog::rows::Row;
+use crate::binlog::rows::{Row, RowsKind};
 use crate::binlog::table_map::TableMapEvent;
 use crate::config::Config;
 use crate::metadata::schema::{Align, TableSchema, align_cols, key_indexes};
@@ -97,12 +114,23 @@ impl SqlOpts {
     }
 }
 
+/// 工作模式：正向（P1）或回滚反转（P2）。上游对照 `-work-type`
+/// （`base/context.go:186`；rollback 分派 `base/events.go:62`、出货面
+/// `base/rollback_process.go`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkKind {
+    #[default]
+    ToSql,
+    Flashback,
+}
+
 /// 无状态构建器（opts 之外零共享；`..,` 简写在简报接口块的含义 = 与
 /// inserts/deletes 一致的三参数 tm/schema/rows，内部状态仅 opts + 每事件
 /// 现算的 align/键计划，不跨事件缓存——文档化于报告）。
 #[derive(Debug, Clone, Default)]
 pub struct DmlBuilder {
     opts: SqlOpts,
+    kind: WorkKind,
 }
 
 /// 每事件计算结果：可入 SQL 的列序号 + 键序号 + WHERE 序号 + 表名。
@@ -116,8 +144,37 @@ struct Plan<'a> {
 }
 
 impl DmlBuilder {
+    /// 正向构建器（P1 行为，零改动）。
     pub fn new(opts: SqlOpts) -> Self {
-        Self { opts }
+        Self {
+            opts,
+            kind: WorkKind::ToSql,
+        }
+    }
+    /// P2 回滚构建器：语义反转（INSERT↔DELETE、UPDATE 的 SET/WHERE 镜像）。
+    pub fn flashback(opts: SqlOpts) -> Self {
+        Self {
+            opts,
+            kind: WorkKind::Flashback,
+        }
+    }
+    pub fn kind(&self) -> WorkKind {
+        self.kind
+    }
+    /// 事件种类 → 逆向/正向 SQL 的统一分派（T3 worker 唯一入口）。
+    pub fn dml_for(
+        &self,
+        kind: RowsKind,
+        tm: &TableMapEvent,
+        s: &TableSchema,
+        rows: &[Row],
+    ) -> Result<Vec<String>, SqlError> {
+        use RowsKind::*;
+        match (kind, self.kind) {
+            (Write, WorkKind::ToSql) | (Delete, WorkKind::Flashback) => self.inserts(tm, s, rows),
+            (Delete, WorkKind::ToSql) | (Write, WorkKind::Flashback) => self.deletes(tm, s, rows),
+            (Update, _) => self.updates(tm, s, rows),
+        }
     }
 
     pub fn opts(&self) -> &SqlOpts {
@@ -132,6 +189,16 @@ impl DmlBuilder {
         // 序号 < min(schema宽, binlog宽)。
         let align = align_cols(tm.n_cols, s, self.opts.strict_schema)?;
         if let Align::Padded { dropped } = &align {
+            // 硬规则 a（P2）：Flashback 下 dropped 列 = 旧镜像不完整，回滚
+            // 宁缺毋漏 → 错误而非告警（对齐上游 events.go:87 fail-hard）。
+            if self.kind == WorkKind::Flashback {
+                return Err(BinlogError::InvalidData(format!(
+                    "flashback: dropped columns in `{}`.`{}` make old row images \
+                     unreliable — refusing to emit partial rollback",
+                    s.db, s.table
+                ))
+                .into());
+            }
             tracing::warn!(
                 table = %format!("`{}`.`{}`", s.db, s.table),
                 dropped = ?dropped,
@@ -177,7 +244,8 @@ impl DmlBuilder {
     }
 
     /// 行值取位：decode_rows 不变式 `row.cols.len() == tm.n_cols`（T10），
-    /// 违背视为调用方 bug → 硬错误；Missing 不在此拦截、由 encode_value 判定。
+    /// 违背视为调用方 bug → 硬错误；Missing 正向不在此拦截、由 encode_value
+    /// 判定；Flashback 下 Missing 命中硬规则 b（见下）。
     fn cell<'r>(
         &self,
         row: &'r Row,
@@ -192,9 +260,19 @@ impl DmlBuilder {
             ))
             .into());
         }
-        row.cols.get(ord).ok_or_else(|| {
-            BinlogError::InvalidData(format!("column ordinal {ord} out of range")).into()
-        })
+        let v = row.cols.get(ord).ok_or_else(|| {
+            BinlogError::InvalidData(format!("column ordinal {ord} out of range"))
+        })?;
+        // 硬规则 b（P2）：Flashback 下 Missing（MINIMAL row image / partial）
+        // 进 WHERE/VALUES 必产坏回滚 SQL → 报错并提示需 FULL 镜像。
+        if self.kind == WorkKind::Flashback && matches!(v, ColumnValue::Missing) {
+            return Err(BinlogError::InvalidData(format!(
+                "flashback: column ordinal {ord} missing (MINIMAL row image); \
+                 requires binlog_row_image=FULL"
+            ))
+            .into());
+        }
+        Ok(v)
     }
 
     /// WHERE 单项：NULL → `col IS NULL`（镜像 expression.go:441-447），否则 `col=lit`。
@@ -283,6 +361,16 @@ impl DmlBuilder {
         rows: &[Row],
     ) -> Result<Vec<String>, SqlError> {
         let p = self.plan(tm, s)?;
+        // 硬规则 b 补全（P2，简报 Step 6 测试钉死）：Flashback 下 WHERE 仅触
+        // 键列，但任意可引用列 Missing 即证行镜像不完整（MINIMAL/partial）→
+        // 整行预检，宁缺毋漏。inserts/updates 天然逐列过 cell()，无需此扫描。
+        if self.kind == WorkKind::Flashback {
+            for r in rows {
+                for &ord in &p.cols {
+                    self.cell(r, tm, ord)?;
+                }
+            }
+        }
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             out.push(format!(
@@ -295,7 +383,8 @@ impl DmlBuilder {
     }
 
     /// UPDATE：rows 为 decode_rows 的交错对 `[before,after,…]`；一行对一语句。
-    /// SET = 变化列（full_columns 时全列）；WHERE = before 镜像键值。
+    /// 正向：SET = 变化列（full_columns 时全列）取 after、WHERE = before 镜像键值。
+    /// Flashback：镜像反转 —— SET 取 before、WHERE 取 after（签名不变）。
     pub fn updates(
         &self,
         tm: &TableMapEvent,
@@ -313,9 +402,16 @@ impl DmlBuilder {
         let mut out = Vec::with_capacity(rows.len() / 2);
         for pair in rows.chunks_exact(2) {
             let (before, after) = (&pair[0], &pair[1]);
+            // P2 反转：SET/WHERE 镜像取位（回滚 = 用旧镜像值覆写、按新镜像
+            // 行定位）；正向路径的 (after, before) 与 P1 完全一致。
+            let (set_row, where_row) = match self.kind {
+                WorkKind::ToSql => (after, before),
+                WorkKind::Flashback => (before, after),
+            };
             // SET 差异（GenUpdateSetPart sqlgen.go:336-381）：非 full 时仅变化
             // 列入 SET；比较 = ColumnValue PartialEq（裁定 6：Str/Bytes 按字节、
-            // 文本族按预渲染文本，与上游「比解码值」效果等价）。
+            // 文本族按预渲染文本，与上游「比解码值」效果等价）。比较对称，
+            // 两 kind 共用；assigns 值从 set_row 取。
             let mut assigns = Vec::new();
             for &ord in &p.cols {
                 let b = self.cell(before, tm, ord)?;
@@ -324,7 +420,7 @@ impl DmlBuilder {
                     assigns.push(format!(
                         "{}={}",
                         quote_ident(&p.schema.cols[ord].name),
-                        encode_value(a)?
+                        encode_value(self.cell(set_row, tm, ord)?)?
                     ));
                 }
             }
@@ -341,7 +437,7 @@ impl DmlBuilder {
                 "UPDATE {} SET {} WHERE {};",
                 p.tbl,
                 assigns.join(","),
-                self.where_part(&p, before, tm)?
+                self.where_part(&p, where_row, tm)?
             ));
         }
         Ok(out)
@@ -351,6 +447,7 @@ impl DmlBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binlog::rows::RowsKind;
     use crate::metadata::schema::SchemaCol;
 
     fn opts(f: fn(&mut SqlOpts)) -> SqlOpts {
@@ -692,6 +789,118 @@ mod tests {
         assert_eq!(
             ins, "INSERT INTO `d``b`.`t``1` (`a```,`b`) VALUES (1,'x');",
             "反引号双写贯通库/表/列位"
+        );
+    }
+
+    // ---------- P2 Flashback（WorkKind 语义反转）----------
+
+    #[test]
+    fn flashback_dml_for_maps_events_to_reverse_statements() {
+        let b = DmlBuilder::flashback(SqlOpts::default());
+        let t = tm(3);
+        let s = schema3(); // pk=a
+        // INSERT 事件(after-image) → DELETE 键定位
+        let w = [row(&[i(1), sv("x"), i(2)])];
+        assert_eq!(
+            b.dml_for(RowsKind::Write, &t, &s, &w).unwrap(),
+            vec!["DELETE FROM `db`.`t` WHERE `a`=1;"]
+        );
+        // DELETE 事件(before-image) → INSERT 全列
+        let d = [row(&[i(7), sv("z"), i(8)])];
+        assert_eq!(
+            b.dml_for(RowsKind::Delete, &t, &s, &d).unwrap(),
+            vec![r#"INSERT INTO `db`.`t` (`a`,`b`,`c`) VALUES (7,'z',8);"#]
+        );
+        // UPDATE → SET=before, WHERE=after 键
+        let u = [row(&[i(1), sv("x"), i(2)]), row(&[i(1), sv("y"), i(2)])];
+        assert_eq!(
+            b.dml_for(RowsKind::Update, &t, &s, &u).unwrap(),
+            vec![r#"UPDATE `db`.`t` SET `b`='x' WHERE `a`=1;"#]
+        );
+        // 正向 kind 不受影响
+        assert_eq!(
+            DmlBuilder::new(SqlOpts::default())
+                .dml_for(RowsKind::Write, &t, &s, &w)
+                .unwrap()[0],
+            r#"INSERT INTO `db`.`t` (`a`,`b`,`c`) VALUES (1,'x',2);"#
+        );
+    }
+
+    #[test]
+    fn flashback_update_full_columns_and_unchanged_pair() {
+        let bf = DmlBuilder::flashback(opts(|o| o.full_columns = true));
+        let rows = [row(&[i(1), sv("x"), i(2)]), row(&[i(1), sv("y"), i(2)])];
+        assert_eq!(
+            bf.updates(&tm(3), &schema3(), &rows).unwrap()[0],
+            r#"UPDATE `db`.`t` SET `a`=1,`b`='x',`c`=2 WHERE `a`=1 AND `b`='y' AND `c`=2;"#,
+            "full: SET 全列取 before、WHERE 全列取 after"
+        );
+        // 无变化行对：正向跳语句（上游 abort）；逆向同样跳（空 SET 同构）
+        let same = [row(&[i(1), sv("x"), i(2)]), row(&[i(1), sv("x"), i(2)])];
+        assert!(
+            DmlBuilder::flashback(SqlOpts::default())
+                .updates(&tm(3), &schema3(), &same)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn flashback_update_unchanged_json_not_in_set() {
+        // 上游逆向 UPDATE 仍带「JSON 恒进 SET」quirk；本层不继承（spec §3.1）——
+        // 未变化的 JSON 列不得出现在 SET。比较器 ALW-JSON-IN-SET 容忍裁判多出的
+        // JSON 项，本测试钉死我方严格。
+        let mut s = schema3();
+        s.cols[1].type_name = "json".into();
+        let mut t = tm(3);
+        t.column_type[1] = 0xf6; // MYSQL_TYPE_JSON
+        let rows = [
+            row(&[i(1), ColumnValue::Json(r#"{"a":1}"#.into()), i(2)]),
+            row(&[i(1), ColumnValue::Json(r#"{"a":1}"#.into()), i(9)]),
+        ];
+        let got = DmlBuilder::flashback(SqlOpts::default())
+            .updates(&t, &s, &rows)
+            .unwrap();
+        assert_eq!(got[0], r#"UPDATE `db`.`t` SET `c`=2 WHERE `a`=1;"#);
+    }
+
+    #[test]
+    fn flashback_rejects_padded_dropped_columns_as_event_error() {
+        // 硬规则 a（对齐上游 events.go:87 fail-hard）：dropped 列 = 旧镜像不完整，
+        // 回滚脚本宁缺毋漏 → Flashback 下 Padded 是错误而非告警。
+        let b = DmlBuilder::flashback(SqlOpts::default());
+        let rows = [row(&[i(1), sv("x"), i(2), i(99)])];
+        let e = b.deletes(&tm(4), &schema3(), &rows).unwrap_err();
+        assert!(
+            matches!(e, SqlError::Value(BinlogError::InvalidData(_))),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("flashback"), "{e}");
+        // 正向不受影响（P1 行为回归守卫）
+        assert!(
+            DmlBuilder::new(SqlOpts::default())
+                .inserts(&tm(4), &schema3(), &rows)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn flashback_missing_value_error_hints_row_image_full() {
+        // 硬规则 b：Missing（MINIMAL row image / partial）进 WHERE/VALUES → 报错，
+        // 提示需 binlog_row_image=FULL。
+        let b = DmlBuilder::flashback(SqlOpts::default());
+        let rows = [row(&[i(1), ColumnValue::Missing, i(2)])];
+        let e = b.deletes(&tm(3), &schema3(), &rows).unwrap_err();
+        assert!(e.to_string().contains("binlog_row_image=FULL"), "{e}");
+        let e = b.inserts(&tm(3), &schema3(), &rows).unwrap_err();
+        assert!(e.to_string().contains("binlog_row_image=FULL"), "{e}");
+        // 正向维持 P1 既有 InvalidData（encode 路径），消息不要求 FULL 提示
+        let e = DmlBuilder::new(SqlOpts::default())
+            .inserts(&tm(3), &schema3(), &rows)
+            .unwrap_err();
+        assert!(
+            matches!(e, SqlError::Value(BinlogError::InvalidData(_))),
+            "{e:?}"
         );
     }
 }
