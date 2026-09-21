@@ -347,6 +347,33 @@ mod tests {
         assert_eq!((g[0].db.as_str(), g[0].table.as_str()), ("d1", "t1"));
     }
 
+    /// P2 T4：stats 形态事实流——Write/Delete 行数直取、Update 按**行对**
+    /// 折算（`rows.len()/2` 镜像 stats_process.go:111）；非 rows 投空批；
+    /// 解码错误原样上抛（与 SQL 形态共用填洞契约）。
+    #[test]
+    fn build_out_stats_counts_and_shapes_facts() {
+        // 单行 WRITE → Fact(Insert, rows=1)
+        let job = rows_job(0, write_body(7, 42));
+        let outs = build_out_stats(&job).unwrap();
+        assert_eq!(outs.len(), 1);
+        let Out::Fact(f) = &outs[0] else {
+            panic!("expected fact");
+        };
+        assert_eq!((f.kind, f.rows, f.trx_id), (FactKind::Insert, 1, 3));
+        assert_eq!((f.db.as_str(), f.table.as_str()), ("d1", "t1"));
+        assert_eq!((f.start_pos, f.end_pos, f.timestamp), (100, 150, 555));
+        // 非 rows 事件（dispatcher 裁定不过 worker，防御 = 空批填洞）
+        let mut j2 = rows_job(2, vec![]);
+        j2.ev.kind = RawKind::Xid;
+        assert!(build_out_stats(&j2).unwrap().is_empty());
+        // table_id 不符 → Err 上抛（process_job 计数+空批）
+        let j3 = rows_job(3, write_body(8, 1));
+        assert!(build_out_stats(&j3).is_err());
+        // Stats 模式经 build_out 分派（builder 不被触碰）
+        let outs = build_out(&job, &DmlBuilder::default(), OutMode::Stats).unwrap();
+        assert!(matches!(outs[0], Out::Fact(_)));
+    }
+
     #[test]
     fn build_groups_errors_propagate_for_dispatcher_counting() {
         // table_id 不符 → decode_rows InvalidData（逐事件错误，T14 策略=跳过+计数）

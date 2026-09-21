@@ -23,7 +23,7 @@ use crate::metadata::store::{MetaError, SchemaStore};
 use crate::output::{Writer, datetime_str};
 use crate::pipeline::filter::Filters;
 use crate::pipeline::order::Reorder;
-use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine};
+use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine, TrxStatus};
 use crate::pipeline::worker::{Job, Out, OutMode, build_out, worker_loop};
 use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
 
@@ -65,10 +65,12 @@ impl std::fmt::Display for RunSummary {
 }
 
 /// 写出侧三形态（Runner::emit 的分支点；SQL 两支复用 output::Writer）。
-/// `Flash` 只写隐藏 tmp + 块索引，逆序回写在 `run_flash` 收尾。
+/// `Flash` 只写隐藏 tmp + 块索引，逆序回写在 `run_flash` 收尾；
+/// `Stats`（P2 T4）不落 .sql，事件流入 `Aggregator`（报表文件自建即写头行）。
 enum Emitter {
     Sql(Writer),
     Flash { tmp: Writer },
+    Stats(crate::stats::Aggregator),
 }
 
 /// 表结构来源分派（run_to_sql / run_flashback 共用）。
@@ -151,6 +153,68 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
     }
 }
 
+/// P2 T4 stats 摘要：`summary` 复用 RunSummary（events = rows+标记派发数，
+/// `statements` = 行计数总和〔Fact.rows 累加，Display 标 "statements rows"〕、
+/// errors = skipped 计数）；`windows` = 非空窗口落盘次数；`biglong` = 命中行数。
+#[derive(Debug, Clone)]
+pub struct StatsRun {
+    pub summary: RunSummary,
+    pub windows: u64,
+    pub biglong: u64,
+}
+
+impl std::fmt::Display for StatsRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stats done: events={}, statements rows={}, windows flushed={}, big/long trx={}, skipped={}",
+            self.summary.events,
+            self.summary.statements,
+            self.windows,
+            self.biglong,
+            self.summary.errors
+        )
+    }
+}
+
+/// P2 T4 stats 装配：正向泵（rows→Fact 经 worker；begin/commit/rollback/XID
+/// →Status 标记经 dispatcher 直推）→ reorder 保序 → `Aggregator`（上游
+/// stats_process.go 口径的 binlog_status.txt / biglong_trx.txt + 可选 JSONL）。
+/// 默认 on_error = skip（分析工具语义，T5 validate_stats 定默认）；显式
+/// Stop 复用 T3 哨兵链（prepare_fail / worker abort 两路）。报表在
+/// `run_pump` 成功后 finish（错误路径不落尾注——半成品报表宁缺毋漏，
+/// 重跑 O_TRUNC 覆盖）。
+pub fn run_stats(cfg: &Config) -> Result<StatsRun, PipelineError> {
+    let Some(dir) = cfg.output_dir.clone() else {
+        return Err(PipelineError::Config(
+            "stats requires --output-dir (report files are the product)".into(),
+        ));
+    };
+    std::fs::create_dir_all(&dir)?;
+    let store = open_store(cfg)?;
+    let agg = crate::stats::Aggregator::new(cfg, &dir)?;
+    let mut st = Runner::new(
+        cfg,
+        Filters::from_config(cfg),
+        store,
+        DmlBuilder::new(SqlOpts::from_config(cfg)),
+        Emitter::Stats(agg),
+    );
+    st.run_pump()?;
+    let skipped = st.summary.errors;
+    let Emitter::Stats(agg) = &mut st.emitter else {
+        return Err(PipelineError::Config(
+            "internal: run_stats on non-stats emitter".into(),
+        ));
+    };
+    let ss = agg.finish(skipped)?;
+    Ok(StatsRun {
+        summary: st.summary,
+        windows: ss.windows,
+        biglong: ss.biglong,
+    })
+}
+
 /// 一次运行的装配状态（dispatcher 侧独占；`SchemaStore` `&mut` 语义天然单线程）。
 struct Runner<'a> {
     cfg: &'a Config,
@@ -200,16 +264,24 @@ impl<'a> Runner<'a> {
         matches!(self.emitter, Emitter::Flash { .. })
     }
 
+    fn is_stats(&self) -> bool {
+        matches!(self.emitter, Emitter::Stats(_))
+    }
+
     /// worker/reorder 载荷形态（P2 T4）：Stats emitter → Stats 事实流；
     /// 其余（Sql/Flash）走既有 SQL 组路径（`Out::Sql` 包装，字节不变）。
     fn out_mode(&self) -> OutMode {
-        OutMode::Sql
+        match &self.emitter {
+            Emitter::Stats(_) => OutMode::Stats,
+            _ => OutMode::Sql,
+        }
     }
 
-    /// `--on-error stop` 生效形态：仅 flashback（to-sql 恒 robust-continue，
-    /// P1 字节面由 e2e 守卫）。
+    /// `--on-error stop` 生效形态：flashback 与 stats（P2 T4 裁定：stats
+    /// 默认 skip 由 T5 `validate_stats` 决定，本层只认显式 Stop）；
+    /// to-sql 恒 robust-continue，P1 字节面由 e2e 守卫。
     fn stop_on_error(&self) -> bool {
-        self.is_flash() && self.cfg.on_error == OnError::Stop
+        (self.is_flash() || self.is_stats()) && self.cfg.on_error == OnError::Stop
     }
 
     fn dump_schema(&self, path: &std::path::Path) -> Result<(), PipelineError> {
@@ -372,6 +444,43 @@ impl<'a> Runner<'a> {
                         .push((ev.timestamp, ev.binlog.clone(), ev.start_pos, sql.clone()));
                 }
             }
+            // P2 T4 stats 形态（Ruling：Status 标记由 dispatcher 顺序直推
+            // reorder，不过 worker——它是 dispatcher 已有信息）：seq 与 rows
+            // 事件同源编号，保序不破坏；计数入 summary.events。
+            // 位点口径：Begin = 标记事件起始（上游 oneBigLong.StartPos），
+            // Commit/Rollback = 结束位（上游 :198 StopPos）——单 `pos` 字段
+            // 按角色承载，biglong 字节面与上游一致。
+            // DDL/空 QUERY、Gtid/Rotate/Other 不派发（上游 query 分支只认
+            // begin/commit/rollback 三关键字 + XID→commit，:193-206）。
+            if self.is_stats() {
+                let marker = match &ev.kind {
+                    RawKind::Query(sql) => {
+                        let kw = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+                        match kw.as_str() {
+                            "begin" => Some((ev.start_pos, TrxStatus::Begin)),
+                            "commit" => Some((ev.end_pos, TrxStatus::Commit)),
+                            "rollback" => Some((ev.end_pos, TrxStatus::Rollback)),
+                            _ => None,
+                        }
+                    }
+                    RawKind::Xid => Some((ev.end_pos, TrxStatus::Commit)),
+                    _ => None,
+                };
+                if let Some((pos, mst)) = marker {
+                    let ready = self.reorder.push(
+                        self.seq,
+                        vec![Out::Status {
+                            binlog: ev.binlog.clone(),
+                            pos,
+                            ts: ev.timestamp,
+                            status: mst,
+                        }],
+                    );
+                    self.seq += 1;
+                    self.summary.events += 1;
+                    self.emit(ready)?;
+                }
+            }
             return Ok(None);
         }
         if !self.filters.accept(&ev, None) {
@@ -449,15 +558,56 @@ impl<'a> Runner<'a> {
     }
 
     /// 写出保序弹出批次（P2 T4 泛型载荷）：SQL 形态仅消费 `Out::Sql`
-    /// （包装不改变写出字节）；Fact/Status 在 SQL 形态不可达（防御忽略）。
+    /// （包装不改变写出字节）；Stats 形态把 Fact/Status 喂 Aggregator
+    /// （`statements` 复用为**行计数**面：每 Fact += rows，Display 标
+    /// "statements rows"）。异形态变体按不可达防御忽略（编号链单一模式）。
     fn emit(&mut self, outs: Vec<Out>) -> Result<(), PipelineError> {
-        let w = match &mut self.emitter {
-            Emitter::Sql(w) | Emitter::Flash { tmp: w } => w,
-        };
-        for o in &outs {
-            if let Out::Sql(g) = o {
-                self.summary.statements += g.sqls.len() as u64;
-                w.write_group(g)?;
+        match &mut self.emitter {
+            Emitter::Sql(w) | Emitter::Flash { tmp: w } => {
+                for o in &outs {
+                    if let Out::Sql(g) = o {
+                        self.summary.statements += g.sqls.len() as u64;
+                        w.write_group(g)?;
+                    }
+                }
+            }
+            Emitter::Stats(agg) => {
+                for o in &outs {
+                    match o {
+                        Out::Fact(f) => {
+                            self.summary.statements += f.rows;
+                            agg.feed(&crate::stats::StreamEvent::Row(f))?;
+                        }
+                        Out::Status {
+                            binlog,
+                            pos,
+                            ts,
+                            status,
+                        } => {
+                            let ev = match status {
+                                TrxStatus::Begin => crate::stats::StreamEvent::Begin {
+                                    binlog,
+                                    pos: *pos,
+                                    ts: *ts,
+                                },
+                                TrxStatus::Commit => crate::stats::StreamEvent::Commit {
+                                    binlog,
+                                    pos: *pos,
+                                    ts: *ts,
+                                },
+                                TrxStatus::Rollback => crate::stats::StreamEvent::Rollback {
+                                    binlog,
+                                    pos: *pos,
+                                    ts: *ts,
+                                },
+                                // Process 永不入标记流（prepare 只派发三态）
+                                TrxStatus::Process => continue,
+                            };
+                            agg.feed(&ev)?;
+                        }
+                        Out::Sql(_) => {}
+                    }
+                }
             }
         }
         Ok(())

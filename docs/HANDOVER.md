@@ -994,6 +994,76 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   提前中断投递/收取（哨兵后仍走完整收束再 Err——只损失败路径时延，不损
   正确性，tmp/final 全清）。
 
+### P2 Task 4: stats 子系统（Out 泛型通道 / Aggregator 上游字节面 / run_stats）
+
+- 做了什么：① `order.rs`——`Reorder<T = SqlGroup>` 泛型化（手写
+  `impl<T> Default`，derive 会强加 T:Default——SqlGroup 不满足），
+  `push/drain_remaining` 签名对 T 开放；to-sql/flashback 走默认参数字节零变。
+  ② `worker.rs`——`Out { Sql(SqlGroup) | Fact(StatFact) | Status{binlog,pos,
+  ts,status} }` + `OutMode { Sql, Stats }`（worker_loop 第 7 参）；
+  `Job.status: TrxStatus`；`build_out_stats`：Rows→单 Fact（update 行对
+  rows=len/2，其余 len；db/table 取 tm、start/end/ts 取 RawEvent 位点三件），
+  非行→空批（标记不过 worker——控制者裁定）；`build_out(job,builder,mode)`
+  统一分派（Sql 臂 = 既有 build_groups 包装，等价改写）。
+  ③ `pipeline/mod.rs`——`Emitter::Stats(Aggregator)`；prepare 非行分支 stats
+  标记派发（query 三关键字 begin→start_pos / commit|rollback→end_pos、
+  Xid→Commit(end_pos)；DDL/空 QUERY/Gtid/Rotate 不派发=上游 :193-206 口径），
+  与 rows 同源编号直推 reorder；emit Stats 臂 Fact→`statements += rows` +
+  feed(Row)、Status→feed(Begin/Commit/Rollback)；`stop_on_error()` 扩为
+  flash||stats 且 Stop（stats 默认 skip 归 T5 validate_stats）；
+  `run_stats(&Config)->Result<StatsRun>`（output-dir 硬前置、报表 Err 路径
+  不 finish=宁缺毋漏、重跑 O_TRUNC 覆盖）+ `StatsRun` Display
+  `"stats done: events=…, statements rows=…, windows flushed=…, big/long
+  trx=…, skipped=…"`（skipped=summary.errors）。
+  ④ `src/stats/mod.rs` 新建——`StatFact/FactKind/StreamEvent/StatsSummary`
+  （简报钉死接口）+ `Aggregator`（feed/finish）：上游 stats_process.go:150-268
+  控制流逐支路移植（binlog 切换落盘+清窗+last_print=ts+interval；
+  lastPrintTime 零值 init=ts+interval；begin 重置累加器含 Binlog/StartPos
+  取标记位点、不判；commit/rollback 仅 StartTime>0 才判 `rows>=big ||
+  dur>=long`；行事件双更新窗口 map+累加器，key=`db.tb`（KEY_DB_TABLE_SEP）；
+  tick flush `ts>=last_print` 落盘序=**首现序**（超越项登记）、biglong `[...]`
+  明细 **db.tb 升序**（超越项 3）、accumulator 收尾不清=上游只认 BEGIN）；
+  两 txt 宽度模板逐字节（`{:<17} {:<19} … %-Ns` 全套 + 头行建文件即写）、
+  `# skipped events: {N}` 尾注仅两 txt；`--stats-json` → binlog_status.jsonl
+  /biglong_trx.jsonl 双件（serde 字段声明序=输出序）。⑤ `config.rs`——
+  `print_interval/big_trx_rows/long_trx_seconds/stats_json` 四字段，
+  validate 填默认 30/10/1/false（to-sql 零影响）。⑥ e2e `tests/stats.rs`
+  双文件 Synth 真实布局 5 用例（golden 跨层同一字符串拷贝钉死）。
+- 上游对照：stats_process.go（表头 :272/:280、内容宽同款 `%s` 版=context.go:
+  530/540 O_TRUNC=File::create；datetime 下划线形复用 P1 `datetime_str`；
+  XID=commit、`update` 行数=对数、begin 语义与本侧 keep_trx 无关——标记只看
+  关键字）。三处有意超越登记于计划文档（窗口行序=首现序、statements 升序、
+  jsonl 面）。
+- 测试：TDD——Step 1 泛型重构免录 RED（编译期等价的机械改造）；Step 2 单元
+  golden 先 RED（`/tmp/p2t4-red-step2.log`：Aggregator/StreamEvent/
+  StatsSummary 缺符号 17 错）后 GREEN；Step 5 e2e 首跑 RED
+  （`/tmp/p2t4-step5-run1.log`：fixture 位点自证 assert 抓到 f4 起点误用
+  rows 自身起始 378≠tm 340——该「跨层对账」正是 Step 5 的核心价值，改
+  `(tsp, ep)` 口径后 5/5 GREEN）。单元 golden 位点在 Step 5 依**真实 Synth
+  尺寸探针**重推导（原手推 216/419/446/… 与实测 tm=38/write=31+5r/
+  query=33+db+sql/xid=27/is 族 41/52-55/46 不符 → 全套改为 214/414/441/
+  253/159/254/296/335/483/510，单元与 e2e 两侧同串同步钉死，控制流断言
+  ts/rows 面零变）。`stats_e2e_on_error_stop_escalates` 钉 stats 显式 Stop
+  复用 T3 prepare_fail 升格链（Err 且报表无尾注半成品）。全量 `cargo test`
+  283 绿（lib 262 + e2e/cli/flashback/fuzz_seed/stats 5 目标 21）、
+  clippy --all-targets -D 净、fmt 净。to-sql/flashback 字节面由既有
+  261+15 项守卫全绿。
+- 遗留/对后续影响：T5 消费 `run_stats` + `validate_stats`（stats 默认
+  on_error=skip 在此落地；`--print-interval/--big-trx-rows/
+  --long-trx-seconds/--stats-json` CLI 面 + 子命令 work_type 接线）；
+  T6 真件 stats 对账（本层 golden=合成件，真机 datetime/时区面复核归 T6）；
+  T7 比较器需容忍/核对尾注行（本侧特有，上游无——比较器跳 `#` 注释行）。
+  **登记裁定/边界**：a) 标记 pos 角色压缩——`StreamEvent::{Begin,Commit,
+  Rollback}` 单 `pos` 字段按角色承载 start/stop（上游 StartPos/StopPos 双
+  字段在标记事件上各取其一），字节面与上游一致，接口从简报钉死版；
+  b) `finish(skipped: u64)` 签名以简报 Step 3 正文为准（Interfaces 速记块
+  无参版视为缩写），e2d Display 依赖此参；c) 尾注只进两 txt（jsonl 只冲刷，
+  JSONL 混注释破格式）；d) windows 计数 = **非空**落盘次数（空窗口 tick 不
+  计数）；e) stats 模式 `summary.events` = rows+标记派发数（缺表事件不派发
+  不计数、只进 errors——与 to-sql 的 events 语义有差，Display 文案已按简报
+  钉死）；f) dml/表过滤在 stats 形态同样先于派发生效（计数面与 to-sql 共
+  用一条 prepare 通道，超越简报未提但零成本一致）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

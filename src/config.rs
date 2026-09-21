@@ -175,6 +175,15 @@ pub struct Config {
     pub keep_trx: bool,
     /// 逐事件错误策略（P2 T3；to-sql 恒默认 `SkipBadEvent` = P1 行为）。
     pub on_error: OnError,
+    /// stats 窗口落盘间隔秒（P2 T4；上游 PrintInterval 默认 30、范围 1..600
+    /// 的校验归 T5 `validate_stats`，此处仅字段+中性默认）。
+    pub print_interval: u32,
+    /// 大事务行数阈值（上游 BigTrxRowLimit 默认 10、范围 1..30000）。
+    pub big_trx_rows: u32,
+    /// 长事务秒阈值（上游 LongTrxSeconds 默认 1、范围 0..3600）。
+    pub long_trx_seconds: u32,
+    /// `--stats-json`：两份报表同步输出 JSONL 版（P2 T4 消费；默认 false）。
+    pub stats_json: bool,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -287,6 +296,11 @@ impl Config {
             work_type: WorkType::ToSql,
             keep_trx: true,
             on_error: OnError::SkipBadEvent,
+            // P2 T4 默认：stats 阈值取上游缺省（30/10/1），JSONL 关（T5 接 CLI）
+            print_interval: 30,
+            big_trx_rows: 10,
+            long_trx_seconds: 1,
+            stats_json: false,
         })
     }
 }
