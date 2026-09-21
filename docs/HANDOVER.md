@@ -1657,7 +1657,7 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
    两 jsonl **不存在**、txt 两件保持既有口径；单元 + 集成双红→绿，集成件
    `tests/stats.rs::stats_err_path_leaves_no_partial_jsonl`，成功路径字节
    不变）；② difftest `--dml insert`×stats 冒烟维度（真跑 `[5.6/7]
-   inserts=26 updates=0 deletes=0 == to-sql(--dml insert) INSERT lines=26`，
+   inserts=26 updates=0 deletes=0 to-sql(--dml insert) INSERT lines=26`，
    同轮回归 `[5.5/7] report total=36 == to-sql DML lines=36`）——台账两处
    挂账条已勾销（见下表 T8-debt 消费注）。
    注：①的失败运行会毁上一份好 JSONL（create 即 O_TRUNC + Drop unlink），
