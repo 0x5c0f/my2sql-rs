@@ -17,7 +17,14 @@
 #
 # 纪律：人工触发（不入 CI / Makefile 默认目标）；数据只进本脚本自建的 rec_db
 # 与自建容器（无宿主 bind mount，datadir 全在容器可写层）；退出前 trap
-# DROP DATABASE rec_db + docker rm -f 自清理。KEEP=1 且失败时保留容器排障。
+# DROP DATABASE rec_db + docker rm -f 自清理（KEEP=1 失败时保留容器排障）。
+#
+# 产物留档口径（T9 登记）：本脚本 stdout（含 CHECKSUM 双值、逐用例计数）是
+# 对账证据的一部分，默认只在终端；实跑请自行 tee 进入 out/ 目录面，例如
+#   bash tools/flashback-reconcile.sh 2>&1 | tee out/flashback-reconcile/run.log
+# P2 T6 的一次性 GREEN transcript 当时记在会话级 /tmp/t6-reconcile-green-transcript.log
+# （不入库，已随会话失效）；本脚本产物快照（baseline/after/rows/flashback.log）
+# 一直落在 out/flashback-reconcile/ 下，是 HANDOVER 引用的持久 artifact。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -64,9 +71,12 @@ echo "   baseline CHECKSUM TABLE = $BASE_CK"
 
 echo "== [3/6] FLUSH BINARY LOGS + mixed DML (7 ins / 5 upd incl 1 JSON / 3 del, 1 multi-row trx)"
 docker exec "$NAME" mysql -uroot -e "FLUSH BINARY LOGS"
-# 起点 = flush 后的当前文件（全部 DML 落入该文件，无中途 rotate）
-BIN="$(docker exec "$NAME" mysql -uroot -N -e "SHOW BINARY LOGS" | awk '{print $1}' | tail -1)"
-START_POS="$(docker exec "$NAME" mysql -uroot -N -e "SHOW MASTER STATUS" | awk '{print $2}')"
+# 起点 = flush 后的新文件。**单次** SHOW MASTER STATUS 原子取 (File, Position)：
+# 两条独立查询（旧 `SHOW BINARY LOGS | tail -1` + `SHOW MASTER STATUS`）之间若发生
+# rotate，BIN 与 START_POS 会指向不同文件 → flashback 的 --start-pos 落在错误文件
+# 上（T9 收口：本脚本仅自库使用，但竞态属实质缺陷，直接改原子取）。
+read -r BIN START_POS < <(docker exec "$NAME" mysql -uroot -N -e "SHOW MASTER STATUS" | awk 'NR==1{print $1, $2}')
+[ -n "$BIN" ] && [ -n "$START_POS" ] || { echo "FAILED: SHOW MASTER STATUS returned no row" >&2; exit 1; }
 echo "   DML binlog: $BIN start_pos=$START_POS"
 docker exec -i "$NAME" mysql -uroot rec_db <<'SQL'
 -- 5 条 autocommit INSERT
@@ -130,8 +140,10 @@ for f in "$OUT"/flashback/flashback.*.sql; do
   docker exec -i "$NAME" mysql -uroot rec_db < "$f"
 done
 AFTER_CK="$(docker exec "$NAME" mysql -uroot -N -e "CHECKSUM TABLE rec_db.rec_t" | awk '{print $2}')"
+# after dump 失败必须硬红（T9 收口：旧 `|| true` 会把「取不到回灌后数据」吞成
+# 空文件，逐行 diff 闸随即失去比对对象；baseline dump 一直是 set -e 硬失败，两侧对称）。
 docker exec "$NAME" mysqldump -uroot --no-create-info --skip-extended-insert \
-  --default-character-set=utf8mb4 rec_db rec_t > "$OUT/after.sql" || true
+  --default-character-set=utf8mb4 rec_db rec_t > "$OUT/after.sql"
 echo "   baseline checksum = $BASE_CK"
 echo "   after-apply checksum = $AFTER_CK"
 # checksum 等值有理论碰撞概率：逐行数据 diff（剔除 mysqldump 头部 SET/注释与

@@ -290,3 +290,132 @@ fn stats_e2e_on_error_stop_escalates() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ---------- 用例 6：--schema-dump 消费（P2 T9 收口：旗标不得挂空） ----------
+
+/// `--schema-dump` 在 stats 形态同样必须有消费点：stats 的行事件与 to-sql 共用
+/// 同一条 prepare 通道（`schema_for` 真查表结构，缺表即计错），故「本次统计遇到
+/// 的表结构」是可导出产物。取舍与 b487a31（flashback 补消费）同构：三形态参数面
+/// 一致 > 单形态拒旗标；Err 路径沿用报表的宁缺毋漏（不写半成品 dump）。
+#[test]
+fn stats_honors_schema_dump() {
+    let root = fix("sdump");
+    let out = root.join("out");
+    let dump = root.join("dump.json");
+    let mut cfg = cfg_stats(&root, &out, false, 2);
+    cfg.schema_dump = Some(dump.clone());
+    run_stats(&cfg).expect("run_stats ok");
+    let text = std::fs::read_to_string(&dump).expect("stats 必须落 --schema-dump 文件");
+    assert!(
+        text.contains("\"version\"") && text.contains("\"t1\""),
+        "dump 形如 schema 文件: {text}"
+    );
+    // Err 路径（显式 stop 缺表事件）不得落 dump——与报表同款宁缺毋漏口径。
+    std::fs::remove_file(&dump).unwrap();
+    let mut cfg2 = cfg_stats(&root, &root.join("out2"), false, 2);
+    cfg2.schema_dump = Some(dump.clone());
+    cfg2.on_error = my2sql_rs::config::OnError::Stop;
+    run_stats(&cfg2).expect_err("stop 形态缺表 → 整跑 Err");
+    assert!(!dump.exists(), "Err 路径不得落 schema-dump（半成品）");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------- 用例 7：非关键字 QUERY（DDL/空文本）必须参与窗口 tick（P2 T9 B.4(b)） ----------
+
+/// 上游 StatChan 喂入集 = {过滤后 rows} ∪ {任意 QUERY_EVENT} ∪ {XID}：
+/// db/dml 过滤只拦 rows（com.go:103-140 的 BinEventCheck 仅 rows 分支；
+/// QUERY/XID 在 com.go:144-151 直通），且 file.go:274-281 对**所有**喂入
+/// 事件都发 StatChan——stats_process.go:247-257 的 interval tick 因此逐
+/// 喂入事件判定。即 DDL 文本与空文本 QUERY（GTID 载体形态）都会冲刷窗口
+/// 并重设锚点。我方历史实现只派发 begin/commit/rollback/XID 四类标记，
+/// DDL 跨界时窗口切分与上游分歧（本用例 = 该分歧的 RED 证据）。
+#[test]
+fn stats_misc_query_ticks_window_like_upstream() {
+    const SQL: &str = "ALTER TABLE `d`.`t1` ADD COLUMN `x` INT";
+    let root = tmp_dir("tick");
+    let binlog = root.join("binlog");
+    std::fs::create_dir_all(&binlog).unwrap();
+    std::fs::write(
+        root.join("schema.json"),
+        r#"{"version":1,"tables":[
+            {"db":"d","table":"t2","cols":[
+                {"name":"id","type_name":"int","unsigned":false}],
+                "pk":["id"],"uks":[]}]}"#,
+    )
+    .unwrap();
+    let mut s = Synth::new();
+    assert_eq!(s.table_map(81, "d", "t2", 1, T0), (120, 158));
+    assert_eq!(
+        s.write(81, 1, &[vec![1], vec![2], vec![3], vec![4], vec![5]], T0),
+        (158, 214)
+    );
+    // tick#1：DDL，ts=T0+5 ≥ 锚点 T0+5 → 上游在此冲刷窗口#1，锚点 T0+10
+    let (qs, qe) = s.query("d", SQL, T0 + 5);
+    assert_eq!((qs, qe), (214, 214 + 33 + 1 + SQL.len() as u32));
+    assert_eq!(s.table_map(81, "d", "t2", 1, T0 + 6), (qe, qe + 38));
+    let (_, bend) = s.write(81, 1, &[vec![6]], T0 + 6);
+    // tick#2：空文本 QUERY（上游 file.go:274 `sqlType != ""` 即喂入），
+    // ts=T0+11 ≥ 锚点 T0+10 → 冲刷窗口#2，锚点 T0+16
+    let (es, ee) = s.query("d", "", T0 + 11);
+    assert_eq!(ee - es, 34);
+    let (t2s, _) = s.table_map(81, "d", "t2", 1, T0 + 12);
+    let (_, cend) = s.write(81, 1, &[vec![7]], T0 + 12);
+    std::fs::write(binlog.join("mysql-bin.000001"), s.bytes).unwrap();
+
+    // 单文件泵（不设 stop-file → 只读 start-file）
+    let out = root.join("out");
+    let cli = Cli::try_parse_from([
+        "my2sql-rs",
+        "to-sql",
+        "--binlog-dir",
+        binlog.to_str().unwrap(),
+        "--start-file",
+        "mysql-bin.000001",
+        "--schema-file",
+        root.join("schema.json").to_str().unwrap(),
+        "--output-dir",
+        out.to_str().unwrap(),
+    ])
+    .expect("cli parse");
+    let mut cfg = match cli.cmd {
+        Command::ToSql(a) => Config::validate_to_sql(a).expect("config validate"),
+        _ => panic!("cfg expects to-sql"),
+    };
+    cfg.print_interval = 5;
+    cfg.big_trx_rows = 1000; // 本用例只测窗口面，biglong 压到不可命中
+    cfg.long_trx_seconds = 3600;
+    cfg.threads = 4;
+
+    let run = run_stats(&cfg).expect("run_stats ok");
+    assert_eq!(
+        (run.windows, run.biglong),
+        (3, 0),
+        "DDL 冲刷一次、空 QUERY 再冲刷一次、finish 收尾残余 = 3 个非空窗口"
+    );
+    let hdr = STATUS_GOLDEN.split_once('\n').unwrap().0.to_owned() + "\n";
+    let win = |st: &str, sp: u32, ep: u32, ins: u64| {
+        format!(
+            "{:<17} {:<19} {:<19} {:<10} {:<10} {:<8} {:<8} {:<8} {:<15} {:<20}\n",
+            "mysql-bin.000001", st, st, sp, ep, ins, 0u64, 0u64, "d", "t2"
+        )
+    };
+    let exp = format!(
+        "{}{}{}{}# skipped events: 0\n",
+        hdr,
+        win("2023-11-14_22:13:20", 120, 214, 5), // 窗口#1（DDL 处冲刷）
+        win("2023-11-14_22:13:26", qe, bend, 1), // 窗口#2（空 QUERY 处冲刷）
+        win("2023-11-14_22:13:32", t2s, cend, 1), // 残余（finish 冲刷）
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.join("binlog_status.txt")).unwrap(),
+        exp
+    );
+    let bl_hdr = BIGLONG_GOLDEN.split_once('\n').unwrap().0.to_owned() + "\n";
+    assert_eq!(
+        std::fs::read_to_string(out.join("biglong_trx.txt")).unwrap(),
+        format!("{bl_hdr}# skipped events: 0\n")
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

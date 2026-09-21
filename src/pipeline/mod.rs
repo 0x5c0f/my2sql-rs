@@ -190,7 +190,8 @@ impl std::fmt::Display for StatsRun {
 }
 
 /// P2 T4 stats 装配：正向泵（rows→Fact 经 worker；begin/commit/rollback/XID
-/// →Status 标记经 dispatcher 直推）→ reorder 保序 → `Aggregator`（上游
+/// →Status 标记经 dispatcher 直推；其余 QUERY〔DDL/空文本〕→Process 纯 tick
+/// ——T9 B.4(b) 对齐上游喂入集）→ reorder 保序 → `Aggregator`（上游
 /// stats_process.go 口径的 binlog_status.txt / biglong_trx.txt + 可选 JSONL）。
 /// 默认 on_error = skip（分析工具语义，T5 validate_stats 定默认）；显式
 /// Stop 复用 T3 哨兵链（prepare_fail / worker abort 两路）。报表在
@@ -220,6 +221,12 @@ pub fn run_stats(cfg: &Config) -> Result<StatsRun, PipelineError> {
         ));
     };
     let ss = agg.finish(skipped)?;
+    // --schema-dump：三形态同构收口（P2 T9 补消费，与 run_to_sql /
+    // run_flashback 同一位置语义）。只在成功路径落盘——Err 路径（上面任一 `?`）
+    // 直接返回，不留半成品 schema（Runner 的「宁缺毋漏」口径）。
+    if let Some(p) = &cfg.schema_dump {
+        st.dump_schema(p)?;
+    }
     Ok(StatsRun {
         summary: st.summary,
         windows: ss.windows,
@@ -462,8 +469,13 @@ impl<'a> Runner<'a> {
             // 位点口径：Begin = 标记事件起始（上游 oneBigLong.StartPos），
             // Commit/Rollback = 结束位（上游 :198 StopPos）——单 `pos` 字段
             // 按角色承载，biglong 字节面与上游一致。
-            // DDL/空 QUERY、Gtid/Rotate/Other 不派发（上游 query 分支只认
-            // begin/commit/rollback 三关键字 + XID→commit，:193-206）。
+            // Gtid/Rotate/Other 不派发（上游 com.go:153-155 default →
+            // C_reContinue，33/34 永不进 StatChan——MySQL GTID 两侧都不折叠
+            // begin；MariaDB GTID 的 begin 折叠属超范围形态，D5）。
+            // 非三关键字 QUERY（DDL/`use`/空文本）→ Process = 纯 tick 派发
+            // （P2 T9 B.4(b)：上游 file.go:274 对任意 sqlType!="" 喂
+            // StatChan，stats_process.go:247 逐喂入事件判 tick——不派发即
+            // 窗口切分歧义）。
             if self.is_stats() {
                 let marker = match &ev.kind {
                     RawKind::Query(sql) => {
@@ -472,7 +484,7 @@ impl<'a> Runner<'a> {
                             "begin" => Some((ev.start_pos, TrxStatus::Begin)),
                             "commit" => Some((ev.end_pos, TrxStatus::Commit)),
                             "rollback" => Some((ev.end_pos, TrxStatus::Rollback)),
-                            _ => None,
+                            _ => Some((ev.end_pos, TrxStatus::Process)),
                         }
                     }
                     RawKind::Xid => Some((ev.end_pos, TrxStatus::Commit)),
@@ -612,8 +624,12 @@ impl<'a> Runner<'a> {
                                     pos: *pos,
                                     ts: *ts,
                                 },
-                                // Process 永不入标记流（prepare 只派发三态）
-                                TrxStatus::Process => continue,
+                                // Process = 纯 tick（非三关键字 QUERY：DDL/空
+                                // 文本；P2 T9 B.4(b) 对齐上游喂入集，只冲刷
+                                // 窗口/锚点，不碰 biglong 与窗内容）。
+                                TrxStatus::Process => {
+                                    crate::stats::StreamEvent::Tick { binlog, ts: *ts }
+                                }
                             };
                             agg.feed(&ev)?;
                         }

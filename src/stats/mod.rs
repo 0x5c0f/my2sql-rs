@@ -59,9 +59,31 @@ pub struct StatFact {
 #[derive(Debug)]
 pub enum StreamEvent<'a> {
     Row(&'a StatFact),
-    Begin { binlog: &'a str, pos: u32, ts: u32 },
-    Commit { binlog: &'a str, pos: u32, ts: u32 },
-    Rollback { binlog: &'a str, pos: u32, ts: u32 },
+    Begin {
+        binlog: &'a str,
+        pos: u32,
+        ts: u32,
+    },
+    Commit {
+        binlog: &'a str,
+        pos: u32,
+        ts: u32,
+    },
+    Rollback {
+        binlog: &'a str,
+        pos: u32,
+        ts: u32,
+    },
+    /// 纯 tick 事件（P2 T9 B.4(b) 对齐）：上游对**所有**喂入 StatChan 的
+    /// 事件逐件判定 interval tick 与 binlog 切换（file.go:274-281 +
+    /// stats_process.go:247-257），其中非 begin/commit/rollback 的 QUERY
+    /// （DDL/`use`/空文本 GTID 载体）既不入窗也不碰 biglong，但**会冲刷
+    /// 窗口并重设锚点**。本变体即该语义的载体：只走 feed 的头部（切换
+    /// 检查 + 锚点初始化）与尾部 tick 判定，match 主体为空操作。
+    Tick {
+        binlog: &'a str,
+        ts: u32,
+    },
 }
 
 /// `finish` 摘要：`windows` = 非空窗口落盘次数，`biglong` = 命中行数。
@@ -214,7 +236,8 @@ impl Aggregator {
             StreamEvent::Row(f) => (f.binlog.as_str(), f.timestamp),
             StreamEvent::Begin { binlog, ts, .. }
             | StreamEvent::Commit { binlog, ts, .. }
-            | StreamEvent::Rollback { binlog, ts, .. } => (*binlog, *ts),
+            | StreamEvent::Rollback { binlog, ts, .. }
+            | StreamEvent::Tick { binlog, ts } => (*binlog, *ts),
         };
         // binlog 切换：落盘清空 + 重置窗口钟（stats_process.go:169-178）。
         if self.last_binlog != binlog {
@@ -243,6 +266,9 @@ impl Aggregator {
                 }
             }
             StreamEvent::Row(f) => self.accumulate_row(f)?,
+            // 纯 tick：不参与窗口/biglong 状态机（上游 query 分支对
+            // 非三关键字文本即 no-op，仅尾部 tick 判定生效）。
+            StreamEvent::Tick { .. } => {}
         }
         // 窗口 tick：当前事件**入窗后**落盘（上游 map 更新在判前）。
         if ts >= self.last_print_time {

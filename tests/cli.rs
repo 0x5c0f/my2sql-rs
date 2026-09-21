@@ -95,5 +95,30 @@ fn to_sql_rejects_on_error_stop() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("stop"), "{err}");
-    assert!(err.contains("flashback"), "{err}");
+    // P2 T9 措辞收口：旗标只存在于 to-sql/flashback 两处（stats 无 `--on-error`），
+    // 故错误串必须点名 **flashback-only**，不得写 "flashback/stats"。
+    assert!(err.contains("flashback-only"), "{err}");
+    assert!(!err.contains("stats"), "{err}");
+
+    // 顺序钉桩（T9 复审要求入账）：`--on-error stop` 的拒绝发生在 build_common
+    // 之前 → 同时缺 schema 源时，用户先看到 on-error 那条，而非 schema 报错。
+    let out = bin()
+        .args([
+            "to-sql",
+            "--binlog-dir",
+            "/tmp",
+            "--start-file",
+            "f",
+            "--on-error",
+            "stop",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("flashback-only"), "{err}");
+    assert!(
+        !err.contains("schema source"),
+        "--on-error 拒绝应早于 build_common: {err}"
+    );
 }

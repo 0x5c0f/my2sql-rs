@@ -154,8 +154,9 @@ pub struct ToSqlArgs {
     /// 输出到标准输出
     #[arg(long)]
     pub to_stdout: bool,
-    /// 逐事件错误策略（仅 skip-bad-event = P1 robust-continue 行为不变；
-    /// stop 不适用正向模式，validate 即拒——flashback/stats 专属）
+    /// 逐事件错误策略（缺省 skip-bad-event = P1 robust-continue 行为不变；
+    /// `stop` 不适用正向模式，validate 即拒——急停语义为 flashback 专属，
+    /// stats 无本旗标）
     #[arg(long, value_enum, default_value_t = OnError::SkipBadEvent)]
     pub on_error: OnError,
 }
@@ -292,10 +293,14 @@ impl Config {
     pub fn validate_to_sql(args: ToSqlArgs) -> Result<Config, String> {
         // to-sql 流水线恒 best-effort（spec §3.5：坏事件计数跳过，P1 字节面
         // 由 e2e 守卫），Stop 无消费点——受理即静默无效，validate 期拒绝
-        // （P2 T5 review 裁定；急停语义仅 flashback/stats 提供）。
+        // （P2 T5 review 裁定）。急停语义只由 **flashback** 提供：`--on-error`
+        // 旗标仅存在于 to-sql/flashback 两处参数面，stats 无该旗标
+        // （validate_stats 恒 SkipBadEvent），故措辞不得写 "stats"（P2 T9 收口）。
+        // 顺序注记：该拒绝在 build_common 之前发生，因此同时非法（如
+        // `--on-error stop` + 缺 `--binlog-dir`）时用户先看到本条错误。
         if args.on_error == OnError::Stop {
             return Err(
-                "--on-error stop is flashback/stats-only; to-sql is best-effort by design".into(),
+                "--on-error stop is flashback-only; to-sql is best-effort by design".into(),
             );
         }
         let mut cfg = build_common(&args.common)?;
@@ -603,7 +608,9 @@ mod tests {
         let e = Config::validate_to_sql(args(&["--uri", "mysql://x@y", "--on-error", "stop"]))
             .unwrap_err();
         assert!(e.contains("stop"), "{e}");
-        assert!(e.contains("flashback"), "{e}");
+        // T9 措辞收口：`--on-error` 旗标只存在于 to-sql/flashback 两处，stats 无
+        // 该旗标（`validate_stats` 恒 SkipBadEvent）→ 错误串须点名 flashback-only。
+        assert!(e.contains("flashback-only"), "{e}");
     }
 
     #[test]
