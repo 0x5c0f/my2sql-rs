@@ -291,6 +291,37 @@ fn stats_e2e_on_error_stop_escalates() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ---------- 用例 5b：Err 路径 JSONL 产物完整性（P2 挂账 A，P3 T8 消费） ----------
+
+/// 与用例 5 同一 Err 路径（on_error=stop 缺表升格），但 `--stats-json=true`：
+/// 钉死「JSONL 要么完整要么不存在」。现行为（红证据）：报错前已有窗口/
+/// biglong 冲刷，drop 时 BufWriter 落盘 → 两个 .jsonl 带部分内容留在盘上
+/// （半成品头，P2 ledger 登记的现状）。修复后：Err 路径 jsonl 两件必须消失；
+/// txt 两件保持 P2 裁定（存在、无尾注——用例 5 已钉死，不随之改动）。
+#[test]
+fn stats_err_path_leaves_no_partial_jsonl() {
+    let root = fix("e2errjson");
+    let out = root.join("out");
+    let mut cfg = cfg_stats(&root, &out, true, 2);
+    cfg.on_error = my2sql_rs::config::OnError::Stop;
+    let e = run_stats(&cfg).expect_err("stop 形态缺表事件 → 整跑 Err");
+    assert!(e.to_string().contains("`d.t9`"), "{e}");
+    assert!(
+        out.join("binlog_status.txt").exists(),
+        "txt 面保持 P2 裁定：Err 路径文件仍存在（本挂账只收口 jsonl）"
+    );
+    for j in ["binlog_status.jsonl", "biglong_trx.jsonl"] {
+        let p = out.join(j);
+        assert!(
+            !p.exists(),
+            "Err 路径 {j} 必须不存在（要么完整要么没有），实际内容：{:?}",
+            std::fs::read_to_string(&p)
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // ---------- 用例 6：--schema-dump 消费（P2 T9 收口：旗标不得挂空） ----------
 
 /// `--schema-dump` 在 stats 形态同样必须有消费点：stats 的行事件与 to-sql 共用

@@ -168,6 +168,11 @@ pub struct Aggregator {
     biglong: BufWriter<std::fs::File>,
     stat_json: Option<BufWriter<std::fs::File>>,
     biglong_json: Option<BufWriter<std::fs::File>>,
+    /// 本次运行实际创建的 JSONL 产物路径（P3 T8 挂账 A：Err 路径按此 unlink，
+    /// 「要么完整要么不存在」；txt 两件不在此列——保持 P2 裁定）。
+    jsonl_paths: Vec<std::path::PathBuf>,
+    /// `finish` 成功标记：Drop 据此区分「完整收尾」与「Err 路径半成品」。
+    finished: bool,
     /// 上游 lastPrintTime：0 = 未初始化（首事件置 ts+interval）。
     last_print_time: u32,
     last_binlog: String,
@@ -199,13 +204,16 @@ impl Aggregator {
         stat.write_all(STATS_HEADER.as_bytes())?;
         let mut biglong = mk("biglong_trx.txt")?;
         biglong.write_all(BIGLONG_HEADER.as_bytes())?;
-        let (stat_json, biglong_json) = if cfg.stats_json {
+        let (stat_json, biglong_json, jsonl_paths) = if cfg.stats_json {
+            let sp = output_dir.join("binlog_status.jsonl");
+            let bp = output_dir.join("biglong_trx.jsonl");
             (
-                Some(mk("binlog_status.jsonl")?),
-                Some(mk("biglong_trx.jsonl")?),
+                Some(BufWriter::new(File::create(&sp)?)),
+                Some(BufWriter::new(File::create(&bp)?)),
+                vec![sp, bp],
             )
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
         Ok(Self {
             interval: cfg.print_interval,
@@ -216,6 +224,8 @@ impl Aggregator {
             biglong,
             stat_json,
             biglong_json,
+            jsonl_paths,
+            finished: false,
             last_print_time: 0,
             last_binlog: String::new(),
             window: Vec::new(),
@@ -281,6 +291,8 @@ impl Aggregator {
 
     /// 收尾：残余窗口落盘 + 两 txt 报表尾注 `# skipped events: {N}`（简报裁定：
     /// N = RunSummary.errors，finish 收参；尾注仅写两 txt，jsonl 只冲刷）。
+    /// 成功到达此处后标记 `finished`——Err 路径（finish 未被调用或中途失败）
+    /// 由 `Drop` unlink JSONL 产物（P3 T8 挂账 A：要么完整要么不存在）。
     pub fn finish(&mut self, skipped: u64) -> std::io::Result<StatsSummary> {
         self.flush_window()?;
         let tail = format!("# skipped events: {skipped}\n");
@@ -295,6 +307,7 @@ impl Aggregator {
         {
             w.flush()?;
         }
+        self.finished = true;
         Ok(StatsSummary {
             windows: self.windows,
             biglong: self.biglong_hits,
@@ -447,6 +460,24 @@ impl Aggregator {
             writeln!(j, "{s}")?;
         }
         Ok(())
+    }
+}
+
+/// Err 路径收口（P2 挂账 A，P3 T8 消费）：`finish` 未成功到达 = 本次运行的
+/// JSONL 报表是半成品（已冲刷的窗口行留在 BufWriter/drop 落盘里，无成功路径
+/// 的最终 flush 定序）。契约「要么完整要么不存在」→ drop 时 unlink 本次创建的
+/// JSONL 产物。txt 两件不删（P2 既有裁定 + tests/stats.rs 用例 5 钉死：
+/// 建文件即有头行，Err 路径无尾注，重跑 O_TRUNC 覆盖）。成功路径不触碰此
+/// 分支——现有 JSONL/txt goldens 逐字节不变。
+impl Drop for Aggregator {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        for p in &self.jsonl_paths {
+            // Err 路径无干净上报口：静默（残留半成品留给人工/重跑 O_TRUNC）。
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -659,6 +690,58 @@ mod tests {
         );
         assert!(!dir.join("binlog_status.jsonl").exists());
         assert!(!dir.join("biglong_trx.jsonl").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P2 挂账消费（P3 T8 挂账 A，TDD 红→绿）：Err 路径 = `finish` 未被调用
+    /// （run_stats 在上游 `?` 提前返回，Aggregator 随 Runner 析构）。钉死契约：
+    /// **JSONL 产物要么完整要么不存在**——不得留下含已冲刷窗口行、却无完整
+    /// 生命周期收尾的半成品头/半份报表。现行为（红证据）：feed 期间 flush_window
+    /// 已把 JSONL 行写入 BufWriter，drop 时自动落盘 → 文件带着部分窗口内容
+    /// 留在盘上（且无成功路径的最终 flush 定序）。
+    /// txt 两件按 P2 既有裁定保持不变（头行 + 已写内容行、无尾注，重跑
+    /// O_TRUNC 覆盖——tests/stats.rs 用例 5 钉死），本用例仅约束 jsonl 面。
+    #[test]
+    fn err_path_leaves_no_partial_jsonl() {
+        let dir = out_dir("errdrop");
+        {
+            let mut agg = Aggregator::new(&cfg(true), &dir).unwrap();
+            // 窗口#1 冲刷（ts=T0+5 ≥ 锚点 T0+5）→ binlog_status.jsonl 已有 2 行
+            let f1 = fact(B1, "d", "t2", FactKind::Insert, 5, T0, (120, 214));
+            let f2 = fact(B1, "d", "t1", FactKind::Insert, 2, T0 + 5, (300, 400));
+            agg.feed(&StreamEvent::Row(&f1)).unwrap();
+            agg.feed(&StreamEvent::Row(&f2)).unwrap();
+            // biglong 命中（rows 3 >= big 3）→ biglong_trx.jsonl 已有 1 行
+            agg.feed(&StreamEvent::Begin {
+                binlog: B1,
+                pos: 400,
+                ts: T0 + 6,
+            })
+            .unwrap();
+            let f3 = fact(B1, "d", "t1", FactKind::Insert, 3, T0 + 6, (400, 500));
+            agg.feed(&StreamEvent::Row(&f3)).unwrap();
+            agg.feed(&StreamEvent::Commit {
+                binlog: B1,
+                pos: 560,
+                ts: T0 + 6,
+            })
+            .unwrap();
+            // Err 路径模拟：不调用 finish，直接离开作用域（drop）。
+        }
+        assert!(
+            dir.join("binlog_status.txt").exists(),
+            "txt 面 Err 路径行为保持 P2 裁定：文件在建文件时即出现"
+        );
+        assert!(
+            !dir.join("binlog_status.jsonl").exists(),
+            "Err 路径 binlog_status.jsonl 必须不存在（不得留半成品），实际内容：{:?}",
+            std::fs::read_to_string(dir.join("binlog_status.jsonl"))
+        );
+        assert!(
+            !dir.join("biglong_trx.jsonl").exists(),
+            "Err 路径 biglong_trx.jsonl 必须不存在（不得留半成品），实际内容：{:?}",
+            std::fs::read_to_string(dir.join("biglong_trx.jsonl"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
