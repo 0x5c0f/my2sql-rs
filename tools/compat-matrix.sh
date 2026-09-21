@@ -8,6 +8,8 @@
 #     run-difftest 步骤 3.5 事件普查硬门，产物 EVENT_CENSUS.txt）
 #   + 8.4 专项：原版 caching_sha2_password 在线元数据探针（Rust mysql crate
 #     对 8.4 默认认证插件的握手验证；Go 裁判侧走 native policy 已由差分覆盖）
+# P2-T8 追加：flashback×4（WORK_TYPE=rollback，各版本 plain 默认捕获同 datadir 流程）
+#   + stats 冒烟×2（5.6/8.0；5.7/8.4 有意不跑 = spec §3.6 省时裁决）。
 # 结果行落 out/compat-results.tsv；任一 FAIL 则退出码非 0。
 # 环境开关：VERSIONS="5.6 8.0" 只跑部分版本（调试用；出矩阵须全跑）。
 set -uo pipefail
@@ -32,13 +34,19 @@ ensure_image() {
   timeout 900 docker pull "mysql:$v" || { echo "BLOCKED: cannot pull mysql:$v" >&2; exit 2; }
 }
 
-run_case() { # label ver [cksum] [v1rows]
-  local label=$1 ver=$2 cksum=${3:-} v1=${4:-} log rc=0
+run_case() { # label ver [cksum] [v1rows] [work]
+  local label=$1 ver=$2 cksum=${3:-} v1=${4:-} work=${5:-2sql} log rc=0 desc
   log="out/compat-$label.log"
-  echo "==== [$label] VER=$ver CKSUM=${cksum:-server-default} V1ROWS=${v1:-0} → $log ===="
-  ( export VER="$ver" CKSUM="$cksum" V1ROWS="$v1"; bash tools/run-difftest.sh ) > "$log" 2>&1 || rc=$?
+  echo "==== [$label] VER=$ver WORK=$work CKSUM=${cksum:-server-default} V1ROWS=${v1:-0} → $log ===="
+  ( export VER="$ver" CKSUM="$cksum" V1ROWS="$v1" WORK_TYPE="$work"; bash tools/run-difftest.sh ) > "$log" 2>&1 || rc=$?
   if [ "$rc" -eq 0 ] && grep -q "^OK difftest" "$log"; then
-    record "$ver" "$label" "PASS $(grep -o 'groups A=[0-9]* .*' "$log" | tail -1)"
+    # stats 冒烟无比较器 groups 行 → 配平行作 PASS 描述；2sql/rollback 仍记裁判比较行
+    if [ "$work" = stats ]; then
+      desc="$(grep -o 'stats smoke: .*' "$log" | tail -1)"
+    else
+      desc="$(grep -o 'groups A=[0-9]* .*' "$log" | tail -1)"
+    fi
+    record "$ver" "$label" "PASS $desc"
   else
     FAILS=$((FAILS+1))
     record "$ver" "$label" "FAIL rc=$rc (log $log)"
@@ -110,6 +118,15 @@ for v in $VERSIONS; do
     *)   echo "unsupported version $v (want 5.6|5.7|8.0|8.4)" >&2; exit 1 ;;
   esac
 done
+
+# P2-T8 追加族（在 to-sql 族与 8.4 探针之后跑，不扰动 P1 用例次序/datadir 时序）：
+#   flashback-{5.6,5.7,8.0,8.4} = WORK_TYPE=rollback——复用各版本 plain 默认捕获的
+#     同套 datadir 流程（run-difftest 自含产数+裁判+我方+比较器三件套；CKSUM/V1ROWS
+#     特殊用例按 brief 12 行 scope 不扩展）；
+#   stats-{5.6,8.0} = WORK_TYPE=stats 冒烟（5.7/8.4 有意不跑 = spec §3.6 省时裁决）。
+for v in $VERSIONS; do run_case "flashback-$v" "$v" "" "" rollback; done
+run_case stats-5.6 5.6 "" "" stats
+run_case stats-8.0 8.0 "" "" stats
 
 echo "==== compat matrix results ($RESULTS) ===="
 cat "$RESULTS"
