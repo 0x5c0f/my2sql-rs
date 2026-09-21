@@ -26,10 +26,12 @@
 1. 逆向 DML（base/sqlgen.go 的 `ifRollback` 旗标）：
    INSERT 事件→`DELETE`（用 after-image）；DELETE 事件→`INSERT`（用
    before-image）；UPDATE 事件→UPDATE（SET=before 值，WHERE=after 值）。
-2. 文件逆序（base/rollback_process.go）：正序生成写 tmp 文件 + 每事务块
-   `(字节长, trx_id)` 索引；收尾 N 线程从尾向前按块 seek+read，块内按行
-   逆序写出；`keepTrx` 且事务 id 变化处注入 `commit;\nbegin;\n`，文件尾
-   补 `commit;\n`；tmp 删除；产物 `rollback.<N>.sql`。
+2. 文件逆序（base/rollback_process.go）：正序生成写 tmp 文件 + **每事件
+   块**（每 rows 事件组一条，非每事务）`(字节长, trx_id)` 索引
+   （events.go:216,259）；收尾 N 线程从尾向前按块 seek+read，块内按行
+   逆序写出；`keepTrx` 且事务 id 变化处注入 `commit;\nbegin;\n`——因
+   `lastTrxIdx` 初值 0，**首个写出块必注入**（头部悬空 `commit;` 为上游
+   原样行为），文件尾补 `commit;\n`；tmp 删除；产物 `rollback.<N>.sql`。
    注意上游按**裸行**逆序——extra-info 注释行与其 SQL 行在逆序后拆对。
 3. 列数不匹配（binlog 列 > 表结构列）在 rollback 路径直接 `log.Fatalf`
    （base/events.go:87，"usually means DDL in the middle"）——上游对回滚
@@ -113,8 +115,10 @@ my2sql-rs stats [通用同上（除 SQL 文本类旗标：--insert-batch/
 - `run-difftest.sh` 增 `WORK_TYPE={2sql|rollback|stats}` 维度：裁判
   `-work-type $WORK_TYPE`，本侧对应子命令。rollback 差分对齐口径：
   比较器新增脚手架行剥离规则（`commit;`/`begin;` 行不进值比较，另设
-  结构断言：keep-trx 注入次数=事务数-1、尾 `commit;` 存在——防注入
-  逻辑被白名单吞掉）；extra-info 对齐键不变（startpos/stoppos 与
+  结构断言：keep-trx 下 `begin;` 行数 = 事务段数 K、`commit;` 行数 =
+  K+1、每个 `begin;` 的前一行必为 `commit;`、文件末行为 `commit;`
+  ——上游 `lastTrxIdx` 初值 0，首段亦注入，头部悬空 `commit;` 是上游
+  原样行为，逐字节对齐；防注入逻辑被白名单吞掉）；extra-info 对齐键不变（startpos/stoppos 与
   正反序无关，组内多重集配对本已序不敏感）。
 - stats 不做逐字节裁判差分（上游报表为自由文本 + 窗口聚合语义受
   print-interval/落盘时机影响）：以 8.0 矩阵数据 + 手算 golden 报表断言
