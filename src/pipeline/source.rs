@@ -60,6 +60,9 @@ pub enum RawKind {
 }
 
 /// 事件源抽象：`Ok(None)` = 干净停止（EOF 或 stop 条件到达）；IO/坏数据 = Err。
+/// （T6b r3：并行泵把源读取挪进作用域线程边等事件边收割 worker 结果，
+/// 泵入口以 `dyn EventSource + Send` 收口——生产 `ReplSource`/`FileReader`
+/// 与测试假源本就 Send，trait 面不加超轨、`src/binlog/` 免触碰。）
 pub trait EventSource {
     fn next(&mut self) -> Result<Option<RawEvent>, BinlogError>;
 }

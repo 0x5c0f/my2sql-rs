@@ -8,7 +8,8 @@ use my2sql_rs::pipeline::{REPL_INTERRUPT, run_flashback, run_repl, run_stats, ru
 
 fn main() {
     let cfg = Config::from_args();
-    // 进度/告警走 tracing（stderr）；默认全收（无 env-filter 特性），
+    // 进度/告警走 tracing（fmt 订阅器默认 MakeWriter = **stdout**，T6b r3
+    // 实测修正旧注释的「stderr」误记）；默认全收（无 env-filter 特性），
     // 摘要行单独 println 到 stdout。
     tracing_subscriber::fmt::init();
     // P2 T5：三子命令按 work_type 分派（validate_* 已保证与子命令一致）。

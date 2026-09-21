@@ -379,13 +379,17 @@ impl EventSource for ReplSource {
                         body,
                     );
                     self.name.clone_from(&url);
-                    if synthetic {
-                        self.chain = if pos > 0 {
-                            pos.min(u32::MAX as u64) as u32
-                        } else {
-                            4
-                        };
-                    }
+                    // 链与名同一坐标系：改名即复位到新档 payload 位点。
+                    // 真 rotate 的 h.log_pos 属**旧档**尾位，留链不复位
+                    // 会让下一个合成帧（EOF 切换/中档 FDE）以 (新名, 旧位)
+                    // 进 stop 判定——旧位 ≥ stop 即假「干净收尾」吞掉新档
+                    // 全部事件（T6b 实踩，红钉
+                    // real_rotate_renames_chain_so_eof_switch_cannot_falsely_stop）。
+                    self.chain = if pos > 0 {
+                        pos.min(u32::MAX as u64) as u32
+                    } else {
+                        4
+                    };
                     return Ok(Some(ev));
                 }
                 EventType::PREVIOUS_GTIDS => continue, // 结构性消化
@@ -864,6 +868,49 @@ mod tests {
         );
         let mut s = crate::repl::test_support::repl_source_for_test(vec![fr(bad)], "x".into());
         assert_eq!(s.next().unwrap_err(), BinlogError::ChecksumMismatch);
+    }
+
+    /// T6b live 实踩（dtb 跨档闸红→绿钉）：真 FLUSH rotate 改名新档后，
+    /// 链若仍停在旧档尾位，紧随其后的 EOF 合成切换帧会以 **(新档名, 旧档
+    /// 位点)** 进 stop 判定——旧尾位 ≥ stop 时流被假「干净收尾」，新档
+    /// 全部事件静默蒸发（数据丢失级）。链必须随改名复位到 payload 位点，
+    /// 合成帧的 stop 标位才落在它真正所属的坐标系里。
+    #[test]
+    fn real_rotate_renames_chain_so_eof_switch_cannot_falsely_stop() {
+        let mut p = Parity::new(false);
+        p.push(EventType::FORMAT_DESC, 1000, &fde_body("8.0.46", Some(0)));
+        p.push(EventType::XID, 1001, &xid_body(1));
+        // 真 rotate（FLUSH LOGS 写入旧档尾部）：头 log_pos = 旧档尾 re。
+        let (_rs, re) = p.push(EventType::ROTATE, 1002, &rotate_body(4, "mysql-bin.000004"));
+        // EOF 切换合成帧（log_pos=0/ts=0）：dump 线程跨档通知。
+        p.raws.push(build_frame(
+            EventType::ROTATE,
+            0,
+            0,
+            0x0020,
+            &rotate_body(4, "mysql-bin.000004"),
+            Crc::Off,
+        ));
+        let mut filters = Filters::none();
+        // stop 设在新档、数值低于旧档尾位 re：合成帧若携带旧链位 = 假 stop。
+        filters.stop = Some(("mysql-bin.000004".to_string(), re - 1));
+        let mut s = ReplSource::new(
+            Box::new(crate::repl::test_support::FakeStream::new(p.frames())),
+            "mysql-bin.000001".into(),
+            filters,
+        );
+        let x1 = s.next().unwrap().unwrap();
+        assert_eq!(x1.kind, RawKind::Xid);
+        let r = s.next().unwrap().unwrap();
+        assert_eq!(r.kind, RawKind::Rotate("mysql-bin.000004".into()));
+        assert_eq!(r.binlog, "mysql-bin.000001", "真 rotate 记旧名");
+        let r2 = s
+            .next()
+            .unwrap()
+            .expect("EOF 合成切换帧必须照常产出，不得假 stop 吞流");
+        assert_eq!(r2.kind, RawKind::Rotate("mysql-bin.000004".into()));
+        assert_eq!(r2.binlog, "mysql-bin.000004", "合成帧标在新档坐标系");
+        assert_eq!(s.chain_pos(), 4, "更名后链 = payload 位点");
     }
 
     /// 心跳内部消化：不产出、不进 stop 判定、不推链（其 header

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mysql::prelude::Queryable;
+use mysql::prelude::{FromValue, Queryable};
 use mysql::{Conn, Row, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -211,24 +211,33 @@ impl SchemaStore {
         Ok((file, pos))
     }
 
-    /// `SHOW BINARY LOGS` → `(Log_name, File_size, Purged?)` 全列。第三列
-    /// 5.6 镜像不存在、5.7+/8.x 为 'No'/'Yes' 串形态——`get::<u32>` 非数值
-    /// 即 None（best-effort，datetime 二分定位只消费前两列；矩阵复核登记
-    /// T7）。列按**索引**读取（5.6 列名 `Log_name` 一致性不做赌注）。
+    /// `SHOW BINARY LOGS` 全行 → 见 [`binlog_list_row`]（单行解析件）。
     pub fn list_binlogs(&mut self) -> Result<Vec<(String, u64, Option<u32>)>, MetaError> {
         let conn = self.online_conn()?;
         let rows: Vec<Row> = conn.query("SHOW BINARY LOGS")?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let name: String = r.get(0).ok_or_else(|| {
-                MetaError::ServerCmd("SHOW BINARY LOGS: unusable Log_name column".into())
-            })?;
-            let size: u64 = r.get(1).unwrap_or(0);
-            let purged: Option<u32> = r.get(2);
-            out.push((name, size, purged));
-        }
-        Ok(out)
+        rows.iter().map(binlog_list_row).collect()
     }
+}
+
+/// `SHOW BINARY LOGS` 单行 → (Log_name, File_size, Purged?)（列按**索引**
+/// 读取，5.6 列名一致性不做赌注）。第三列 5.6 镜像不存在、5.7+/8.x 实为
+/// Encrypted 'Yes'/'No' 串形态——best-effort 走 [`col_u32`]：非数值即
+/// None（datetime 二分定位只消费前两列；矩阵复核登记 T7）。
+pub(crate) fn binlog_list_row(r: &Row) -> Result<(String, u64, Option<u32>), MetaError> {
+    let name: String = r
+        .get(0)
+        .ok_or_else(|| MetaError::ServerCmd("SHOW BINARY LOGS: unusable Log_name column".into()))?;
+    let size: u64 = r.get(1).unwrap_or(0);
+    Ok((name, size, col_u32(r.as_ref(2))))
+}
+
+/// 列值 → Option<u32> 的**非 panic** best-effort 臂（from_value_opt）。
+/// T6b live 实踩：`Row::get::<u32>` 走 `from_value`，8.0 真机
+/// `SHOW BINARY LOGS` 第三列 Encrypted=`'No'` 串直接 panic
+/// （`Could not retrieve u32: Bytes("No")`），把 `--start-datetime`
+/// 定位整条路炸穿——best-effort 契约必须用 opt 通道兑现。
+fn col_u32(v: Option<&Value>) -> Option<u32> {
+    v.and_then(|v| u32::from_value_opt(v.clone()).ok())
 }
 
 /// SHOW INDEX 单行的解析输入（Non_unique / Key_name / Column_name(NULL=表达式索引)）。
@@ -711,5 +720,29 @@ mod tests {
         std::fs::remove_file(&dst).ok();
 
         admin.query_drop("DROP DATABASE my2sql_t11").unwrap();
+    }
+
+    /// T6b live 实踩缺陷钉：8.0 真机 `SHOW BINARY LOGS` 第三列 = Encrypted
+    /// `'No'` 串——旧调用 `Row::get::<u32>(2)`（from_value 通道）转换失败
+    /// 直接 **panic**，整个 `--start-datetime` 定位被炸穿（最小复现：对
+    /// live 8.0 跑 `my2sql-rs repl --start-datetime …`，stderr 现
+    /// ``Could not retrieve u32: Couldn't convert the value Bytes("No")``，
+    /// 2026-09-22 实踩）。best-effort 契约由 `col_u32`（from_value_opt
+    /// 非 panic 臂）兑现：非数值 → None。
+    #[test]
+    fn col_u32_nonnumeric_is_none_not_panic() {
+        let no = Value::from("No");
+        assert_eq!(col_u32(Some(&no)), None, "Encrypted 'No' 必须降 None");
+        assert_eq!(col_u32(None), None, "5.6 两列形态缺列 = None");
+        let num = Value::from(7u64);
+        assert_eq!(col_u32(Some(&num)), Some(7));
+        let bytes = Value::from("157");
+        assert_eq!(
+            col_u32(Some(&bytes)),
+            Some(157),
+            "text 协议数值串照收（File_size 同型）"
+        );
+        let null = Value::NULL;
+        assert_eq!(col_u32(Some(&null)), None);
     }
 }

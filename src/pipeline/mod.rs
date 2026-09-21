@@ -1077,7 +1077,7 @@ impl<'a> Runner<'a> {
     /// P3 T5 起真消费者为 `run_repl_with`（跨重连复用同一 Runner）。
     pub fn run_live(
         &mut self,
-        mut src: Box<dyn EventSource>,
+        mut src: Box<dyn EventSource + Send>,
         first_binlog: &str,
         ckpt: Option<&Path>,
     ) -> Result<RunSummary, PipelineError> {
@@ -1269,7 +1269,7 @@ impl<'a> Runner<'a> {
     /// ——纯重构，file 模式字节面零变化（钉死于 P1 e2e 全量回归）。
     fn pump_source(
         &mut self,
-        src: &mut dyn EventSource,
+        src: &mut (dyn EventSource + Send),
         opening_binlog: &str,
     ) -> Result<(), PipelineError> {
         if self.threads == 1 {
@@ -1512,7 +1512,7 @@ impl<'a> Runner<'a> {
     /// 单线程直通：无通道无线程，build 内联，reorder 恒零滞留。
     fn pump_direct(
         &mut self,
-        src: &mut dyn EventSource,
+        src: &mut (dyn EventSource + Send),
         opening_binlog: &str,
     ) -> Result<(), PipelineError> {
         while let Some(ev) = src.next()? {
@@ -1549,9 +1549,20 @@ impl<'a> Runner<'a> {
 
     /// 并行路径：bounded 作业队列 + unbounded 结果回流；reorder pending >
     /// 2×threads 时 dispatcher 阻塞补收（spec §5.1 统一反压规则）。
+    ///
+    /// P3 T6b r3 修复（threads>1 静默期滞后）：源读取挪进**作用域线程**，
+    /// 事件经 bounded(1) 通道中转，dispatcher 以 20ms `recv_timeout` 轮询
+    /// 「新事件 | 收割结果」。旧形态下 dispatcher 直接阻塞在 `src.next()`
+    /// 的 socket 读上，repl 静默期（心跳被 ReplSource 内部消化、不出事件）
+    /// 在飞 worker 的完工结果永不收割——尾事务不落盘、水位不推进，直到
+    /// 下一个真事件或泵终止才补做（live 8.0 实踩 threads=4：40s 不追平，
+    /// 末事务 'X7last' 字节缺席产物）。出码序仍由 Reorder 的 seq 唯一决定
+    /// （file 模式字节面零变化：其源从文件读，next 从不停摆，中转只是
+    /// 多一跳通道）。错误路径的提前 return 会 join 尚在 `src.next()` 里
+    /// 的源线程——repl 形态由读超时（心跳 2d+1s）兜底有界，可接受。
     fn pump_parallel(
         &mut self,
-        src: &mut dyn EventSource,
+        src: &mut (dyn EventSource + Send),
         opening_binlog: &str,
     ) -> Result<(), PipelineError> {
         let (job_tx, job_rx) = bounded::<Job>(self.threads * 2);
@@ -1576,51 +1587,81 @@ impl<'a> Runner<'a> {
         drop(job_rx);
         drop(res_tx); //  dispatcher 侧只 recv；所有 worker 结束后通道才闭合
 
-        while let Some(ev) = src.next()? {
-            if let Some(job) = self.prepare(ev, opening_binlog)? {
-                // 反压前清收 + 超限阻塞收取（progress 保证：worker 永不阻塞在发送侧）
-                self.reap(&res_rx)?;
-                while self.reorder.pending() > self.threads * 2 {
-                    match res_rx.recv() {
-                        Ok((seq, g)) => {
-                            let ready = self.reorder.push(seq, g);
-                            self.emit(ready)?;
-                        }
-                        // 全部 worker 已退（不可能：job 队列仍有消费者/在飞）→ 结束收取
-                        Err(_) => break,
+        std::thread::scope(|s| -> Result<(), PipelineError> {
+            // 源中转线程：Err / Ok(None) 转发后即退（泵语义判定仍在 dispatcher）。
+            let (ev_tx, ev_rx) = bounded::<Result<Option<RawEvent>, BinlogError>>(1);
+            s.spawn(move || {
+                loop {
+                    let r = src.next();
+                    let last = !matches!(r, Ok(Some(_)));
+                    if ev_tx.send(r).is_err() || last {
+                        break; // 接收端已弃（错误路径早退）或流终
                     }
                 }
-                if job_tx.send(job).is_err() {
-                    return Err(PipelineError::Config("worker pool died mid-run".into()));
+            });
+            loop {
+                // 每轮先清收（try_recv 至空）：静默期水位/落盘延迟上界 = 一轮
+                // recv_timeout（20ms），有流量时与原「reap 前置」形态同型。
+                self.reap(&res_rx)?;
+                match ev_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(Ok(Some(ev))) => {
+                        if let Some(job) = self.prepare(ev, opening_binlog)? {
+                            // 反压前清收 + 超限阻塞收取（progress 保证：worker 永不阻塞在发送侧）
+                            self.reap(&res_rx)?;
+                            while self.reorder.pending() > self.threads * 2 {
+                                match res_rx.recv() {
+                                    Ok((seq, g)) => {
+                                        let ready = self.reorder.push(seq, g);
+                                        self.emit(ready)?;
+                                    }
+                                    // 全部 worker 已退（不可能：job 队列仍有消费者/在飞）→ 结束收取
+                                    Err(_) => break,
+                                }
+                            }
+                            if job_tx.send(job).is_err() {
+                                return Err(PipelineError::Config(
+                                    "worker pool died mid-run".into(),
+                                ));
+                            }
+                        }
+                    }
+                    // 源流终/硬错：语义与旧形态 `src.next()` 直调完全一致
+                    Ok(Ok(None)) => break,
+                    Ok(Err(be)) => return Err(be.into()),
+                    // 超时 = 暂无事件：走轮首 reap 收割在飞结果（本修复钉死点）。
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    // 中转线程随 scope 同生共死，tx 掉线仅源线程 panic 一途；
+                    // 按流终处理，交给末次 drain + run_pump 上层收口。
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             }
-        }
-        drop(job_tx); // 投递完成 → worker 陆续退出
-        while let Ok((seq, g)) = res_rx.recv() {
-            let ready = self.reorder.push(seq, g);
-            self.emit(ready)?;
-        }
-        for h in handles {
-            let _ = h.join();
-        }
-        let leftover = self.reorder.drain_remaining();
-        if !leftover.is_empty() {
-            tracing::warn!(
-                "reorder kept {} batches after drain (gap in seq stream)",
-                leftover.len()
-            );
-            self.emit(leftover)?;
-        }
-        // worker 侧错误计入摘要（dispatcher 视野外的 decode/build 失败）
-        self.summary.errors += errors.load(Ordering::Relaxed);
-        // P2 T3 并行 stop：哨兵已置位 → 整跑作废（tmp 清场由 run_flash 错误
-        // 路径负责；首个错误已由 worker 记入 stderr）
-        if stop && abort.load(Ordering::Relaxed) {
-            return Err(PipelineError::Config(
-                "aborted: first error logged to stderr".into(),
-            ));
-        }
-        Ok(())
+            drop(job_tx); // 投递完成 → worker 陆续退出
+            while let Ok((seq, g)) = res_rx.recv() {
+                let ready = self.reorder.push(seq, g);
+                self.emit(ready)?;
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+            let leftover = self.reorder.drain_remaining();
+            if !leftover.is_empty() {
+                tracing::warn!(
+                    "reorder kept {} batches after drain (gap in seq stream)",
+                    leftover.len()
+                );
+                self.emit(leftover)?;
+            }
+            // worker 侧错误计入摘要（dispatcher 视野外的 decode/build 失败）
+            self.summary.errors += errors.load(Ordering::Relaxed);
+            // P2 T3 并行 stop：哨兵已置位 → 整跑作废（tmp 清场由 run_flash 错误
+            // 路径负责；首个错误已由 worker 记入 stderr）
+            if stop && abort.load(Ordering::Relaxed) {
+                return Err(PipelineError::Config(
+                    "aborted: first error logged to stderr".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     /// 非阻塞收取全部已就绪结果并写出（反压前置）。
@@ -1684,6 +1725,10 @@ mod live_tests {
     }
 
     fn config_from(dir: &std::path::Path, schema: &std::path::Path) -> Config {
+        config_threads(dir, schema, 1)
+    }
+
+    fn config_threads(dir: &std::path::Path, schema: &std::path::Path, threads: usize) -> Config {
         let cli = Cli::try_parse_from([
             "my2sql-rs",
             "to-sql",
@@ -1696,7 +1741,7 @@ mod live_tests {
             "--output-dir",
             dir.join("out").to_str().unwrap(),
             "--threads",
-            "1",
+            &threads.to_string(),
         ])
         .expect("cli parse");
         let Command::ToSql(a) = cli.cmd else {
@@ -1760,7 +1805,7 @@ mod live_tests {
     /// probe 观察的是「此前所有事件已泵完」时刻的 checkpoint/落盘实态。
     struct FakeSrc {
         q: VecDeque<Result<Option<RawEvent>, BinlogError>>,
-        probe: Box<dyn FnMut(usize)>,
+        probe: Box<dyn FnMut(usize) + Send>,
     }
     impl EventSource for FakeSrc {
         fn next(&mut self) -> Result<Option<RawEvent>, BinlogError> {
@@ -1937,6 +1982,119 @@ mod live_tests {
         assert_eq!(sum.events, 2);
         assert_eq!(sum.files, 1);
         assert_eq!(read_cp(&ckpt_path).expect("水位").pos, 400);
+    }
+
+    /// T6b r3 生产缺陷钉（threads>1 静默期滞后，T4 挂账的活体红件）：
+    /// 生产 repl 形态源 `next()` 消费完事件后长阻塞（主库静默，心跳被
+    /// ReplSource 内部消化、对泵不可见）。旧泵形下 dispatcher 与源读取
+    /// 同线程互斥——尾事务的在飞 worker 结果永不收割：数据不落盘、水位
+    /// 不推进，直到下一个真事件或泵终止才补做（live 8.0 threads=4 实踩
+    /// 40s 不追平 marker 界，末事务字节缺席产物）。本件：3 事务 × 300
+    /// 行进假源，尾 XID 进泵后假源即静默阻塞；要求**阻塞期间**水位推进
+    /// 至尾事务界 + 全 900 行落盘（旧泵形 = 必红）。
+    #[test]
+    fn parallel_watermark_advances_while_source_idle() {
+        let dir = tmpdir("idle-par");
+        let schema = schema_file(&dir);
+        let cfg = config_threads(&dir, &schema, 3);
+        let out = dir.join("out");
+        let ckpt_path = dir.join("checkpoint.json");
+
+        const N: i32 = 300;
+        const TRX: i32 = 3;
+        let mut evs: VecDeque<RawEvent> = VecDeque::new();
+        let mut pos = 100u32;
+        let mut final_pos = 0u32;
+        for t in 0..TRX {
+            evs.push_back(q("BEGIN", pos, 1700000000));
+            pos += 20;
+            for i in 0..N {
+                let v = t * N + i + 1;
+                evs.push_back(rows(v, pos, 1700000000));
+                pos += 40;
+            }
+            evs.push_back(xid(pos, 1700000000));
+            final_pos = pos;
+            pos += 20;
+        }
+
+        // 静默闸：假源出完事件后 next() 阻塞到测试侧释放（gate_tx 掉线
+        // 即放行 = 干净流终）。
+        struct IdleSrc {
+            q: VecDeque<RawEvent>,
+            gate: std::sync::mpsc::Receiver<()>,
+        }
+        impl EventSource for IdleSrc {
+            fn next(&mut self) -> Result<Option<RawEvent>, BinlogError> {
+                match self.q.pop_front() {
+                    Some(ev) => Ok(Some(ev)),
+                    None => {
+                        let _ = self.gate.recv();
+                        Ok(None)
+                    }
+                }
+            }
+        }
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+
+        let store = SchemaStore::offline(&schema).unwrap();
+        let writer = Writer::with_live(
+            out.clone(),
+            false,
+            false,
+            false,
+            cfg.time_zone,
+            "to_sql".into(),
+            false,
+            true,
+            false,
+        );
+        let mut st = Runner::new(
+            &cfg,
+            Filters::from_config(&cfg),
+            store,
+            DmlBuilder::new(SqlOpts::from_config(&cfg)),
+            Emitter::Sql(writer),
+        );
+        let fake = IdleSrc {
+            q: evs,
+            gate: gate_rx,
+        };
+
+        // 看门狗：源仍静默（不释放 gate）期间轮询水位；命中或 8s 超时都
+        // 释放收尾（超时 = 红，由 join 回的 false 钉死）。
+        let ck = ckpt_path.clone();
+        let watchdog = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let hit = loop {
+                if read_cp(&ck).is_some_and(|cp| cp.pos == final_pos) {
+                    break true;
+                }
+                if t0.elapsed() > std::time::Duration::from_secs(8) {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            drop(gate_tx); // 释放假源 → 干净流终
+            hit
+        });
+        let sum = st
+            .run_live(Box::new(fake), "mysql-bin.000001", Some(&ckpt_path))
+            .expect("静默后释放 → 干净收尾 Ok");
+        assert!(
+            watchdog.join().expect("watchdog 不得 panic"),
+            "源静默期 threads=3 水位停滞（尾结果未收割 = 旧泵形；T6b live 缺陷：尾事务不落盘、水位 40s+ 不推进）"
+        );
+        assert_eq!(read_cp(&ckpt_path).expect("终水位").pos, final_pos);
+        let s = std::fs::read_to_string(out.join("to_sql.1.sql")).expect("产物在场");
+        assert_eq!(
+            s.matches("INSERT INTO `t10`.`a` (`id`) VALUES").count(),
+            (N * TRX) as usize,
+            "水位声称尾事务界 ⟹ 全 900 行必已 flush"
+        );
+        assert_eq!(sum.files, 1);
+        assert_eq!(sum.errors, 0);
+        read_verify(&ckpt_path, &out).expect("read_verify");
     }
 }
 
