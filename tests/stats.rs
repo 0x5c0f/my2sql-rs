@@ -148,7 +148,8 @@ fn cfg_stats(root: &Path, out: &Path, json: bool, threads: usize) -> Config {
     ])
     .expect("cli parse");
     let mut c = match cli.cmd {
-        Command::ToSql(a) => Config::validate(a).expect("config validate"),
+        Command::ToSql(a) => Config::validate_to_sql(a).expect("config validate"),
+        _ => panic!("cfg expects to-sql"),
     };
     c.print_interval = 5;
     c.big_trx_rows = 3;

@@ -480,7 +480,8 @@ mod tests {
         ])
         .unwrap();
         let mut c = match cli.cmd {
-            Command::ToSql(a) => Config::validate(a).unwrap(),
+            Command::ToSql(a) => Config::validate_to_sql(a).unwrap(),
+            _ => panic!("cfg expects to-sql"),
         };
         c.print_interval = 5;
         c.big_trx_rows = 3;

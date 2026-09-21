@@ -99,12 +99,14 @@ fn build_fixture(dir: &Path) -> Fix {
     }
 }
 
-/// 由 CLI 参数串构造 Config（复用真实解析/校验路径）。
+/// 由 CLI 参数串构造 Config（复用真实解析/校验路径；T5 三子命令后本
+/// helper 仅收 to-sql——e2e 各用例首参恒 "to-sql"）。
 fn config_from(args: &[&str]) -> Config {
     let cli = Cli::try_parse_from(args).expect("cli parse");
-    match cli.cmd {
-        Command::ToSql(a) => Config::validate(a).expect("config validate"),
-    }
+    let Command::ToSql(a) = cli.cmd else {
+        panic!("config_from expects to-sql")
+    };
+    Config::validate_to_sql(a).expect("config validate")
 }
 
 fn read_file(p: &Path) -> String {

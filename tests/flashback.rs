@@ -34,11 +34,11 @@ fn cfg_for(dir: &Path, out: &Path, keep: bool, oe: OnError) -> Config {
         out.to_str().unwrap(),
     ])
     .expect("cli parse");
-    // 单变体枚举下 let-else 触 irrefutable 警告、恒等 match 触
-    // infallible_destructuring_match——validate 收进 arm（e2e::config_from 同款
-    // 形态；T5 加子命令时再补 arm 穷举）。
+    // T5 三子命令后 match 不再穷尽——let-else + panic（config_from 同款
+    // 形态）：本 helper 恒走 to-sql 解析路径，再在库层覆写 flashback 字段。
     let mut c = match cli.cmd {
-        Command::ToSql(a) => Config::validate(a).expect("config validate"),
+        Command::ToSql(a) => Config::validate_to_sql(a).expect("config validate"),
+        _ => panic!("cfg_for expects to-sql"),
     };
     c.work_type = WorkType::Flashback;
     c.keep_trx = keep;

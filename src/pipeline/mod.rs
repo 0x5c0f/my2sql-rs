@@ -54,13 +54,20 @@ pub struct RunSummary {
     pub files: usize,
 }
 
-impl std::fmt::Display for RunSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "to-sql done: events={}, statements={}, files={}, errors={}",
+impl RunSummary {
+    /// 前缀参数化摘要行（P2 T5）：`Display` 固定 `"to-sql done"`（P1 文案
+    /// 不得变），flashback 路径由 main 传 `"flashback done"`。
+    pub fn display_with(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}: events={}, statements={}, files={}, errors={}",
             self.events, self.statements, self.files, self.errors
         )
+    }
+}
+
+impl std::fmt::Display for RunSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_with("to-sql done"))
     }
 }
 
@@ -78,7 +85,7 @@ fn open_store(cfg: &Config) -> Result<SchemaStore, PipelineError> {
     Ok(match (&cfg.schema_file, &cfg.uri) {
         (Some(p), _) => SchemaStore::offline(p)?,
         (None, Some(uri)) => SchemaStore::online(uri)?,
-        (None, None) => unreachable!("Config::validate 已拦双缺"),
+        (None, None) => unreachable!("Config::validate_* 已拦双缺"),
     })
 }
 

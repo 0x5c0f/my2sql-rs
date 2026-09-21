@@ -1064,6 +1064,54 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   钉死）；f) dml/表过滤在 stats 形态同样先于派发生效（计数面与 to-sql 共
   用一条 prepare 通道，超越简报未提但零成本一致）。
 
+### P2 Task 5: CLI 三子命令（CommonArgs/SqlTextArgs flatten 重构 + 三 validate + main dispatch）
+
+- 做了什么：① `config.rs` 主体重构——`ToSqlArgs` 26 旗标拆 `CommonArgs`
+  （binlog_dir…threads 19 项，含 `--output-dir`，**不含** `--to-stdout`）+
+  `SqlTextArgs`（add_extra_info/no_db_prefix/full_columns/unique_key_first/
+  ignore_primary_key_for_insert/strict_schema/insert_batch 7 项），二者
+  flatten 进 `ToSqlArgs`（+to_stdout、+`--on-error` 默认 `skip-bad-event`、
+  **零旗标名/默认/help 文案改动**）与 `FlashbackArgs`（+`--keep-trx`/
+  `--no-keep-trx` 双 bool + `--on-error` 默认 `stop`）；`StatsArgs` =
+  Common + `--print-interval/--big-trx-rows/--long-trx-seconds`（clap 只做
+  u32 类型面）+ `--stats-json`。`Command::{ToSql,Flashback,Stats}` 三变体。
+  ② 校验：共享内核抽 `build_common(&CommonArgs)->Result<Config,String>`
+  （threads/schema 源/时区/时间对/位点逻辑原样搬入，SQL 文本与 work_type/
+  on_error/keep_trx/stats 阈值落中性默认）；`validate`→`validate_to_sql`
+  直重命名（无 deprecated 别名），新 `validate_flashback`（keep-trx 双旗标
+  互斥在此判 Err——clap 面可同 parse，简报钉死；默认 stop/keep_trx=true）、
+  `validate_stats`（范围 1..=600 / 1..=30000 / 0..=3600，越界 Err 带实值；
+  on_error 恒 SkipBadEvent 无旗标）。`OnError` 加 `ValueEnum`（kebab-case
+  `stop`/`skip-bad-event`）。`from_args` 三臂分派，Err → `error: …` +
+  exit(2)（P1 出口唯一性不变）。③ `pipeline/mod.rs`——`RunSummary::
+  display_with(prefix)`（Display 仍恒 `to-sql done:` 逐字节不变，e2e 断言
+  核查无此串、无回归）；main 按 `cfg.work_type` 三臂 dispatch
+  （flashback 传 `"flashback done"` 前缀；stats 走 `StatsRun` 自带
+  `stats done:` Display），Err → exit(1)。④ 穷尽 match 迁移：`filter.rs`
+  测试 3 处 `let Command::ToSql` 改 let-else+panic，`e2e::config_from`/
+  `flashback::cfg_for`/`stats.rs cfg`/`stats/mod.rs cfg` 四 helper 改
+  let-else/match-else+panic 并迁 `validate_to_sql`。⑤ `tests/cli.rs`+3
+  冒烟（三子命令 help 旗标面 + flashback 拒绝 --to-stdout + stats 拒绝
+  --full-columns + help_lists_subcommands 扩三串）。
+- 真件冒烟（capture_8.0_minimal）：to-sql skip 默认 errors=1 照常 Ok；
+  flashback 默认 stop 同件 → `error: event at …aborted (--on-error stop)`
+  exit 1（差异化默认生效）；`--on-error skip-bad-event` 后
+  `flashback done: events=0, …, errors=1` exit 0；stats 报表双件落盘。
+- 测试：TDD——Step 1 RED `/tmp/p2t5-red-step1.log`（18 编译错：
+  FlashbackArgs/StatsArgs/validate_* 缺符号），Step 2-4 GREEN
+  `/tmp/p2t5-green.log`。全量 288 绿（lib 265 + cli 5 + e2e 5 + flashback
+  6 + fuzz_seed 2 + stats 5，净增 5：config 3 + cli 2）、
+  clippy --all-targets -D 净、fmt 净。
+- 遗留/对后续影响：**to-sql 面 `--on-error stop` 是已暴露但未接线的
+  旗标**——`stop_on_error()` 仍限 flash||stats（T3 合同「to-sql 恒
+  robust-continue」未动），且 skipped-WARNING 头行只存在于 flash 收尾，
+  故该值在 to-sql 路径当前完全无行为分叉（默认 Skip 面 P1 字节零变）。
+  T6-T8 若需真 stop 语义须扩 `stop_on_error` 并补 e2e；若维持现状建议
+  T9 文档标注。stats 参数范围校验自 clap 移入 `validate_stats` 后，
+  difftest 包装层（T7）传参越界会走 exit 2 而非 clap usage——文案差异
+  不涉行为。`fargs/sargs` helper 与 `args()` 同放 config.rs tests，
+  真件 e2e（T6）可直接复用子命令串形态。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

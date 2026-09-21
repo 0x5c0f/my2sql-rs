@@ -450,8 +450,10 @@ mod tests {
             "mysql://x@y",
         ])
         .unwrap();
-        let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args).unwrap();
+        let Command::ToSql(args) = cli.cmd else {
+            panic!("expects to-sql")
+        };
+        let cfg = Config::validate_to_sql(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(
             f.start.as_ref().map(|(n, p)| (n.as_str(), *p)),
@@ -486,8 +488,10 @@ mod tests {
             "mysql://x@y",
         ])
         .unwrap();
-        let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args).unwrap();
+        let Command::ToSql(args) = cli.cmd else {
+            panic!("expects to-sql")
+        };
+        let cfg = Config::validate_to_sql(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(f.stop, Some(("mysql-bin.000002".to_string(), 5000)));
     }
@@ -509,8 +513,10 @@ mod tests {
             "mysql://x@y",
         ])
         .unwrap();
-        let Command::ToSql(args) = cli.cmd;
-        let cfg = Config::validate(args).unwrap();
+        let Command::ToSql(args) = cli.cmd else {
+            panic!("expects to-sql")
+        };
+        let cfg = Config::validate_to_sql(args).unwrap();
         let f = Filters::from_config(&cfg);
         assert_eq!(f.stop_ts, Some(1767225600)); // 2026-01-01T00:00:00Z
     }

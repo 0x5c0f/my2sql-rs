@@ -2,18 +2,26 @@
 
 use std::process::exit;
 
-use my2sql_rs::config::Config;
-use my2sql_rs::pipeline::run_to_sql;
+use my2sql_rs::config::{Config, WorkType};
+use my2sql_rs::pipeline::{run_flashback, run_stats, run_to_sql};
 
 fn main() {
     let cfg = Config::from_args();
     // 进度/告警走 tracing（stderr）；默认全收（无 env-filter 特性），
     // 摘要行单独 println 到 stdout。
     tracing_subscriber::fmt::init();
-    match run_to_sql(&cfg) {
-        Ok(summary) => {
-            println!("{summary}");
+    // P2 T5：三子命令按 work_type 分派（validate_* 已保证与子命令一致）。
+    // 摘要文案：to-sql 走 Display（"to-sql done:"，P1 逐字节不变）；
+    // flashback 复用同字段面换前缀（display_with）；stats 由 StatsRun 自带 Display。
+    let rc = match cfg.work_type {
+        WorkType::ToSql => run_to_sql(&cfg).map(|s| println!("{s}")),
+        WorkType::Flashback => {
+            run_flashback(&cfg).map(|s| println!("{}", s.display_with("flashback done")))
         }
+        WorkType::Stats => run_stats(&cfg).map(|s| println!("{s}")),
+    };
+    match rc {
+        Ok(()) => {}
         Err(e) => {
             eprintln!("error: {e}");
             exit(1);
