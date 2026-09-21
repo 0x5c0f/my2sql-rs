@@ -23,12 +23,12 @@
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::binlog::error::BinlogError;
-use crate::binlog::rows::{RowsKind, decode_rows};
+use crate::binlog::rows::decode_rows;
 use crate::metadata::schema::TableSchema;
 use crate::pipeline::source::{RawEvent, RawKind};
 use crate::sqlopen::SqlError;
@@ -74,11 +74,9 @@ pub fn build_groups(job: &Job, builder: &DmlBuilder) -> Result<Vec<SqlGroup>, Sq
         BinlogError::InvalidData("rows event without table_map".into()).into(),
     )?;
     let rows = decode_rows(&job.ev.body, tm, &job.schema, *kind, *v2)?;
-    let sqls = match kind {
-        RowsKind::Write => builder.inserts(tm, &job.schema, &rows)?,
-        RowsKind::Update => builder.updates(tm, &job.schema, &rows)?,
-        RowsKind::Delete => builder.deletes(tm, &job.schema, &rows)?,
-    };
+    // P2 T3：统一分派入口（ToSql 下与旧三臂逐字节等价；Flashback 下
+    // Write↔Delete 互换 + 逆向 UPDATE，T1 硬规则错误原样上抛）。
+    let sqls = builder.dml_for(*kind, tm, &job.schema, &rows)?;
     if sqls.is_empty() {
         // 全部语句被跳过（如无变化行对，T13 策略）：不出组、不出注释头
         return Ok(Vec::new());
@@ -106,7 +104,15 @@ pub(crate) const PANIC_MARKER: &str = "__panic__";
 /// 单作业处理（catch_unwind 保护区）：Ok=批；Err/panic → 计数 + error 日志 +
 /// 空批（**同一填洞契约**：res 流绝不允许出现 seq 空洞，否则 reorder/dispatcher
 /// 永挂——存活 worker 持有 sender 时 `recv()` 不会断开）。
-fn process_job(job: &Job, builder: &DmlBuilder, errors: &AtomicU64) -> Vec<SqlGroup> {
+/// P2 T3：Err 分支额外置 abort 哨兵——**当且仅当** `stop_on_error`（flashback
+/// `--on-error stop` 形态；to-sql 侧恒 false，行为零变）。
+fn process_job(
+    job: &Job,
+    builder: &DmlBuilder,
+    errors: &AtomicU64,
+    abort: &AtomicBool,
+    stop_on_error: bool,
+) -> Vec<SqlGroup> {
     #[cfg(test)]
     if job.ev.binlog == PANIC_MARKER {
         panic!("injected worker panic (seq={})", job.seq);
@@ -115,6 +121,9 @@ fn process_job(job: &Job, builder: &DmlBuilder, errors: &AtomicU64) -> Vec<SqlGr
         Ok(g) => g,
         Err(e) => {
             errors.fetch_add(1, Ordering::Relaxed);
+            if stop_on_error {
+                abort.store(true, Ordering::Relaxed);
+            }
             tracing::error!(
                 seq = job.seq,
                 binlog = %job.ev.binlog,
@@ -141,19 +150,29 @@ fn panic_payload(p: &(dyn Any + Send)) -> String {
 /// 错误即计数 + `tracing::error!` + 投空批（空洞必须填，否则 reorder 永挂）。
 /// build 路径 **panic 同样捕获**并走同款填洞（Finding 1：单作业 panic 曾致
 /// 流水线永久挂死——肇事线程死后存活 worker 仍持有 sender，`recv()` 永断不了）。
+/// P2 T3 新末两参：`stop_on_error=true`（flashback `--on-error stop`）时
+/// Err/panic 两分支在计数后置 `abort` 哨兵，由 Runner 收取循环后统一转 Err；
+/// to-sql 侧恒 `stop_on_error=false` + 独立哨兵（零改动行为）。
 /// `job_rx` 断开（dispatcher 投递完成）→ 自然退出。
 pub fn worker_loop(
     job_rx: Receiver<Job>,
     res_tx: Sender<(u64, Vec<SqlGroup>)>,
     builder: DmlBuilder,
     errors: Arc<AtomicU64>,
+    abort: Arc<AtomicBool>,
+    stop_on_error: bool,
 ) {
     while let Ok(job) = job_rx.recv() {
         let seq = job.seq;
-        let groups = match catch_unwind(AssertUnwindSafe(|| process_job(&job, &builder, &errors))) {
+        let groups = match catch_unwind(AssertUnwindSafe(|| {
+            process_job(&job, &builder, &errors, &abort, stop_on_error)
+        })) {
             Ok(g) => g,
             Err(p) => {
                 errors.fetch_add(1, Ordering::Relaxed);
+                if stop_on_error {
+                    abort.store(true, Ordering::Relaxed);
+                }
                 tracing::error!(
                     seq,
                     "event skipped due to worker panic: {}",
@@ -172,6 +191,7 @@ pub fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binlog::rows::RowsKind;
     use crate::binlog::table_map::TableMapEvent;
     use crate::metadata::schema::SchemaCol;
 
@@ -271,15 +291,19 @@ mod tests {
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
         let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<SqlGroup>)>();
         let errors = Arc::new(AtomicU64::new(0));
+        let abort = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
         for _ in 0..2 {
-            let (rx, tx, e, b) = (
+            let (rx, tx, e, b, a) = (
                 job_rx.clone(),
                 res_tx.clone(),
                 errors.clone(),
                 DmlBuilder::default(),
+                abort.clone(),
             );
-            handles.push(std::thread::spawn(move || worker_loop(rx, tx, b, e)));
+            handles.push(std::thread::spawn(move || {
+                worker_loop(rx, tx, b, e, a, false)
+            }));
         }
         drop(job_rx);
         drop(res_tx);
@@ -301,9 +325,49 @@ mod tests {
             "panicked seq must be hole-filled"
         );
         assert_eq!(errors.load(Ordering::Relaxed), 1, "panic counted as error");
+        assert!(
+            !abort.load(Ordering::Relaxed),
+            "stop_on_error=false（to-sql 形态）：panic/Err 一律不置哨兵"
+        );
         drop(job_tx);
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// P2 T3 哨兵契约：`stop_on_error=true` 时 Err 与 panic 两分支都必须
+    /// 置 abort（Runner 并行收取循环后据此转 `--on-error stop` 的 Err）；
+    /// 正常批不置。
+    #[test]
+    fn worker_loop_stop_on_error_sets_abort_sentinel_on_err_and_panic() {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<SqlGroup>)>();
+        let errors = Arc::new(AtomicU64::new(0));
+        let abort = Arc::new(AtomicBool::new(false));
+        let builder = DmlBuilder::default();
+        let handle = std::thread::spawn({
+            let (e, a) = (errors.clone(), abort.clone());
+            move || worker_loop(job_rx, res_tx, builder, e, a, true)
+        });
+        job_tx.send(rows_job(0, write_body(7, 1))).unwrap(); // 正常批
+        job_tx.send(rows_job(1, write_body(8, 2))).unwrap(); // table_id 不符 → Err
+        for _ in 0..2 {
+            res_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("hole-filled stream");
+        }
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "Err 分支 + stop_on_error → 哨兵必须置位"
+        );
+        let mut bad = rows_job(2, write_body(7, 3));
+        bad.ev.binlog = PANIC_MARKER.into();
+        job_tx.send(bad).unwrap();
+        res_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("panic hole-filled");
+        drop(job_tx);
+        handle.join().unwrap();
+        assert_eq!(errors.load(Ordering::Relaxed), 2);
     }
 }

@@ -168,6 +168,13 @@ impl Writer {
         &self.blocks
     }
 
+    /// 创建顺序路径表（P2 T3：flashback 按此序装配 (tmp, final, blocks) 作业、
+    /// 错误路径清场枚举全部 tmp；stdout sink 的 `<stdout>` 键不会出现——
+    /// flashback 形态恒 stdout=false 的文件 sink）。
+    pub fn created(&self) -> &[PathBuf] {
+        &self.created
+    }
+
     fn sink_key(&self, g: &SqlGroup) -> PathBuf {
         if self.stdout {
             PathBuf::from("<stdout>")

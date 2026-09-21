@@ -19,6 +19,24 @@ pub enum Dml {
     Delete,
 }
 
+/// 工作模式（P2 T3；上游 `-work-type` 的库层对应物，CLI 子命令面归 T5）。
+/// `Stats` 由 P2 T4 消费，本任务仅立枚举位。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkType {
+    ToSql,
+    Flashback,
+    Stats,
+}
+
+/// 逐事件错误策略（P2 T3）：`Stop` = 首错即整跑 Err + 清场（flashback 专用
+/// 语义；to-sql 路径恒 `SkipBadEvent` 行为不变），`SkipBadEvent` = 计数跳过
+/// （P1 robust-continue 既定默认）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnError {
+    Stop,
+    SkipBadEvent,
+}
+
 #[derive(Parser)]
 #[command(name = "my2sql-rs", version)]
 pub struct Cli {
@@ -149,6 +167,14 @@ pub struct Config {
     /// --time-zone 解析结果（默认 UTC+00）
     pub time_zone: FixedOffset,
     pub threads: usize,
+    /// P2 T3：工作模式（`validate(ToSqlArgs)` 恒 `ToSql`；flashback 测试/
+    /// T5 子命令在库层覆写）。
+    pub work_type: WorkType,
+    /// 回滚脚本逐事务注入 `commit;\nbegin;\n`（上游 rollback_process.go 口径，
+    /// P2 T3；to-sql 默认 true 无消费）。
+    pub keep_trx: bool,
+    /// 逐事件错误策略（P2 T3；to-sql 恒默认 `SkipBadEvent` = P1 行为）。
+    pub on_error: OnError,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -257,6 +283,10 @@ impl Config {
             insert_batch: args.insert_batch,
             time_zone,
             threads: args.threads,
+            // P2 T3 默认：to-sql 恒 ToSql/keep_trx=true/Skip（robust-continue 不变）
+            work_type: WorkType::ToSql,
+            keep_trx: true,
+            on_error: OnError::SkipBadEvent,
         })
     }
 }

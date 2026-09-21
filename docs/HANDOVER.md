@@ -925,6 +925,71 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   清场是既定分工）；`Writer::created()` 未加（简报未要求，blocks() 键集即可
   枚举 tmp）。
 
+### P2 Task 3: 流水线接通 flashback（装配 / on-error 策略 / DDL 排除）
+
+- 做了什么：① `config.rs`——`WorkType {ToSql, Flashback, Stats}`、
+  `OnError {Stop, SkipBadEvent}`（`Clone,Copy,Debug,PartialEq,Eq`，简报钉死）+
+  `Config` 三新字段 `work_type/keep_trx/on_error`，`validate(ToSqlArgs)` 恒填
+  `{ToSql, true, SkipBadEvent}`（to-sql 默认 skip 不变）；CLI 面零改动（T5）。
+  ② `worker.rs`——`build_groups` 三臂 match 改 `builder.dml_for(*kind, tm,
+  &job.schema, &rows)?`（ToSql 下逐字节等价，e2e 全绿守卫）；`worker_loop`
+  扩为 6 参（+`abort: Arc<AtomicBool>` + `stop_on_error: bool`）：Err/panic 两
+  分支 `errors.fetch_add` 后**当且仅当** stop 形态 `abort.store(true, Relaxed)`。
+  ③ `pipeline/mod.rs`——`Emitter { Sql(Writer) | Flash{tmp} }` 分派写出侧；
+  `run_to_sql` 的 store 构造抽 `open_store` 与 `run_flashback` 共用；
+  `run()` 拆 `run_pump`（两形态共用的文件泵）+ 形态收尾；新增
+  `run_flash` = `flash_inner` + Err 时 `cleanup_flash_files`（**全部** created
+  tmp + 对应 final 双清——T2 登记的调用方清场义务，spec §3.2 半成品不落盘）；
+  `flash_inner`：DDL 排除汇总（`prepare` 非行分支登记
+  非 begin/commit/rollback/空 的 QUERY → 收尾逐条 `tracing::warn!` +
+  `eprintln!("flashback: {} DDL/query events excluded", n)`）→ `tmp.finish()`
+  （**先 flush BufWriter 再回读**，句柄顺序=T2 块偏移契约）→ created 序装配
+  `(tmp, parent().join(final_for_tmp(tmp)), blocks)` 作业 →
+  `reverse::run_files(&jobs, keep_trx, threads, warn)`，`files=jobs.len()`；
+  warn 行 = errors>0 且 Skip 形态时 `"-- WARNING: skipped {N} events,
+  positions in stderr\n"`（T2 已测落位=FILE_HEADER 后）。stop 语义两形态：
+  并行=收取循环+jion 后 `if stop && abort → Err("aborted: first error logged
+  to stderr")`；threads=1 直通无 catch_unwind——`pump_direct` Err 分支直接
+  返回 `Err(Config("event at {binlog}:{start_pos} aborted (--on-error stop):
+  {e:#}"))`（**永不 unwrap/panic**，解码器不崩约束）。to-sql 侧 stop=false
+  常量 + 独立哨兵，行为零变。④ `output.rs`——补 `Writer::created()` 访问器
+  （T2 节点登记的缺口）。⑤ 测试基建：`Synth` 从 `tests/e2e.rs` 整段平移
+  `tests/common/synth.rs`（pub(crate)+`#![allow(dead_code)]`，e2e 经
+  `#[path=…] mod synth;` 引用、断言零改）；加性扩 `table_map_is/write_is/
+  delete_is/update_is`（`d`.`t` int pk + VAR_STRING，meta 2B LE、串前缀
+  max_len<256→1B）与 `IsPair` 别名（clippy type_complexity）。
+- **简报对账（期望串手推，简报自授）**：用例 1 字面期望
+  （`DELETE … id=3` 在首、`INSERT …(1,'a')` 在尾）= 正向语句装进逆序块位，
+  与简报自述规则「块序=事件序逆序」+T1 Flashback 语义（W→DELETE、D→INSERT）
+  矛盾；按规则手推钉死为
+  `SET NAMES utf8mb4;\ncommit;\nbegin;\nINSERT INTO `d`.`t` (`id`,`b`) VALUES (3,'b');\ncommit;\nbegin;\nUPDATE `d`.`t` SET `id`=1 WHERE `id`=2;\nDELETE FROM `d`.`t` WHERE `id`=1;\ncommit;\n`
+  （脚手架位置与简报串完全一致，仅块内语句取反转语义——head 注入=T2 上游
+  口径原样消费，未重实现）。另 `Command` 单变体下简报 `let-else` 骨架触
+  irrefutable/infallible-destructuring 双闸，改 validate 入 arm 的穷举 match
+  （T5 补子命令时加 arm）。
+- 上游对照：stop/skip 策略对应上游 rollback `log.Fatalf` 系（fail-hard）与
+  本库 P1 robust-continue 的双形态开关；DDL 排除=file 模式 QUERY 不出 SQL
+  （file.go:245-268）+ 本层告警面增强（上游静默）。
+- 测试：TDD——`tests/flashback.rs` 先 RED（库级编译错 6 组：WorkType/OnError
+  缺符号、run_flashback 缺函数、三字段缺 → 留档 `/tmp/p2t3-red.log`）后 GREEN
+  5/5：多事务逐字节（含 threads=1/4 字节等价副断言+tmp 消失+目录零残留）、
+  stop 清场（并行+直通双形态循环）、skip 头部 WARNING 行逐字节、DDL 排除+
+  摘要不污染、to-sql 正向守卫（同款 fixture 经 run_to_sql 钉正向字节面）。
+  worker 层新增哨兵单测（Err/panic 置位 + stop=false 永不置位）。全量
+  `cargo test` 274 绿（lib 259/e2e 5/cli 3/flashback 5/fuzz_seed 2）、
+  clippy --all-targets -D 净、fmt 净。
+- 遗留/对后续影响：T5 消费 `run_flashback` + `Config{work_type,keep_trx,
+  on_error}` 覆写面；`WorkType::Stats` 枚举位已立（T4 消费）。**登记边界**：
+  a) flashback 形态忽略 `--to-stdout`（Writer 恒 stdout=false 文件 sink——
+  reverse 需要磁盘文件；T5 CLI 层应拒收 flashback+to-stdout 组合或文档化）；
+  b) **dispatcher 侧 schema 获取失败在 stop 形态仍计数跳过**（简报 Step 1 只
+  把哨兵接在 build/decode 错误路径，prepare 错误不在其列——T6 真件若遇
+  schema 缺表+stop 预期需按此口径归错）；c) file-per-table 的
+  `.flashback.tmp.d.t.N.sql → flashback.d.t.N.sql` 装配按 parent().join 泛化
+  接线（final_for_tmp 单测已钉名，端到端覆盖归 T6 真件）；d) 并行 stop 不
+  提前中断投递/收取（哨兵后仍走完整收束再 Err——只损失败路径时延，不损
+  正确性，tmp/final 全清）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为

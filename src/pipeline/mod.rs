@@ -5,8 +5,9 @@ pub mod source;
 pub mod worker;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -14,10 +15,12 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crate::binlog::error::BinlogError;
 use crate::binlog::file_reader::FileReader;
 use crate::binlog::table_map::TableMapEvent;
-use crate::config::Config;
+use crate::config::{Config, OnError};
+use crate::flashback::final_for_tmp;
+use crate::flashback::reverse::{self, Block};
 use crate::metadata::schema::{Align, TableSchema, align_cols};
 use crate::metadata::store::{MetaError, SchemaStore};
-use crate::output::Writer;
+use crate::output::{Writer, datetime_str};
 use crate::pipeline::filter::Filters;
 use crate::pipeline::order::Reorder;
 use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine};
@@ -61,6 +64,22 @@ impl std::fmt::Display for RunSummary {
     }
 }
 
+/// 写出侧三形态（Runner::emit 的分支点；SQL 两支复用 output::Writer）。
+/// `Flash` 只写隐藏 tmp + 块索引，逆序回写在 `run_flash` 收尾。
+enum Emitter {
+    Sql(Writer),
+    Flash { tmp: Writer },
+}
+
+/// 表结构来源分派（run_to_sql / run_flashback 共用）。
+fn open_store(cfg: &Config) -> Result<SchemaStore, PipelineError> {
+    Ok(match (&cfg.schema_file, &cfg.uri) {
+        (Some(p), _) => SchemaStore::offline(p)?,
+        (None, Some(uri)) => SchemaStore::online(uri)?,
+        (None, None) => unreachable!("Config::validate 已拦双缺"),
+    })
+}
+
 /// 端到端装配：FileReader→filter→trx 机→编号→workers→reorder→Writer。
 /// `threads=1` 走单线程直通（与并行路径输出逐字节等价的契约由 e2e 测试钉死）。
 pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
@@ -69,11 +88,7 @@ pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
             "output target required: pass --output-dir or --to-stdout".into(),
         ));
     }
-    let store = match (&cfg.schema_file, &cfg.uri) {
-        (Some(p), _) => SchemaStore::offline(p)?,
-        (None, Some(uri)) => SchemaStore::online(uri)?,
-        (None, None) => unreachable!("Config::validate 已拦双缺"),
-    };
+    let store = open_store(cfg)?;
     let writer = Writer::new(
         cfg.output_dir.clone().unwrap_or_default(),
         cfg.to_stdout,
@@ -88,7 +103,7 @@ pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
         Filters::from_config(cfg),
         store,
         DmlBuilder::new(SqlOpts::from_config(cfg)),
-        writer,
+        Emitter::Sql(writer),
     );
     let files = st.run()?;
     let mut sum = st.summary;
@@ -100,13 +115,49 @@ pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
     Ok(sum)
 }
 
+/// P2 T3 flashback 装配：正向泵 → 隐藏 tmp（逐事件块索引）→ 逆序回写
+/// `flashback.*.sql`（reverse::run_files，T2 已测上游字节口径）。
+/// 任何 Err（stop 哨兵/源级/写盘/逆序 IO）返回前清光 tmp 与半成品 final
+/// （宁缺毋漏，spec §3.2）。
+pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
+    if cfg.output_dir.is_none() {
+        return Err(PipelineError::Config(
+            "flashback requires --output-dir (reverse pass needs files on disk)".into(),
+        ));
+    }
+    let store = open_store(cfg)?;
+    let writer = Writer::new(
+        cfg.output_dir.clone().unwrap(),
+        false,
+        cfg.file_per_table,
+        cfg.add_extra_info,
+        cfg.time_zone,
+        ".flashback.tmp".into(),
+        true,
+    );
+    let mut st = Runner::new(
+        cfg,
+        Filters::from_config(cfg),
+        store,
+        DmlBuilder::flashback(SqlOpts::from_config(cfg)),
+        Emitter::Flash { tmp: writer },
+    );
+    match st.run_flash() {
+        Ok((mut summary, files)) => {
+            summary.files = files;
+            Ok(summary)
+        }
+        Err(e) => Err(e), // run_flash 内部已清 tmp/final（见 cleanup_flash_files）
+    }
+}
+
 /// 一次运行的装配状态（dispatcher 侧独占；`SchemaStore` `&mut` 语义天然单线程）。
 struct Runner<'a> {
     cfg: &'a Config,
     filters: Filters,
     store: SchemaStore,
     builder: DmlBuilder,
-    writer: Writer,
+    emitter: Emitter,
     trx: TrxStateMachine,
     /// 已派发事件数 = 下一个 seq 编号。
     seq: u64,
@@ -116,6 +167,9 @@ struct Runner<'a> {
     /// ——DDL 后结构漂移的保守重查路径；SchemaStore 自身还有 db.table 缓存。
     tmap: HashMap<u64, (Arc<TableMapEvent>, Arc<TableSchema>)>,
     threads: usize,
+    /// flashback 形态收集的被排除 DDL/非事务 QUERY（(timestamp, binlog,
+    /// start_pos, sql)），run 收尾统一 warn 汇总（简报 Step 4）。
+    ddl: Vec<(u32, String, u32, String)>,
 }
 
 impl<'a> Runner<'a> {
@@ -124,21 +178,32 @@ impl<'a> Runner<'a> {
         filters: Filters,
         store: SchemaStore,
         builder: DmlBuilder,
-        writer: Writer,
+        emitter: Emitter,
     ) -> Self {
         Self {
             cfg,
             filters,
             store,
             builder,
-            writer,
+            emitter,
             trx: TrxStateMachine::new(),
             seq: 0,
             reorder: Reorder::new(),
             summary: RunSummary::default(),
             tmap: HashMap::new(),
             threads: cfg.threads.clamp(1, 64),
+            ddl: Vec::new(),
         }
+    }
+
+    fn is_flash(&self) -> bool {
+        matches!(self.emitter, Emitter::Flash { .. })
+    }
+
+    /// `--on-error stop` 生效形态：仅 flashback（to-sql 恒 robust-continue，
+    /// P1 字节面由 e2e 守卫）。
+    fn stop_on_error(&self) -> bool {
+        self.is_flash() && self.cfg.on_error == OnError::Stop
     }
 
     fn dump_schema(&self, path: &std::path::Path) -> Result<(), PipelineError> {
@@ -146,9 +211,9 @@ impl<'a> Runner<'a> {
         Ok(self.store.dump(path)?)
     }
 
-    /// 主循环：逐文件（上游镜像：仅当设了 stop 条件才续读下一文件，
-    /// T12 裁定 7）→ 逐事件 → 线程形态分派。
-    fn run(&mut self) -> Result<usize, PipelineError> {
+    /// 主循环（两形态共用）：逐文件（上游镜像：仅当设了 stop 条件才续读下一
+    /// 文件，T12 裁定 7）→ 逐事件 → 线程形态分派。
+    fn run_pump(&mut self) -> Result<(), PipelineError> {
         let mut name = self.cfg.start_file.clone();
         // stop 条件 = stop-file/stop-pos（Filters.stop）或 stop-datetime（stop_ts）
         let cross_file = self.filters.stop.is_some() || self.filters.stop_ts.is_some();
@@ -175,7 +240,98 @@ impl<'a> Runner<'a> {
                 None => break,
             }
         }
-        self.writer.finish().map_err(Into::into)
+        Ok(())
+    }
+
+    /// to-sql 形态收尾（行为与 P1 逐字节一致）。
+    fn run(&mut self) -> Result<usize, PipelineError> {
+        self.run_pump()?;
+        let Emitter::Sql(w) = &mut self.emitter else {
+            return Err(PipelineError::Config(
+                "internal: flashback emitter must go through run_flash".into(),
+            ));
+        };
+        w.finish().map_err(Into::into)
+    }
+
+    /// flashback 形态 = 通用泵 + 逆序回写；任何 Err 返回前清场半成品
+    /// （spec §3.2「半成品不落盘」，T2 登记的调用方义务）。
+    fn run_flash(&mut self) -> Result<(RunSummary, usize), PipelineError> {
+        let r = self.flash_inner();
+        if r.is_err() {
+            self.cleanup_flash_files();
+        }
+        r
+    }
+
+    fn flash_inner(&mut self) -> Result<(RunSummary, usize), PipelineError> {
+        self.run_pump()?;
+        // DDL 排除汇总（tracing 面 + 计数行；不进回滚脚本，prepare 已拦）
+        for (ts, f, pos, s) in &self.ddl {
+            tracing::warn!(
+                binlog = %f,
+                pos = *pos,
+                datetime = %datetime_str(*ts, self.cfg.time_zone),
+                "DDL excluded from rollback script: {s}"
+            );
+        }
+        if !self.ddl.is_empty() {
+            eprintln!("flashback: {} DDL/query events excluded", self.ddl.len());
+        }
+        let Emitter::Flash { tmp } = &mut self.emitter else {
+            return Err(PipelineError::Config(
+                "internal: run_flash on non-flashback emitter".into(),
+            ));
+        };
+        // finish = flush 全部 BufWriter——必须先于 reverse 回读（文件句柄
+        // 字节可见性），再取块索引与创建序。
+        tmp.finish()?;
+        let blocks = tmp.blocks().clone();
+        let created = tmp.created().to_vec();
+        let jobs: Vec<(PathBuf, PathBuf, Vec<Block>)> = created
+            .iter()
+            .map(|tmp_path| {
+                let fin = final_for_tmp(tmp_path);
+                let out = match tmp_path.parent() {
+                    Some(p) => p.join(&fin),
+                    None => fin,
+                };
+                (
+                    tmp_path.clone(),
+                    out,
+                    blocks.get(tmp_path).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let warn = if self.summary.errors > 0 && self.cfg.on_error == OnError::SkipBadEvent {
+            Some(format!(
+                "-- WARNING: skipped {} events, positions in stderr\n",
+                self.summary.errors
+            ))
+        } else {
+            None
+        };
+        reverse::run_files(&jobs, self.cfg.keep_trx, self.cfg.threads, warn.as_deref())?;
+        // tmp 已由 run_files 逐个删除；files 计数 = 作业数（本形态下每
+        // created 必带 ≥1 块，空块表不落 final 的 T2 分歧不触发计数分歧）
+        Ok((self.summary, jobs.len()))
+    }
+
+    /// 错误路径清场：全部 tmp（`Writer::created()` 序）+ 对应 final
+    /// （run_files 可能已写出部分成品/半成品——一次 Err 即整跑作废）。
+    fn cleanup_flash_files(&mut self) {
+        let Emitter::Flash { tmp } = &self.emitter else {
+            return;
+        };
+        for p in tmp.created() {
+            let _ = std::fs::remove_file(p);
+            let fin = final_for_tmp(p);
+            let out = match p.parent() {
+                Some(par) => par.join(&fin),
+                None => fin,
+            };
+            let _ = std::fs::remove_file(&out);
+        }
     }
 
     /// 单文件消费（threads==1 直通 / 并行 worker 池两条路径）。
@@ -195,7 +351,18 @@ impl<'a> Runner<'a> {
     fn prepare(&mut self, ev: RawEvent) -> Option<Job> {
         let (trx_id, _status) = self.trx.feed(&ev);
         if !matches!(ev.kind, RawKind::Rows(..)) {
-            // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）
+            // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）。
+            // flashback 形态：非事务性 QUERY（DDL 等）登记排除清单，run 收尾
+            // 汇总告警（begin/commit/rollback/空文本 = 事务脚手架，不登记）。
+            if self.is_flash()
+                && let RawKind::Query(sql) = &ev.kind
+            {
+                let kw = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+                if !kw.is_empty() && kw != "begin" && kw != "commit" && kw != "rollback" {
+                    self.ddl
+                        .push((ev.timestamp, ev.binlog.clone(), ev.start_pos, sql.clone()));
+                }
+            }
             return None;
         }
         if !self.filters.accept(&ev, None) {
@@ -266,8 +433,11 @@ impl<'a> Runner<'a> {
         for g in &groups {
             self.summary.statements += g.sqls.len() as u64;
         }
+        let w = match &mut self.emitter {
+            Emitter::Sql(w) | Emitter::Flash { tmp: w } => w,
+        };
         for g in &groups {
-            self.writer.write_group(g)?;
+            w.write_group(g)?;
         }
         Ok(())
     }
@@ -292,6 +462,14 @@ impl<'a> Runner<'a> {
                         pos = job.ev.start_pos,
                         "event skipped due to decode/SQL-build error: {e:#}"
                     );
+                    // P2 T3：threads=1 直通无 catch_unwind——stop 形态在此
+                    // **直接返回 Err**（禁 unwrap/panic，错误原样上抛给调用方）
+                    if self.stop_on_error() {
+                        return Err(PipelineError::Config(format!(
+                            "event at {}:{} aborted (--on-error stop): {e:#}",
+                            job.ev.binlog, job.ev.start_pos
+                        )));
+                    }
                     Vec::new()
                 }
             };
@@ -310,14 +488,19 @@ impl<'a> Runner<'a> {
         let (job_tx, job_rx) = bounded::<Job>(self.threads * 2);
         let (res_tx, res_rx): (Sender<(u64, Vec<SqlGroup>)>, _) = unbounded();
         let errors = Arc::new(AtomicU64::new(0));
+        // P2 T3 abort 哨兵：stop 形态下 worker Err/panic 置位，收取循环后转 Err；
+        // to-sql 侧 stop=false 恒不置位（行为零变），仍传独立原子量保持签名统一。
+        let abort = Arc::new(AtomicBool::new(false));
+        let stop = self.stop_on_error();
         let mut handles = Vec::with_capacity(self.threads);
         for _ in 0..self.threads {
             let job_rx = job_rx.clone();
             let res_tx = res_tx.clone();
             let builder = self.builder.clone();
             let errors = errors.clone();
+            let abort = abort.clone();
             handles.push(thread::spawn(move || {
-                worker_loop(job_rx, res_tx, builder, errors)
+                worker_loop(job_rx, res_tx, builder, errors, abort, stop)
             }));
         }
         drop(job_rx);
@@ -360,6 +543,13 @@ impl<'a> Runner<'a> {
         }
         // worker 侧错误计入摘要（dispatcher 视野外的 decode/build 失败）
         self.summary.errors += errors.load(Ordering::Relaxed);
+        // P2 T3 并行 stop：哨兵已置位 → 整跑作废（tmp 清场由 run_flash 错误
+        // 路径负责；首个错误已由 worker 记入 stderr）
+        if stop && abort.load(Ordering::Relaxed) {
+            return Err(PipelineError::Config(
+                "aborted: first error logged to stderr".into(),
+            ));
+        }
         Ok(())
     }
 
