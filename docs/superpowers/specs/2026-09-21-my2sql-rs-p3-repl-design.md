@@ -85,8 +85,8 @@ ReplSource(EventSource) ──RawEvent──▶ pump（过滤/事务状态机/�
 ## 5. 输出文件命名与防覆盖
 
 - 命名族沿用 `to_sql.{[schema.table.]}<N>.sql`，N = binlog 文件序号（去前导零，`output.rs:path_for` 现口径）→ ROTATE 跨文件天然新文件（上游 `com.go:41` 跟文件语义等价）。
-- **不重写已存在文件**：本次 run（含 resume run）将要创建的目标文件若已存在 → 启动即硬错并列出冲突名（提示换 `--output-dir`）。**repl 永不 append 既有文件**——接续产物永远新文件，旧产物字节不可变，这是 §4 at-least-once 语义能被人手消费的前提。
-  - 边界：resume 起点在文件 N 中间 → 新 run 仍产出 `.{N}` 序号——与上一 run 的 `.{N}` 必冲突 → 规范做法：resume 用新 `--output-dir`（错误信息里直接给这条指引）。
+- **不重写已存在文件**：无启动一次性预检；闸在**首个冲突目标的创建时刻**原子生效——写文件走 `create_new`（O_EXCL），盘上已存在同名文件即该次创建失败 → 硬错并报出该冲突名（提示换 `--output-dir`），逐次一个、race 安全（预检式方案在 TOCTOU 窗口下不可保证，实现口径以 O_EXCL 为准）。**repl 永不 append 既有文件**——接续产物永远新文件，旧产物字节不可变，这是 §4 at-least-once 语义能被人手消费的前提。
+  - 边界：resume 起点在文件 N 中间 → 新 run 仍产出 `.{N}` 序号——写到该文件首次创建时与上一 run 留存的 `.{N}` 必冲突（硬错终止）→ 规范做法：resume 用新 `--output-dir`（错误信息里直接给这条指引）。
 
 ## 6. 心跳、重连与错误面
 

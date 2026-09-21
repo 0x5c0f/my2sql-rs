@@ -259,7 +259,8 @@ P3（repl）追加：
     无限次；认证/权限/purge/server-id 冲突为终止类硬错）；③ 心跳探活
     （`--heartbeat-secs`，连续 2×间隔无事件判死链，TCP 半开兜底）；
     ④ resume 防覆盖闸（自设安全语义：repl 永不 append 既有文件，接续产物
-    永远进新 `--output-dir`，冲突启动即硬错并列出冲突名）——上游
+    永远进新 `--output-dir`；冲突在首个冲突文件的创建时刻以 `create_new`
+    /O_EXCL 原子拒绝并报该冲突名——逐次一个、race 安全，非启动预扫）——上游
     `-mode` 断线即 `log.Fatalf` 终，四件全无对应物。
 24. **repl 强制显式 `--server-id`（无默认）**：上游有默认值——同宿主
     server-id 冲突表现为对端强制断连的静默互踢，我方拒绝代答；另以
