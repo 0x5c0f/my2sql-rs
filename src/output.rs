@@ -24,7 +24,7 @@
 //!   python my2sql 有；T15 白名单已挂「SET NAMES 头」项）。
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -234,16 +234,28 @@ impl Writer {
             let sink = if self.stdout {
                 Sink::Screen
             } else {
-                if self.no_clobber && key.exists() {
-                    return Err(std::io::Error::other(format!(
-                        "refusing to overwrite {}",
-                        key.display()
-                    )));
-                }
                 if let Some(parent) = key.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let f = File::create(key)?;
+                let f = if self.no_clobber {
+                    // TOCTOU 已闭合：旧写法 exists()+File::create 是两步，
+                    // 窗口内落入同名文件仍会被截断；create_new = 单次
+                    // O_CREAT|O_EXCL，判存与创建原子。既存文件只可能以
+                    // AlreadyExists 浮出，映射回钉死的拒覆盖文案（kind 仍
+                    // 为 Other，走 write_group 既有 io 通道）。
+                    match OpenOptions::new().write(true).create_new(true).open(key) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(std::io::Error::other(format!(
+                                "refusing to overwrite {}",
+                                key.display()
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    File::create(key)?
+                };
                 let mut bw = BufWriter::new(f);
                 bw.write_all(FILE_HEADER.as_bytes())?;
                 self.created.push(key.to_path_buf());
@@ -740,6 +752,29 @@ mod tests {
                 utc,
                 "to_sql".into(),
                 false,
+            );
+            w.write_group(&grp("mysql-bin.000001", "d", "t")).unwrap();
+            assert_eq!(w.finish().unwrap(), 1);
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "SET NAMES utf8mb4;\nSELECT 1;\n"
+            );
+        }
+        // create_new 成功路径（fix round 1）：no_clobber=true 且**无**冲突
+        // 时正常建档写入（O_EXCL 只拒既存，不得误伤新文件）。
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut w = Writer::with_live(
+                dir.clone(),
+                false,
+                false,
+                false,
+                utc,
+                "to_sql".into(),
+                false,
+                false,
+                true,
             );
             w.write_group(&grp("mysql-bin.000001", "d", "t")).unwrap();
             assert_eq!(w.finish().unwrap(), 1);
