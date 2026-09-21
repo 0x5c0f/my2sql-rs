@@ -1472,6 +1472,12 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   真机捕获与差分矩阵均无该列）；② GEOMETRY 真机捕获（裁决 7 字节保真
   路径无实抓 fixture）；③ LONGBLOB >64K 前缀行（packlen 4B 档 + 跨页
   payload 未进矩阵）。补捕获即补差分用例，不改解码器。
+- [ ] 已文档化行为（终审核对，**不修**）：`tests/e2e.rs::parse_stmt`
+  （~:463-465）对字面量含 `,`/`(`/`)`/` AND `/` WHERE ` 的敌意输入会
+  panic（`unwrap`/切片越界）——**设计内**：该 helper 仅解析本仓 fixture
+  真件产出的 SQL（`ab`/`xyz` 等字面量不触上述字符，前提见其文档注释），
+  非通用 SQL 解析器；可接受性论证已在测试注释内，此行仅把裁定落进追踪
+  文档。
 - [ ] 已文档化行为（终审核对，**不修**）：writer 写盘错误在 `pump_*` 内
   `emit`/`finish` 处早返回 Err，`pump_parallel` 该路径不 join 已 spawn 的
   worker——整跑已进入终止收敛，worker 阻塞在 `job_rx.recv()` 随通道丢弃

@@ -627,6 +627,9 @@ impl<'a> Runner<'a> {
                                 // Process = 纯 tick（非三关键字 QUERY：DDL/空
                                 // 文本；P2 T9 B.4(b) 对齐上游喂入集，只冲刷
                                 // 窗口/锚点，不碰 biglong 与窗内容）。
+                                // pos 对 Process/Tick 有意弃用：tick 仅需
+                                // binlog+ts 触发窗口判定（上游 stats_process
+                                // .go:247-257 口径），位点在此角色无语义。
                                 TrxStatus::Process => {
                                     crate::stats::StreamEvent::Tick { binlog, ts: *ts }
                                 }

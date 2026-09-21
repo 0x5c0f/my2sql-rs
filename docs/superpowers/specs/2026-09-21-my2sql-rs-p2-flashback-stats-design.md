@@ -110,6 +110,8 @@ my2sql-rs stats [通用同上（除 SQL 文本类旗标：--insert-batch/
 ```
 （`to-sql` 的 `--on-error` 维持 P1 默认 skip 不变——正向少一条仍可用。）
 
+> 勘误（R12）：上列 stats 草图的 `[--on-error stop|skip-bad-event(默认 skip)]` **撤回**——发货 CLI 不在 stats 暴露 `--on-error` 旗标（`StatsArgs` 无此字段，`validate_stats` 恒 `SkipBadEvent`，见 HANDOVER §T5 裁定）；库级 `Stop` 语义保留且已测（tests/stats.rs 用例 5 `stats_e2e_on_error_stop_escalates`）。
+
 ### 3.6 差分与兼容矩阵扩展
 
 - `run-difftest.sh` 增 `WORK_TYPE={2sql|rollback|stats}` 维度：裁判

@@ -92,7 +92,7 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   --threads 8 --output-dir out/stats
 # stats done: events=60, statements rows=36, windows flushed=1,
 #             big/long trx=0, skipped=0
-# binlog_status.txt 首行内容（逐字节）：
+# binlog_status.txt 首条数据行（截尾空格；line 1 为列头）：
 # mysql-bin.000003  2026-09-21_07:30:31 2026-09-21_07:30:31 1605       34706      7        1        0        dt              t_all
 ```
 
