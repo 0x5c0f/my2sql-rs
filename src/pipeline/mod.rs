@@ -4,8 +4,8 @@ pub mod order;
 pub mod source;
 pub mod worker;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -25,6 +25,7 @@ use crate::pipeline::filter::Filters;
 use crate::pipeline::order::Reorder;
 use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine, TrxStatus};
 use crate::pipeline::worker::{Job, Out, OutMode, build_out, worker_loop};
+use crate::repl::checkpoint::{self, Checkpoint};
 use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
 
 /// 装配层错误（管道终止级：源文件级损坏/IO、schema 源不可用、写盘失败；
@@ -263,6 +264,13 @@ struct Runner<'a> {
     /// flashback 形态收集的被排除 DDL/非事务 QUERY（(timestamp, binlog,
     /// start_pos, sql)），run 收尾统一 warn 汇总（简报 Step 4）。
     ddl: Vec<(u32, String, u32, String)>,
+    /// P3 T4 repl 形态提交边界水位队列：`(seq 水位, binlog, pos, ts)`——
+    /// 水位 = 提交/回滚事件派发时刻的 `self.seq`（该事务全部 job 的 seq
+    /// 均 < 水位）；仅 `run_live` 且给定 ckpt 路径时启用，file 模式恒空。
+    ckpt_q: VecDeque<(u64, String, u32, String)>,
+    /// 水位落盘目标（None = 水位机制未启用——file 形态与无 resume 的
+    /// repl 预演形态均不记录、不写档）。
+    ckpt_out: Option<PathBuf>,
 }
 
 impl<'a> Runner<'a> {
@@ -286,6 +294,8 @@ impl<'a> Runner<'a> {
             tmap: HashMap::new(),
             threads: cfg.threads.clamp(1, 64),
             ddl: Vec::new(),
+            ckpt_q: VecDeque::new(),
+            ckpt_out: None,
         }
     }
 
@@ -337,8 +347,10 @@ impl<'a> Runner<'a> {
                 tracing::info!("{} not exists nor a file, stop", path.display());
                 break;
             }
-            let reader = FileReader::open(&self.cfg.binlog_dir, &name, self.filters.clone())?;
-            self.pump_one_file(reader)?;
+            let mut reader = FileReader::open(&self.cfg.binlog_dir, &name, self.filters.clone())?;
+            // P3 T4 纯重构：原 pump_one_file 的泵体泛化到 dyn EventSource
+            // （run_pump 改经 FileReader 装箱调用）——file 模式字节面零变化。
+            self.pump_source(&mut reader, &name)?;
             if !cross_file {
                 break; // 上游默认单文件真相（file.go:74-85）
             }
@@ -359,6 +371,93 @@ impl<'a> Runner<'a> {
             ));
         };
         w.finish().map_err(Into::into)
+    }
+
+    /// P3 T4 repl 形态泵入口：`src` 为任意 `EventSource`（生产 = T2
+    /// `ReplSource`，测试 = 假流回放），`first_binlog` = 本源起始文件名，
+    /// `ckpt` = 断点档路径（None = 不启用水位，行为同 file 模式的纯泵）。
+    /// 与 `run_pump` 共用 `pump_source` 泵体；每次 Commit/Rollback 派发记
+    /// 水位，reorder 弹出越过水位 → `flush_all` + 原子写档 + pop（细节见
+    /// `ckpt_drain`）。**不调 `Writer::finish`**——repl 跨重连存活，句柄
+    /// 收尾归调用方（T5）。返回摘要（`files` = 已创建 .sql 文件数）。
+    // Runner 为 crate-private 装配结构：本入口的活体消费者是 T5
+    // `run_repl`（同文件替换桩体即消警）；本层由 live_tests 全链钉死。
+    #[allow(dead_code)]
+    pub fn run_live(
+        &mut self,
+        mut src: Box<dyn EventSource>,
+        first_binlog: &str,
+        ckpt: Option<&Path>,
+    ) -> Result<RunSummary, PipelineError> {
+        self.ckpt_out = ckpt.map(|p| p.to_path_buf());
+        let pumped = self.pump_source(src.as_mut(), first_binlog);
+        // 泵 Err（断链/stop_on_error）也要末次冲试：水位判据是「已弹出 +
+        // 已 flush」，对未完整事务天然关闭，Err 路径不越界（钉死于 kill
+        // 模拟单测）；泵成功时兜住「尾提交后无新 emit 触发」的并行末窗。
+        let drained = self.ckpt_drain();
+        pumped?;
+        drained?;
+        let mut sum = self.summary;
+        sum.files = match &self.emitter {
+            Emitter::Sql(w) => w.created().len(),
+            _ => 0,
+        };
+        Ok(sum)
+    }
+
+    /// 提交边界水位推进（P3 T4）：队首水位（= 提交事件派发时刻的 seq）
+    /// ≤ reorder 已弹出数 ⟹ 该事务的全部 job 已经 reorder 保序弹出且经
+    /// `emit` 写入 Writer——此时 `flush_all` 落盘、以 `writer.created()`
+    /// 快照 `written_files`、原子写档、pop。file 模式 `ckpt_q` 恒空，
+    /// 首行判空即返回（零成本、零语义）。
+    fn ckpt_drain(&mut self) -> Result<(), PipelineError> {
+        // 未武装（ckpt_out=None，含 run_live 前后两态切换的残队场景）即静默
+        // 返回——水位机整体不启用，expect 分支不可达。
+        if self.ckpt_out.is_none() {
+            return Ok(());
+        }
+        while !self.ckpt_q.is_empty() {
+            let through = self.reorder.emitted_through();
+            if self.ckpt_q.front().expect("non-empty checked").0 > through {
+                break;
+            }
+            let (wm, binlog, pos, ts) = self.ckpt_q.pop_front().expect("front checked");
+            let path = self
+                .ckpt_out
+                .clone()
+                .expect("ckpt_q 仅在 ckpt_out=Some 时记录");
+            let w = match &mut self.emitter {
+                Emitter::Sql(w) => w,
+                _ => {
+                    return Err(PipelineError::Config(
+                        "internal: live checkpoint on non-sql emitter".into(),
+                    ));
+                }
+            };
+            // 顺序钉死：数据先 flush_all 可见，written_files 快照其后——
+            // checkpoint 声称存在的文件必然已在盘上（恢复侧 read_verify 前提）。
+            w.flush_all()?;
+            let written_files = w
+                .created()
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            let cp = Checkpoint {
+                file: binlog,
+                pos,
+                ts,
+                written_files,
+            };
+            checkpoint::write_atomic(&path, &cp)?;
+            tracing::debug!(
+                watermark = wm,
+                binlog = %cp.file,
+                pos = cp.pos,
+                path = %path.display(),
+                "repl checkpoint advanced to transaction boundary"
+            );
+        }
+        Ok(())
     }
 
     /// flashback 形态 = 通用泵 + 逆序回写；任何 Err 返回前清场半成品
@@ -441,15 +540,19 @@ impl<'a> Runner<'a> {
         }
     }
 
-    /// 单文件消费（threads==1 直通 / 并行 worker 池两条路径）。
-    fn pump_one_file<R: std::io::Read + std::io::Seek>(
+    /// 事件泵总入口（P3 T4）：单线程直通 / 并行 worker 池两条路径分派。
+    /// `opening_binlog` = 本源起始文件名（ReplSource 起始定位；file 形态
+    /// 即当前泵读的文件名）。原 `pump_one_file` 泛化为 `&mut dyn EventSource`
+    /// ——纯重构，file 模式字节面零变化（钉死于 P1 e2e 全量回归）。
+    fn pump_source(
         &mut self,
-        reader: FileReader<R>,
+        src: &mut dyn EventSource,
+        opening_binlog: &str,
     ) -> Result<(), PipelineError> {
         if self.threads == 1 {
-            self.pump_direct(reader)
+            self.pump_direct(src, opening_binlog)
         } else {
-            self.pump_parallel(reader)
+            self.pump_parallel(src, opening_binlog)
         }
     }
 
@@ -458,8 +561,34 @@ impl<'a> Runner<'a> {
     /// P2 修复轮：stop 形态（仅 flashback）下 prepare 侧错误升整跑 Err
     /// （spec §3.2 完整性——不完整且不标记的回滚脚本绝不落盘）；to-sql 侧
     /// stop_on_error() 恒 false，计数跳过行为逐字节不变。
-    fn prepare(&mut self, ev: RawEvent) -> Result<Option<Job>, PipelineError> {
+    /// `opening_binlog` = 本泵事件源的起始文件名（P3 T4 起供 repl 形态
+    /// checkpoint 记录兜底；file 形态不消费）。
+    fn prepare(
+        &mut self,
+        ev: RawEvent,
+        opening_binlog: &str,
+    ) -> Result<Option<Job>, PipelineError> {
         let (trx_id, status) = self.trx.feed(&ev);
+        // P3 T4 repl 水位登记：Commit/Rollback 事件（Xid / COMMIT /
+        // ROLLBACK / autocommit DDL）派发时刻的 self.seq = 该事务（及其前）
+        // 全部 job 的 seq 上界；binlog 兜底 opening_binlog（源不变式恒非空，
+        // 防御分支）。file 形态 ckpt_out=None，本分支恒不进。
+        if self.ckpt_out.is_some() && matches!(status, TrxStatus::Commit | TrxStatus::Rollback) {
+            let binlog = if ev.binlog.is_empty() {
+                opening_binlog.to_string()
+            } else {
+                ev.binlog.clone()
+            };
+            self.ckpt_q.push_back((
+                self.seq,
+                binlog,
+                ev.end_pos,
+                datetime_str(ev.timestamp, self.cfg.time_zone),
+            ));
+            // 弹出侧触发点在 emit()；此处触发覆盖「提交事件到达即水位已达」
+            // 的 threads=1 常见形（并行在飞未齐则留队，emit 时再推）。
+            self.ckpt_drain()?;
+        }
         if !matches!(ev.kind, RawKind::Rows(..)) {
             // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）。
             // flashback 形态：非事务性 QUERY（DDL 等）登记排除清单，run 收尾
@@ -651,16 +780,20 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+        // P3 T4：reorder 弹出即「该 seq 前（含）数据已入 Writer」——水位
+        // 推进的 emit 侧触发点（file 模式 ckpt_q 恒空，判空即返回）。
+        self.ckpt_drain()?;
         Ok(())
     }
 
     /// 单线程直通：无通道无线程，build 内联，reorder 恒零滞留。
-    fn pump_direct<R: std::io::Read + std::io::Seek>(
+    fn pump_direct(
         &mut self,
-        mut reader: FileReader<R>,
+        src: &mut dyn EventSource,
+        opening_binlog: &str,
     ) -> Result<(), PipelineError> {
-        while let Some(ev) = reader.next()? {
-            let Some(job) = self.prepare(ev)? else {
+        while let Some(ev) = src.next()? {
+            let Some(job) = self.prepare(ev, opening_binlog)? else {
                 continue;
             };
             let seq = job.seq;
@@ -693,9 +826,10 @@ impl<'a> Runner<'a> {
 
     /// 并行路径：bounded 作业队列 + unbounded 结果回流；reorder pending >
     /// 2×threads 时 dispatcher 阻塞补收（spec §5.1 统一反压规则）。
-    fn pump_parallel<R: std::io::Read + std::io::Seek>(
+    fn pump_parallel(
         &mut self,
-        mut reader: FileReader<R>,
+        src: &mut dyn EventSource,
+        opening_binlog: &str,
     ) -> Result<(), PipelineError> {
         let (job_tx, job_rx) = bounded::<Job>(self.threads * 2);
         let (res_tx, res_rx): (Sender<(u64, Vec<Out>)>, _) = unbounded();
@@ -719,8 +853,8 @@ impl<'a> Runner<'a> {
         drop(job_rx);
         drop(res_tx); //  dispatcher 侧只 recv；所有 worker 结束后通道才闭合
 
-        while let Some(ev) = reader.next()? {
-            if let Some(job) = self.prepare(ev)? {
+        while let Some(ev) = src.next()? {
+            if let Some(job) = self.prepare(ev, opening_binlog)? {
                 // 反压前清收 + 超限阻塞收取（progress 保证：worker 永不阻塞在发送侧）
                 self.reap(&res_rx)?;
                 while self.reorder.pending() > self.threads * 2 {
@@ -773,5 +907,312 @@ impl<'a> Runner<'a> {
             self.emit(ready)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    //! P3 T4：`run_live` 提交边界水位单测（假 EventSource 回放 synth 事件，
+    //! 无服务器、无真 binlog 文件）。
+
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::process;
+    use std::sync::Arc;
+
+    use clap::Parser;
+
+    use super::{Emitter, Runner};
+    use crate::binlog::error::BinlogError;
+    use crate::binlog::rows::RowsKind;
+    use crate::binlog::table_map::TableMapEvent;
+    use crate::config::{Cli, Command, Config};
+    use crate::metadata::store::SchemaStore;
+    use crate::output::{Writer, datetime_str};
+    use crate::pipeline::filter::Filters;
+    use crate::pipeline::source::{EventSource, RawEvent, RawKind};
+    use crate::repl::checkpoint::{Checkpoint, read_verify};
+    use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!(
+            "my2sql-p3t4-live-{}-{}-{}",
+            tag,
+            process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 离线 schema（version 1，与 tests/e2e.rs 同族）：t10.a(id INT, pk)。
+    fn schema_file(dir: &std::path::Path) -> PathBuf {
+        let p = dir.join("schema.json");
+        std::fs::write(
+            &p,
+            r#"{"version":1,"tables":[{"db":"t10","table":"a","cols":[{"name":"id","type_name":"int","unsigned":false}],"pk":["id"],"uks":[]}]}"#,
+        )
+        .unwrap();
+        p
+    }
+
+    fn config_from(dir: &std::path::Path, schema: &std::path::Path) -> Config {
+        let cli = Cli::try_parse_from([
+            "my2sql-rs",
+            "to-sql",
+            "--binlog-dir",
+            dir.join("binlog").to_str().unwrap(),
+            "--start-file",
+            "mysql-bin.000001",
+            "--schema-file",
+            schema.to_str().unwrap(),
+            "--output-dir",
+            dir.join("out").to_str().unwrap(),
+            "--threads",
+            "1",
+        ])
+        .expect("cli parse");
+        let Command::ToSql(a) = cli.cmd else {
+            panic!("to-sql expected")
+        };
+        Config::validate_to_sql(a).expect("config validate")
+    }
+
+    fn tm() -> TableMapEvent {
+        TableMapEvent {
+            table_id: 85,
+            schema: "t10".into(),
+            table: "a".into(),
+            n_cols: 1,
+            column_type: vec![3],
+            column_meta: vec![0],
+            null_bits: vec![0],
+            charset: vec![],
+        }
+    }
+
+    /// WRITE_ROWS_V2 最小体（镜像 worker.rs 单测构造器）。
+    fn write_body(tid: u64, val: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&tid.to_le_bytes()[..6]);
+        b.extend_from_slice(&[0u8; 2]);
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.push(1);
+        b.push(1);
+        b.push(0);
+        b.extend_from_slice(&val.to_le_bytes());
+        b
+    }
+
+    fn base(kind: RawKind, start: u32, end: u32, ts: u32) -> RawEvent {
+        RawEvent {
+            binlog: "mysql-bin.000001".into(),
+            start_pos: start,
+            end_pos: end,
+            timestamp: ts,
+            kind,
+            body: Vec::new(),
+            tm: None,
+        }
+    }
+
+    fn q(sql: &str, end: u32, ts: u32) -> RawEvent {
+        base(RawKind::Query(sql.into()), end - 20, end, ts)
+    }
+    fn xid(end: u32, ts: u32) -> RawEvent {
+        base(RawKind::Xid, end - 20, end, ts)
+    }
+    fn rows(val: i32, end: u32, ts: u32) -> RawEvent {
+        let mut ev = base(RawKind::Rows(RowsKind::Write, true), end - 50, end, ts);
+        ev.body = write_body(85, val);
+        ev.tm = Some(Arc::new(tm()));
+        ev
+    }
+
+    /// 假源：VecDeque 回放（含尾部 Err 注入）；每次出件前调 probe——
+    /// probe 观察的是「此前所有事件已泵完」时刻的 checkpoint/落盘实态。
+    struct FakeSrc {
+        q: VecDeque<Result<Option<RawEvent>, BinlogError>>,
+        probe: Box<dyn FnMut(usize)>,
+    }
+    impl EventSource for FakeSrc {
+        fn next(&mut self) -> Result<Option<RawEvent>, BinlogError> {
+            (self.probe)(self.q.len());
+            match self.q.pop_front() {
+                Some(r) => r,
+                None => Ok(None),
+            }
+        }
+    }
+
+    fn read_cp(path: &std::path::Path) -> Option<Checkpoint> {
+        match std::fs::read(path) {
+            Ok(raw) => Some(serde_json::from_slice(&raw).expect("checkpoint JSON 合法")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("read {}: {e}", path.display()),
+        }
+    }
+
+    /// Step 1 钉死测试：checkpoint 的 pos **总是**等于「已完整 flush 事务的
+    /// 提交事件 end_pos」（每次出件前 probe 断言 ∈ {200,500}），泵中注入
+    /// Err（kill 模拟）后 checkpoint 停在整事务边界 500——tr3 的行虽已
+    /// 落盘，其未提交即不得进水位。
+    #[test]
+    fn ckpt_watermark_advances_only_after_full_trx_flushed() {
+        let dir = tmpdir("kill");
+        let schema = schema_file(&dir);
+        let cfg = config_from(&dir, &schema);
+        let out = dir.join("out");
+        let ckpt_path = dir.join("checkpoint.json");
+        let sql_file = out.join("to_sql.1.sql");
+        // 提交边界 end_pos 全集：trx1 Xid@200、trx2 ROLLBACK@500。
+        // 行事件 end_pos（150/350/450/650）**绝不允许**出现在 checkpoint。
+        let commit_end_positions = [200u32, 500];
+
+        let evs: Vec<Result<Option<RawEvent>, BinlogError>> = vec![
+            Ok(Some(q("BEGIN", 100, 1700000000))),
+            Ok(Some(rows(1, 150, 1700000000))),
+            Ok(Some(xid(200, 1700000000))), // trx1 提交边界①
+            Ok(Some(q("BEGIN", 300, 1700000100))),
+            Ok(Some(rows(2, 350, 1700000100))),
+            Ok(Some(rows(3, 450, 1700000100))),
+            Ok(Some(q("ROLLBACK", 500, 1700000100))), // trx2 结束边界②
+            Ok(Some(q("BEGIN", 600, 1700000200))),
+            Ok(Some(rows(4, 650, 1700000200))), // trx3 未提交……
+            Err(BinlogError::InvalidData(
+                "kill simulated: link dropped".into(),
+            )), // ……即断链
+        ];
+
+        let ckpt_probe = ckpt_path.clone();
+        let sql_probe = sql_file.clone();
+        let probe = move |i: usize| {
+            let cp = read_cp(&ckpt_probe);
+            if let Some(cp) = &cp {
+                assert!(
+                    commit_end_positions.contains(&cp.pos),
+                    "step {i}: checkpoint pos={} 不是任何整事务提交事件 end_pos",
+                    cp.pos
+                );
+            }
+            match cp {
+                None => {}
+                Some(cp) if cp.pos == 200 => {
+                    // 水位=200 ⟹ trx1 的行必已 flush 可见（可能含更后的行——
+                    // 方向是安全的「落后可重复消费」）
+                    let s = std::fs::read_to_string(&sql_probe).expect("trx1 flush 先于水位推进");
+                    assert!(
+                        s.contains("INSERT INTO `t10`.`a` (`id`) VALUES (1);"),
+                        "{s}"
+                    );
+                }
+                Some(cp) => {
+                    // 水位=500 ⟹ trx1+trx2 全部行已 flush
+                    assert_eq!(cp.pos, 500, "probe 值域已过滤，只剩 500");
+                    let s = std::fs::read_to_string(&sql_probe).expect("trx2 flush");
+                    for v in ["(1)", "(2)", "(3)"] {
+                        assert!(
+                            s.contains(&format!("INSERT INTO `t10`.`a` (`id`) VALUES {v};")),
+                            "pos=500 时行 {v} 应已落盘: {s}"
+                        );
+                    }
+                }
+            }
+        };
+
+        let store = SchemaStore::offline(&schema).unwrap();
+        let writer = Writer::with_live(
+            out.clone(),
+            false,
+            false,
+            false,
+            cfg.time_zone,
+            "to_sql".into(),
+            false,
+            true,  // streaming（repl 实时可见性，T3 接口）
+            false, // no_clobber（本测试从空目录起）
+        );
+        let mut st = Runner::new(
+            &cfg,
+            Filters::from_config(&cfg),
+            store,
+            DmlBuilder::new(SqlOpts::from_config(&cfg)),
+            Emitter::Sql(writer),
+        );
+        let fake = FakeSrc {
+            q: evs.into(),
+            probe: Box::new(probe),
+        };
+        let e = st
+            .run_live(Box::new(fake), "mysql-bin.000001", Some(&ckpt_path))
+            .expect_err("注入的断链 Err 必须原样上抛");
+        assert!(format!("{e:#}").contains("kill simulated"), "got: {e:#}");
+
+        // kill 后：水位停在最后一个整事务边界 500（trx3 的行已落盘但未提交，
+        // 不得进水位——恢复时从 500 起重复消费，方向安全）。
+        let cp = read_cp(&ckpt_path).expect("至少推进过一次水位");
+        assert_eq!(cp.pos, 500, "Err 后水位必须停在整事务边界");
+        assert_eq!(cp.file, "mysql-bin.000001");
+        assert_eq!(cp.ts, datetime_str(1700000100, cfg.time_zone));
+        assert_eq!(cp.written_files, vec!["to_sql.1.sql".to_string()]);
+        read_verify(&ckpt_path, &out).expect("written_files 与实物一一对应");
+        let s = std::fs::read_to_string(&sql_file).unwrap();
+        assert!(
+            s.contains("VALUES (4)"),
+            "tr3 已 emit 的行在盘（水位落后于数据，非相反）"
+        );
+    }
+
+    /// 干净 EOF 路径：全 3 事务 + 尾 Xid@700 → Ok 摘要 + 水位推到最后一格。
+    #[test]
+    fn ckpt_watermark_reaches_last_commit_on_clean_stop() {
+        let dir = tmpdir("clean");
+        let schema = schema_file(&dir);
+        let cfg = config_from(&dir, &schema);
+        let out = dir.join("out");
+        let ckpt_path = dir.join("checkpoint.json");
+
+        let evs: VecDeque<Result<Option<RawEvent>, BinlogError>> = [
+            Ok(Some(q("BEGIN", 100, 1))),
+            Ok(Some(rows(1, 150, 1))),
+            Ok(Some(xid(200, 1))),
+            Ok(Some(q("BEGIN", 300, 2))),
+            Ok(Some(rows(2, 350, 2))),
+            Ok(Some(q("COMMIT", 400, 2))),
+        ]
+        .into();
+        let store = SchemaStore::offline(&schema).unwrap();
+        let writer = Writer::with_live(
+            out.clone(),
+            false,
+            false,
+            false,
+            cfg.time_zone,
+            "to_sql".into(),
+            false,
+            true,
+            false,
+        );
+        let mut st = Runner::new(
+            &cfg,
+            Filters::from_config(&cfg),
+            store,
+            DmlBuilder::new(SqlOpts::from_config(&cfg)),
+            Emitter::Sql(writer),
+        );
+        let fake = FakeSrc {
+            q: evs,
+            probe: Box::new(|_| {}),
+        };
+        let sum = st
+            .run_live(Box::new(fake), "mysql-bin.000001", Some(&ckpt_path))
+            .expect("干净 EOF → Ok");
+        assert_eq!(sum.events, 2);
+        assert_eq!(sum.files, 1);
+        assert_eq!(read_cp(&ckpt_path).expect("水位").pos, 400);
     }
 }

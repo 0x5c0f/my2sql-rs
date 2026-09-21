@@ -57,6 +57,12 @@ impl<T> Reorder<T> {
         self.buf.len()
     }
 
+    /// 已完成弹出数（P3 T4 checkpoint 水位判据：全部 `seq < 返回值` 均已
+    /// 保序弹出并交 `emit` 写出；纯只读，不改任何弹出语义）。
+    pub fn emitted_through(&self) -> u64 {
+        self.next
+    }
+
     /// 收尾：全部 seq 到齐后缓冲应为空；若非空（上游断流/bug）按 seq 升序
     /// 强制吐出，不丢数据。
     pub fn drain_remaining(&mut self) -> Vec<T> {
