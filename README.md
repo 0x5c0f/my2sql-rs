@@ -133,6 +133,9 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   连续 2×间隔无事件判死链走重连；空闲 master 上 Ctrl-C/stop 的停泵延迟以
   心跳周期为界——**0 同时禁用死链探测与空闲期即时中断**）；
   `--resume-file` 与 `--to-stdout` 互斥。
+- 输出目标必须显式（终审 FIX F）：`--output-dir` 与 `--to-stdout` 二选一，
+  两者皆缺启动即拒——**repl 绝不写当前工作目录**；`--resume-file` 恒需
+  `--output-dir`（checkpoint 与盘上产物对账）。
 - 语义 = **每事务至少一次**：崩溃重放最多重复 checkpoint 之后的完整事务，
   绝不半途切开；重复段可由产物与 `written_files` 名单界定
   （kill-9 接续零丢失由 live 件 `repl_kill9_resume_zero_loss` 钉死）。

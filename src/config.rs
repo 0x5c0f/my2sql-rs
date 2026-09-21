@@ -415,7 +415,10 @@ impl Config {
     ///    互斥——同为显式定位来源，同给即「位点来源歧义」硬错；
     /// 3. `--resume-file` + `--to-stdout` 拒——checkpoint 的 written_files 需
     ///    与盘上产物对账（T3 契约），stdout 形态无从对账；
-    /// 4. `--heartbeat-secs` 仅上限 3600（0 合法=禁用，spec §1）。
+    /// 4. `--heartbeat-secs` 仅上限 3600（0 合法=禁用，spec §1）；
+    ///    4b.（FIX F）输出目标闸：`--output-dir` 与 `--to-stdout` 均缺即拒
+    ///    （裸 repl 曾静默写当前工作目录且永无 checkpoint；`--resume-file`
+    ///    恒需 `--output-dir`）。镜像 `run_to_sql` 的守卫至 config 层。
     ///    其余位点/窗口对偶校验（stop_pos>start_pos、start<stop datetime 等）
     ///    复用 `build_common`。server-id 无 clap 默认=拒绝代答（冲突静默丢事件）。
     pub fn validate_repl(args: ReplArgs) -> Result<Config, String> {
@@ -460,6 +463,18 @@ impl Config {
                 "--heartbeat-secs must be in 0..=3600, got {} (0 disables heartbeat probing)",
                 args.heartbeat_secs
             ));
+        }
+        // FIX F（终审）：输出目标闸前移到 config 层——裸 repl 曾在**当前
+        // 工作目录**静默写 to_sql.N.sql，且该形态下 checkpoint 永不会写
+        // （写档恒为 {output-dir}/resume.json），镜像 run_to_sql 的守卫。
+        if !args.to_stdout && args.common.output_dir.is_none() {
+            return Err(
+                "repl: output target required — pass --output-dir D (SQL files and the \
+                 resume.json checkpoint land there; --resume-file requires --output-dir) \
+                 or --to-stdout (streaming shape with no on-disk checkpoint); repl never \
+                 writes into the current working directory"
+                    .into(),
+            );
         }
         let mut cfg = build_common(&args.common)?;
         apply_sql(&mut cfg, &args.text);
@@ -738,7 +753,9 @@ mod tests {
         a
     }
 
-    /// now 哨兵 + server-id 的合法最小基座（uri 由 extra 决定有无）。
+    /// now 哨兵 + server-id + 输出目录的合法最小基座（uri 由 extra 决定有无；
+    /// FIX F 后输出目标为合法臂必备成分，bare 形态拒绝由
+    /// `repl_requires_output_target` 独占钉）。
     fn rargs(extra: &[&str]) -> ReplArgs {
         let mut v = vec![
             "--binlog-dir",
@@ -749,6 +766,8 @@ mod tests {
             "0",
             "--server-id",
             "7",
+            "--output-dir",
+            "/o",
         ];
         v.extend_from_slice(extra);
         repl_parsed(&v)
@@ -879,6 +898,8 @@ mod tests {
             "mysql://x@y",
             "--server-id",
             "7",
+            "--output-dir",
+            "/o",
             "--start-file",
             "",
             "--start-datetime",
@@ -894,6 +915,8 @@ mod tests {
             "mysql://x@y",
             "--server-id",
             "7",
+            "--output-dir",
+            "/o",
             "--start-file",
             "f.000001",
             "--start-pos",
@@ -927,6 +950,60 @@ mod tests {
         assert!(
             Config::validate_repl(rargs(&["--uri", "mysql://x@y", "--heartbeat-secs", "3601"]))
                 .is_err()
+        );
+    }
+
+    /// 终审 FIX F：裸 `repl`（既无 --output-dir 又无 --to-stdout）曾在
+    /// **当前工作目录**静默写 to_sql.N.sql 且永无 checkpoint（写档恒为
+    /// {output-dir}/resume.json）。run_to_sql 的输出目标闸前移到
+    /// validate_repl（config 层，启动即拒）。
+    #[test]
+    fn repl_requires_output_target() {
+        let e = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "",
+            "--uri",
+            "mysql://x@y",
+            "--server-id",
+            "7",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("output-dir") && e.contains("to-stdout"), "{e}");
+        assert!(
+            e.contains("resume"),
+            "--resume-file 须 --output-dir 的指引: {e}"
+        );
+        // 两合法臂各过：--to-stdout（该形态无盘上档）/--output-dir
+        assert!(
+            Config::validate_repl(repl_parsed(&[
+                "--binlog-dir",
+                "/d",
+                "--start-file",
+                "",
+                "--uri",
+                "mysql://x@y",
+                "--server-id",
+                "7",
+                "--to-stdout",
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Config::validate_repl(repl_parsed(&[
+                "--binlog-dir",
+                "/d",
+                "--start-file",
+                "",
+                "--uri",
+                "mysql://x@y",
+                "--server-id",
+                "7",
+                "--output-dir",
+                "/o",
+            ]))
+            .is_ok()
         );
     }
 
