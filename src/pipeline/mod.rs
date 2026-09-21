@@ -265,9 +265,11 @@ pub(crate) const RESUME_GONE_PREFIX: &str = "resume point is gone: ";
 const BACKOFF_CAP_SECS: f64 = 30.0;
 /// 同因快速失败的连发窗口（毫秒）：两次同因失败间隔 ≥ 本窗即重置计数
 /// ——主库重启级故障（退避自然拉长后间隔必超窗）绝不被误杀；server-id
-/// 互踢循环封顶后间隔 ~31s 仍 < 60s 窗，第 3 连发必终止。
+/// 互踢循环（1236 特征或 FIX E 的裸强制断连形态）封顶后间隔 ~31s 仍
+/// < 60s 窗，第 3 连发必终止。
 pub(crate) const SERVER_ID_GRACE_MS: u64 = 60_000;
-/// 同因秒断终止阈值（spec §6「连续 3 次同因秒断即终止报错」）。
+/// 同因秒断终止阈值（spec §6「连续 3 次同因秒断即终止报错」；适用范围
+/// ServerIdConflict + Disconnect，终审 FIX E）。
 const FAST_FAIL_LIMIT: u32 = 3;
 
 /// 位点三态 + resume 的判定结果（纯函数可测，控制器裁定：start_file 空
@@ -832,11 +834,26 @@ pub(crate) fn run_repl_with(
         }
         // ── 可重连面：同因秒断终止闸 → 退避 → checkpoint 起点重开 ──
         let streak = tracker.observe(rep.kind, (env.now_ms)());
-        if rep.kind == FailKind::ServerIdConflict && streak >= FAST_FAIL_LIMIT {
+        // 带 1236 特征的 server-id 冲突 3 连即终止（T5 原判）；终审 FIX E：
+        // 真实互踢常是**无特征的干净强制断连**（Disconnect）——tracker 的
+        // 同类 streak 语义保证所有间隔 < grace（任一宽间隔重置为 1，主库
+        // 重启级故障不误杀），故 Disconnect 同 3-strike 也按疑似互踢快速
+        // 失败，不再无限循环。
+        if matches!(rep.kind, FailKind::ServerIdConflict | FailKind::Disconnect)
+            && streak >= FAST_FAIL_LIMIT
+        {
+            let (lead, trail) = if rep.kind == FailKind::ServerIdConflict {
+                ("server-id conflict suspected", " (master kicks both)")
+            } else {
+                (
+                    "repeated master-initiated disconnects — server-id conflict is the primary hypothesis",
+                    " (a mutual kick usually presents as a clean forced shutdown without any 1236 feature; verify network and master `SHOW SLAVE HOSTS` before concluding otherwise)",
+                )
+            };
             break Err(PipelineError::Config(format!(
                 "repl: {streak} consecutive same-cause disconnects within {SERVER_ID_GRACE_MS}ms \
-                 of each other — server-id conflict suspected: another slave shares \
-                 --server-id {} (master kicks both). Fix the id and restart (last cause: {})",
+                 of each other — {lead}: another slave shares --server-id {}{trail}. \
+                 Fix the id and restart (last cause: {})",
                 cfg.server_id.unwrap_or(0),
                 rep.cause
             )));
@@ -2606,6 +2623,68 @@ mod repl_tests {
         );
         assert_eq!(waits.len(), 2, "仅前两次失败后进退避");
         assert!(!flag.load(Ordering::Relaxed), "终止路径不走中断旗标");
+    }
+
+    /// 终审 FIX E 红件（互踢 = 裸断连形态）：真实 server-id 冲突常不发
+    /// 1236 特征包而是**干净强制断连**（主库踢双方）——旧闸只认
+    /// FailKind::ServerIdConflict（:835 修复前），此形态退避重试无限循环、
+    /// 永不报错。新契约：同因 Disconnect 3 连**秒**断（tracker 同款 streak
+    /// 语义即「全部间隔 < grace」，宽间隔重置为 1 → 主库重启级故障不误杀）
+    /// 同样终止，文案点名 server-id 冲突为主假设。假流在第 4 次 open 设
+    /// 逃逸门：修复前必然走到（expect 到 Ok → expect_err 红）；修复后
+    /// 恰 3 开 2 退避，绝不触及第 4。
+    #[test]
+    fn bare_disconnect_streak_three_terminates_as_serverid_suspect() {
+        let (_dir, _out, cfg) = repl_cfg(&["--start-file", "mysql-bin.000001"]);
+        let opens: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut opener = {
+            let opens = opens.clone();
+            let flag = flag.clone();
+            move |f: &str, p: u32| {
+                let mut v = opens.lock().unwrap();
+                v.push((f.to_string(), p));
+                let call = v.len();
+                drop(v);
+                if call >= 4 {
+                    // 逃逸门（仅旧形态可及——其「永不终止」缺陷的证据位）
+                    flag.store(true, Ordering::Relaxed);
+                    return Ok(Box::new(FakeStream::new(vec![])) as Box<dyn FrameStream>);
+                }
+                Ok(Box::new(FakeStream::with_tail(
+                    vec![],
+                    ReplError::Disconnect(
+                        "connection killed by master: forced shutdown of slave".into(),
+                    ),
+                )) as Box<dyn FrameStream>)
+            }
+        };
+        let mut waits: Vec<Duration> = vec![];
+        let mut wait = |d: Duration| waits.push(d);
+        let mut t_ms = 0u64;
+        let mut clock = || {
+            t_ms += 300;
+            t_ms
+        };
+        let mut env = ReplEnv {
+            open: &mut opener,
+            wait: &mut wait,
+            now_ms: &mut clock,
+            interrupt: flag.clone(),
+        };
+        let e = run_repl_with(&cfg, store_for(&_dir), &mut env)
+            .expect_err("同因 3 连**裸**秒断必须终止（修复前形态无限循环永不报错）");
+        let s = format!("{e:#}");
+        assert!(
+            s.contains("server-id"),
+            "终止文案须点名 server-id 冲突为主假设，got: {s}"
+        );
+        assert_eq!(
+            *opens.lock().unwrap(),
+            vec![("mysql-bin.000001".to_string(), 4u32); 3],
+            "恰 3 次开流，不得触及逃逸门"
+        );
+        assert_eq!(waits.len(), 2, "仅前两次失败后进退避");
     }
 
     /// 终止面文案逐字（简报钉）：purge / auth / privilege；零重连零退避。
