@@ -9,5 +9,6 @@ pub mod flashback;
 pub mod metadata;
 pub mod output;
 pub mod pipeline;
+pub mod repl;
 pub mod sqlopen;
 pub mod stats;
