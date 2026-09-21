@@ -128,9 +128,10 @@ fn repl_subcommand_visible_and_rejects_bad_args() {
 }
 
 #[test]
-fn repl_valid_args_dispatch_to_run_repl_stub_exit_1() {
-    // dispatch 面本任务定稿：参数合法 → run_repl 空壳真实 Err → main 打印并退 1
-    // （非 clap/validate 的 exit 2 通道；T5 仅替换函数体）。
+fn repl_valid_args_dispatch_to_real_run_repl_exit_1() {
+    // dispatch 面 T1 定稿、T5 换芯：参数合法 → 真实 run_repl 尝试连主 →
+    // 连接失败真实 Err → main 打印并退 1（非 clap/validate 的 exit 2 通道；
+    // 桩文本 "pipeline not built" 已退役，见 task-5-report）。
     let out = bin()
         .args([
             "repl",
@@ -151,7 +152,11 @@ fn repl_valid_args_dispatch_to_run_repl_stub_exit_1() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("repl: pipeline not built (P3 T5)"), "{err}");
+    assert!(err.contains("mysql error"), "{err}");
+    assert!(
+        !err.contains("pipeline not built"),
+        "T5 后桩文本不得再现: {err}"
+    );
 }
 
 #[test]

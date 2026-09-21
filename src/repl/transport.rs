@@ -69,10 +69,16 @@ pub enum ReplError {
 
 /// 建立注册从库 + BINLOG_DUMP 升级，返回帧流（消耗内部 Conn）。
 ///
-/// - `heartbeat = Some(d)`：dump 升级前同连接 `SET @master_heartbeat_period
-///   = <ns>`（spec §2 勘误-4：BinlogRequest/flags 无心跳入口，唯一实测通路）。
-///   SET 失败**不致命**——静默降级为无心跳流，Option 原样保留给 T5 用读
-///   超时兜底（§6 死链探测）。
+/// - `heartbeat = Some(d)`：①dump 升级前同连接 `SET @master_heartbeat_period
+///   = <ns>`（spec §2 勘误-4：BinlogRequest/flags 无心跳入口，唯一实测通路）；
+///   ②**T5 裁定的客户端探活兜底**：连接级 socket 读超时 `2d + 1s`（本层
+///   原注释预留的 Option 用途，spec §6「连续 2×间隔无任何帧即死链」）。
+///   mysql 28.0.2 无 URL 级 read_timeout 参（白名单硬错），但
+///   `OptsBuilder::read_timeout` 在 connect_stream 落到 `set_read_timeout`
+///   ——超时以 `IoError(WouldBlock)` 冒泡 → `is_connectivity_error` →
+///   本层归 [`ReplError::Disconnect`] → T5 重连分类学接管（每次尝试都是
+///   全新 open，中毒流无害）。SET 失败**不致命**——静默降级为无服务端
+///   心跳流（读超时兜底仍在场，探活变慢但方向正确）。
 /// - TLS 不提供（spec §2 勘误-5：`Opts::from_url` 白名单无 ssl 项，未知
 ///   query 参硬错），uri 原样透传。
 pub fn open(
@@ -83,7 +89,13 @@ pub fn open(
     heartbeat: Option<Duration>,
 ) -> Result<Box<dyn FrameStream>, ReplError> {
     let opts = Opts::from_url(uri).map_err(|e| ReplError::Protocol(format!("invalid uri: {e}")))?;
-    let mut conn = Conn::new(opts).map_err(map_mysql_error)?;
+    let mut builder = mysql::OptsBuilder::from_opts(opts);
+    if let Some(d) = heartbeat {
+        // 2× 间隔 + 1s 宽限：服务端心跳按 d 送达，任何 ≤2d 的静默都是
+        // 正常；连续无帧超 2d 即半开死链（§6），读超时把它变成 Err。
+        builder = builder.read_timeout(Some(d * 2 + Duration::from_secs(1)));
+    }
+    let mut conn = Conn::new(builder).map_err(map_mysql_error)?;
     if let Some(d) = heartbeat
         && let Err(e) = conn.query_drop(format!("SET @master_heartbeat_period = {}", d.as_nanos()))
     {

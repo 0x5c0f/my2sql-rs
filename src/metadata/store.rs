@@ -47,6 +47,15 @@ pub enum MetaError {
     /// 库名或表名为空（mysqlFuncs.go:126-130 "schema/table is empty"）。
     #[error("schema/table is empty")]
     EmptyIdent,
+    /// P3 T5：位点定位类服务端命令（SHOW MASTER STATUS / SHOW BINARY LOGS）
+    /// 在 offline（--schema-file）形态下不可用——离线没有活主库。
+    #[error(
+        "server command requires an online connection (--uri); offline schema-file mode is not backed by a live master"
+    )]
+    Offline,
+    /// P3 T5：服务端命令返回空集/缺列（如 log-bin 未开）。
+    #[error("server command returned unusable output: {0}")]
+    ServerCmd(String),
     /// 列数对账 fatal（strict-schema；对照 events.go:87 的无条件 fatal）。
     #[error(
         "column count mismatch for {table}: binlog has {binlog_cols}, \
@@ -162,6 +171,63 @@ impl SchemaStore {
         })?;
         std::fs::write(json, text)?;
         Ok(())
+    }
+
+    /// 在线连接借用（P3 T5 位点定位类命令共用闸；offline 即硬错）。
+    fn online_conn(&mut self) -> Result<&mut Conn, MetaError> {
+        match &mut self.source {
+            Source::Online(c) => Ok(c),
+            Source::Offline => Err(MetaError::Offline),
+        }
+    }
+
+    /// `SHOW MASTER STATUS` → (当前 binlog 文件, 位点)。repl「now」定位
+    /// （spec §1 三态之一），走**元数据连接**（与 dump 流物理两条，spec §2
+    /// 勘误钉死）。8.4 移除本语句（改 `SHOW BINARY LOG STATUS`）——首查
+    /// 语法错（1064）时自动改口重发（T7 矩阵前移的防御纵深）。
+    pub fn master_status(&mut self) -> Result<(String, u64), MetaError> {
+        let conn = self.online_conn()?;
+        // SHOW MASTER STATUS 在 5.6/5.7/8.0 均为 5 列（File, Position,
+        // Binlog_Do_DB, Binlog_Ignore_DB, Executed_Gtid_Set）——`(String,
+        // u64)` 元组形态 from_row 会因列数不符 panic，故按索引读前两列。
+        let mut rows: Vec<Row> = match conn.query("SHOW MASTER STATUS") {
+            Ok(v) => v,
+            Err(mysql::Error::MySqlError(m)) if m.code == 1064 => {
+                conn.query("SHOW BINARY LOG STATUS")?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let row = rows.pop().filter(|_| rows.is_empty()).ok_or_else(|| {
+            MetaError::ServerCmd(
+                "SHOW MASTER STATUS returned no rows (is log-bin enabled on the master?)".into(),
+            )
+        })?;
+        let file: String = row.get(0).ok_or_else(|| {
+            MetaError::ServerCmd("SHOW MASTER STATUS: unusable File column".into())
+        })?;
+        let pos: u64 = row.get(1).ok_or_else(|| {
+            MetaError::ServerCmd("SHOW MASTER STATUS: unusable Position column".into())
+        })?;
+        Ok((file, pos))
+    }
+
+    /// `SHOW BINARY LOGS` → `(Log_name, File_size, Purged?)` 全列。第三列
+    /// 5.6 镜像不存在、5.7+/8.x 为 'No'/'Yes' 串形态——`get::<u32>` 非数值
+    /// 即 None（best-effort，datetime 二分定位只消费前两列；矩阵复核登记
+    /// T7）。列按**索引**读取（5.6 列名 `Log_name` 一致性不做赌注）。
+    pub fn list_binlogs(&mut self) -> Result<Vec<(String, u64, Option<u32>)>, MetaError> {
+        let conn = self.online_conn()?;
+        let rows: Vec<Row> = conn.query("SHOW BINARY LOGS")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let name: String = r.get(0).ok_or_else(|| {
+                MetaError::ServerCmd("SHOW BINARY LOGS: unusable Log_name column".into())
+            })?;
+            let size: u64 = r.get(1).unwrap_or(0);
+            let purged: Option<u32> = r.get(2);
+            out.push((name, size, purged));
+        }
+        Ok(out)
     }
 }
 
