@@ -5,6 +5,7 @@
 
 pub mod binlog;
 pub mod config;
+pub mod flashback;
 pub mod metadata;
 pub mod output;
 pub mod pipeline;

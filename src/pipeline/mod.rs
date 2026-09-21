@@ -80,6 +80,8 @@ pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
         cfg.file_per_table,
         cfg.add_extra_info,
         cfg.time_zone,
+        "to_sql".into(),
+        false,
     );
     let mut st = Runner::new(
         cfg,

@@ -880,6 +880,51 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   DROP COLUMN」矩阵场景整事件报错（宁缺毋漏口径，T6/T7 差分需按此归入
   错误计数而非输出差集）。
 
+### P2 Task 2: output 块索引模式 + flashback/reverse 并行逆序读取器
+
+- 做了什么：① `src/output.rs`——`path_for` 前缀参数化（5 参版删除 → 6 参
+  `{prefix}.{schema.table.}<N>.sql`；to-sql 传 `"to_sql"`、flashback tmp 传
+  `".flashback.tmp"`、final 传 `"flashback"`）；`Writer::new` 尾增
+  `prefix: String, index: bool`；`Sink::File` 增 `written: u64` 字节计数
+  （初值 = FILE_HEADER 长度，Screen 不计数）；`write_group` 先组装本批完整
+  字节串再单次写入，`index=true` 时每 rows-event 批登记
+  `(offset, len, trx_id)`（**逐事件一块，非逐事务**），`Writer::blocks()`
+  只读视图供逆序回读。② 新建 `src/flashback/{mod.rs,reverse.rs}`——
+  `reverse_block`（记录原子化：extra-info 注释行保头、块内 SQL 行逆序）、
+  `reverse_file`（按块索引从尾回读；keep_trx=true 逐字节复刻上游注入：
+  lastTrxIdx 初值 0 → 首个写出块必 `commit;\nbegin;\n`、trx 变化处注入、
+  尾补 `commit;\n`）、`run_files`（文件级任务队列，threads 只影响文件间
+  并发；成功即删 tmp=上游 :20；空块表判空跳过不落 final）、
+  `final_for_tmp`（tmp 名 → final 名前缀替换，只回 file_name 段）。
+  ③ 唯一外部调用点 `pipeline/mod.rs` 同步
+  `Writer::new(…, "to_sql".into(), false)`。
+- **简报对账（代码片段 bug，按契约文本修正）**：`final_for_tmp` 片段
+  `strip_prefix('.') + replacen(".flashback.tmp","flashback",1)` 自相矛盾——
+  剥掉首点后串内已无 `.flashback.tmp`，替换恒不命中，与片段自带 doc 例
+  （`.flashback.tmp.3.sql → flashback.3.sql`）冲突；实采**不剥点**的单次
+  `replacen`，doc 两形态（plain + file-per-table `.flashback.tmp.d.t.3.sql`）
+  以测试钉死。另简报测试 `b1.contains(b"…")` 作用于 `&[u8]` 是类型错
+  （slice::contains 收单元素），改 `String::from_utf8_lossy(b1).contains(...)`，
+  断言语义不变。
+- 上游对照：`rollback_process.go:31`（lastTrxIdx=0 初值）、:76-155（尾块
+  先出 + trx 变化注入 + 尾 commit）、:20（tmp 必删）。有意分歧（计划已裁，
+  不修）：记录原子化（上游逐行整体逆序，注释行会漂到组尾）；空块表本侧
+  判空跳过 vs 上游落仅 `commit;\n` 空文件——后者入差异清单（T7/T8 对账时
+  登记）。
+- 测试：TDD 两轮 RED→GREEN——output 签名/缺方法编译错 14 条 → 8/8 绿
+  （块偏移用文件字节切片逐块核验：首块紧跟 SET NAMES 头、末块止于 EOF）；
+  flashback 未定义符号编译错 17 条 → 13/13 绿（keep-trx 字节 golden、
+  记录原子、无脚手架纯逆序、threads 1/8 逐文件字节全等、warn 行插Header后、
+  final_for_tmp×2）。全量 `cargo test` 258 绿、clippy -D warnings 净
+  （`reverse.rs` 增 `pub type Block=(u64,u64,u64)` 别名消 type_complexity，
+  与钉死签名同型不改语义）、fmt 净。
+- 遗留/对后续影响：T3 消费接口=本节点钉死面：`Writer::new(dir, false, fpt,
+  extra, tz, ".flashback.tmp".into(), true)` + `finish()` 后 `blocks()`；
+  `final_for_tmp` 只回文件名片段，T3 须 `tmp.parent().join(final_for_tmp(tmp))`；
+  `run_files` 任一文件失败即返 Err 且**不清理**其余已建 tmp/final（调用方
+  清场是既定分工）；`Writer::created()` 未加（简报未要求，blocks() 键集即可
+  枚举 tmp）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
