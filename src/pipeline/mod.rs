@@ -1599,6 +1599,15 @@ impl<'a> Runner<'a> {
                     }
                 }
             });
+            // 终审 FIX A：源错误**不再早退**。早退会跳过尾部采集段
+            // （drop(job_tx) → 收残结果 → join → drain_remaining → emit），
+            // Reorder 的 `next` 永久卡在洞里，而同一 Runner 跨重连复用
+            // （run_repl_with）→ `emitted_through()` 冻结 → checkpoint 永不
+            // 推进、unbounded res_rx 与 reorder.buf 无界增长（默认并行配置
+            // 整场报废）。现行为：错误入栈暂存 → 走与干净路径**同一尾部**
+            // （强制吐出保持 at-least-once：撕裂事务成为盘上半块 = 崩溃
+            // 撕裂形态，水位只认完整事务不受污染）→ 尾部走完后上抛。
+            let mut src_err: Option<BinlogError> = None;
             loop {
                 // 每轮先清收（try_recv 至空）：静默期水位/落盘延迟上界 = 一轮
                 // recv_timeout（20ms），有流量时与原「reap 前置」形态同型。
@@ -1625,9 +1634,13 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
-                    // 源流终/硬错：语义与旧形态 `src.next()` 直调完全一致
+                    // 源流终/硬错：两臂同走尾部采集（FIX A）——None 干净停，
+                    // Err 暂存后在尾部上抛。
                     Ok(Ok(None)) => break,
-                    Ok(Err(be)) => return Err(be.into()),
+                    Ok(Err(be)) => {
+                        src_err = Some(be);
+                        break;
+                    }
                     // 超时 = 暂无事件：走轮首 reap 收割在飞结果（本修复钉死点）。
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     // 中转线程随 scope 同生共死，tx 掉线仅源线程 panic 一途；
@@ -1659,6 +1672,11 @@ impl<'a> Runner<'a> {
                 return Err(PipelineError::Config(
                     "aborted: first error logged to stderr".into(),
                 ));
+            }
+            // FIX A：采集/收尾全部完成后才上抛暂存的源错误（顺序钉：数据
+            // 面完整先行，错误面后至；与 run_live 的 pump-Err 为主契约同轨）。
+            if let Some(be) = src_err {
+                return Err(be.into());
             }
             Ok(())
         })
@@ -2095,6 +2113,125 @@ mod live_tests {
         assert_eq!(sum.files, 1);
         assert_eq!(sum.errors, 0);
         read_verify(&ckpt_path, &out).expect("read_verify");
+    }
+
+    /// 终审 FIX A 红钉（pump_parallel 源错误早退）：`Ok(Err(be))` 早退
+    /// 跳过收尾采集段（drop(job_tx) → 收残结果 → join → drain_remaining →
+    /// emit）后，Reorder 的 `next` 永久卡在洞里；同一 Runner 跨重连复用
+    /// （run_repl_with 装配注释钉死），`emitted_through()` 冻结 → checkpoint
+    /// 永不推进、res_rx（unbounded）与 reorder.buf 无界增长——默认
+    /// threads=available_parallelism 的 repl 主配置整场报废。本件：
+    /// threads=4 + 2 个完整事务（各 400 行，保证错误到达时在飞/积压 seq
+    /// 必然构成洞）+ 尾部 Err；断言 (1) 错误后 reorder 无洞（全部 seq 已
+    /// 弹出）、水位落在最后整事务边界（强制吐出 = at-least-once，撕裂事务
+    /// 成为盘上半块——正是崩溃撕裂形态，checkpoint 只认完整事务不越界）；
+    /// (2) **同一 Runner** 接第二颗假源再跑，水位继续推进且 checkpoint
+    /// 更新（早退形态下 emitted_through 冻结 → 水位永远停表 = 必红）。
+    #[test]
+    fn parallel_source_error_drains_reorder_and_same_runner_recovers() {
+        let dir = tmpdir("pmp-err");
+        let schema = schema_file(&dir);
+        let cfg = config_threads(&dir, &schema, 4);
+        let out = dir.join("out");
+        let ckpt_path = dir.join("checkpoint.json");
+
+        const N: i32 = 400;
+        let mut evs: Vec<Result<Option<RawEvent>, BinlogError>> = Vec::new();
+        let mut pos = 100u32;
+        let mut trx2_end = 0u32;
+        for t in 0..2 {
+            evs.push(Ok(Some(q("BEGIN", pos, 1700000000))));
+            pos += 20;
+            for i in 0..N {
+                let v = t * N + i + 1;
+                evs.push(Ok(Some(rows(v, pos, 1700000000))));
+                pos += 40;
+            }
+            evs.push(Ok(Some(xid(pos, 1700000000))));
+            trx2_end = pos;
+            pos += 20;
+        }
+        // 尾事务（未提交即断链）：其行允许被强制吐出（at-least-once 撕裂
+        // 形态），但其边界绝不进水位。
+        evs.push(Ok(Some(q("BEGIN", pos, 1700000100))));
+        pos += 20;
+        for i in 0..50 {
+            evs.push(Ok(Some(rows(10_000 + i, pos, 1700000100))));
+            pos += 40;
+        }
+        evs.push(Err(BinlogError::InvalidData(
+            "FIX A: source died mid-stream".into(),
+        )));
+
+        let store = SchemaStore::offline(&schema).unwrap();
+        let writer = Writer::with_live(
+            out.clone(),
+            false,
+            false,
+            false,
+            cfg.time_zone,
+            "to_sql".into(),
+            false,
+            true,
+            false,
+        );
+        let mut st = Runner::new(
+            &cfg,
+            Filters::from_config(&cfg),
+            store,
+            DmlBuilder::new(SqlOpts::from_config(&cfg)),
+            Emitter::Sql(writer),
+        );
+        let fake = FakeSrc {
+            q: evs.into(),
+            probe: Box::new(|_| {}),
+        };
+        let e = st
+            .run_live(Box::new(fake), "mysql-bin.000001", Some(&ckpt_path))
+            .expect_err("源错误必须原样上抛");
+        assert!(format!("{e:#}").contains("FIX A: source died"), "{e:#}");
+
+        // (1) 无洞：全部已派发 seq 经收尾采集弹出（早退形态下必 < seq）。
+        assert_eq!(
+            st.reorder.emitted_through(),
+            st.seq,
+            "源错误后 reorder.next 必须追平已派发 seq（早退即永久卡洞）"
+        );
+        assert_eq!(st.reorder.pending(), 0, "缓冲不得滞留");
+        // 水位 = 最后整事务（trx2）提交界；尾事务未提交绝不越界。
+        let cp = read_cp(&ckpt_path).expect("两个整事务的水位必须已推进落盘");
+        assert_eq!(cp.pos, trx2_end, "水位必须停在 trx2 提交界");
+
+        // (2) 同一 Runner 跨重连复用：换第二颗干净假源（trx4 完整提交），
+        // 水位必须继续推进、终档更新——冻结形态下永远停在 trx2_end = 必红。
+        let mut evs2: VecDeque<Result<Option<RawEvent>, BinlogError>> = VecDeque::new();
+        evs2.push_back(Ok(Some(q("BEGIN", 20000, 1700000200))));
+        for i in 0..100 {
+            evs2.push_back(Ok(Some(rows(
+                20_000 + i,
+                20040 + i as u32 * 40,
+                1700000200,
+            ))));
+        }
+        evs2.push_back(Ok(Some(xid(26000, 1700000200))));
+        let fake2 = FakeSrc {
+            q: evs2,
+            probe: Box::new(|_| {}),
+        };
+        let sum2 = st
+            .run_live(Box::new(fake2), "mysql-bin.000001", Some(&ckpt_path))
+            .expect("第二跑干净收尾");
+        assert_eq!(sum2.errors, 0);
+        let cp2 = read_cp(&ckpt_path).expect("水位在场");
+        assert_eq!(
+            cp2.pos, 26000,
+            "重连后水位必须继续推进（冻结 = FIX A 缺陷）"
+        );
+        assert!(
+            cp2.written_files.contains(&"to_sql.1.sql".to_string()),
+            "written_files 必须登记实产物: {:?}",
+            cp2.written_files
+        );
     }
 }
 
