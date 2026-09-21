@@ -18,6 +18,11 @@
 #     stats = 冒烟（不裁判比较）：我方 to-sql 产基线语料 + stats 两报表存在 +
 #     Σinserts+updates+deletes（跳 '#' 尾注行）== 同语料 to-sql DML 语句数；
 #     裁判 stats 输出仅留档 $OUT/go-stats/，不参与退出码。
+# P3-T8 挂账 B 扩展（同维度内增量，仍不裁判）：
+#   --dml×stats 一致性冒烟 = 同一 binlog 上分别跑 `to-sql --dml insert` 与
+#   `stats --dml insert`，比较器断言 stats 报表 inserts 总和 == to-sql
+#   `--dml insert` 的 INSERT 语句行数，且 updates/deletes 总和为 0
+#   （dml 过滤器跨通道语义一致；stats 无 Go 裁判，本维度为我方双通道自证）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -133,6 +138,41 @@ dml = sum(1 for fn in sorted(glob.glob(os.path.join(out, "rs", "*.sql")))
 print(f"stats smoke: report total={tot} to-sql DML lines={dml}")
 assert tot == dml, f"stats total {tot} != to-sql DML {dml}"
 PYEOF
+  echo "== [5.6/7] rust --dml insert × stats 一致性冒烟（P3-T8 挂账 B，同形态增量）"
+  ./target/debug/my2sql-rs to-sql \
+    --binlog-dir "data/$VER" --start-file "$BIN" \
+    --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
+    --dml insert --threads 4 --output-dir "$OUT/rs-dml-insert" > "$OUT/rs-dml-insert.log" 2>&1 \
+    || { tail -20 "$OUT/rs-dml-insert.log"; echo "rust to-sql --dml insert FAILED"; exit 1; }
+  ./target/debug/my2sql-rs stats \
+    --binlog-dir "data/$VER" --start-file "$BIN" \
+    --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
+    --dml insert --threads 4 --output-dir "$OUT/rs-stats-dml-insert" > "$OUT/rs-stats-dml-insert.log" 2>&1 \
+    || { tail -20 "$OUT/rs-stats-dml-insert.log"; echo "rust stats --dml insert FAILED"; exit 1; }
+  python3 - "$OUT" <<'PYEOF'
+import sys, os, glob
+out = sys.argv[1]
+# stats 侧：--dml insert 下 binlog_status.txt 的 inserts/updates/deletes 总和
+# （列序与解析口径同 [5.5/7]：跳 '#' 尾注与表头，datetime 下划线形单 token）
+rep = os.path.join(out, "rs-stats-dml-insert", "binlog_status.txt")
+assert os.path.isfile(rep), "stats report missing: " + rep
+tot_ins = tot_upd = tot_del = 0
+for line in open(rep):
+    s = line.split()
+    if line.startswith("#") or len(s) < 10 or not (s[5].isdigit() and s[6].isdigit() and s[7].isdigit()):
+        continue
+    tot_ins += int(s[5]); tot_upd += int(s[6]); tot_del += int(s[7])
+# to-sql 侧：--dml insert 产物中的 INSERT 语句行数（无 --add-extra-info，
+# 行首即语句；默认无 batch → 一行语句 = 一行数据，与 stats 行计数同口径）
+ins_rows = sum(1 for fn in sorted(glob.glob(os.path.join(out, "rs-dml-insert", "*.sql")))
+               for l in open(fn) if l.strip().upper().startswith("INSERT "))
+print(f"--dml insert × stats: inserts={tot_ins} updates={tot_upd} deletes={tot_del} "
+      f"to-sql(--dml insert) INSERT lines={ins_rows}")
+assert tot_ins == ins_rows, f"stats inserts {tot_ins} != to-sql --dml insert rows {ins_rows}"
+# dml 过滤器必须同时作用于 stats 通道：非 insert 行计数恒 0（跨通道语义一致）
+assert tot_upd == 0 and tot_del == 0, \
+    f"--dml insert leaked into stats: updates={tot_upd} deletes={tot_del}"
+PYEOF
 else
   echo "== [6/7] semantic compare (A=go oracle, B=rust)"
   if [ "$WORK_TYPE" = rollback ]; then
@@ -143,7 +183,7 @@ else
 fi
 
 if [ "$WORK_TYPE" = stats ]; then
-  echo "OK difftest(stats-smoke) $VER${CKSUM:+ (checksum=$CKSUM)}: reports present + DML totals reconcile"
+  echo "OK difftest(stats-smoke) $VER${CKSUM:+ (checksum=$CKSUM)}: reports present + DML totals reconcile + --dml insert cross-channel consistent"
   exit 0
 fi
 echo "== [7/7] offline schema replay (--schema-file, 与在线输出逐字节对差)"
