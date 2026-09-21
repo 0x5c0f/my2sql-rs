@@ -201,6 +201,38 @@ fn flashback_on_error_stop_aborts_cleanly() {
     }
 }
 
+// ---------- 用例 2b：prepare 侧错误（表缺失于 schema-file）同受 stop 约束 ----------
+
+#[test]
+fn flashback_on_error_stop_aborts_missing_table() {
+    for threads in [4usize, 1] {
+        let f = Fix::new("stop-prep", |s| {
+            good_trx(s);
+            // `d`.`ghost` 不在 schema.json → dispatcher prepare 侧 MetaError
+            s.query("d", "BEGIN", 1700000100);
+            s.table_map_is(90, "d", "ghost", 10, 1700000100);
+            s.write_is(90, &[(9, "x")], 1700000100);
+            s.xid(1700000100);
+        });
+        let out = f.dir().join("out");
+        let mut cfg = cfg_for(f.dir(), &out, true, OnError::Stop);
+        cfg.threads = threads;
+        let r = run_flashback(&cfg);
+        assert!(
+            r.is_err(),
+            "threads={threads}：stop 模式下 prepare 侧（schema 获取失败）必须返回 Err，\
+             got Ok({:?})",
+            r.ok()
+        );
+        assert!(
+            leftovers(&out).is_empty(),
+            "threads={threads}：半成品不落盘（spec §3.2）——无 final 无 tmp，got {:?}",
+            leftovers(&out)
+        );
+        std::fs::remove_dir_all(f.dir()).ok();
+    }
+}
+
 // ---------- 用例 3：skip-bad-event → Ok + 头部 WARNING 行 ----------
 
 #[test]

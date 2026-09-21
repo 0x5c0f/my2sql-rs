@@ -348,7 +348,10 @@ impl<'a> Runner<'a> {
 
     /// 事件 → （过滤/事务机/schema 配对）→ Option<Job>。errors 计数在此
     /// 累计（schema 获取失败 = 逐事件错误）；源不变式违背同样计数跳过。
-    fn prepare(&mut self, ev: RawEvent) -> Option<Job> {
+    /// P2 修复轮：stop 形态（仅 flashback）下 prepare 侧错误升整跑 Err
+    /// （spec §3.2 完整性——不完整且不标记的回滚脚本绝不落盘）；to-sql 侧
+    /// stop_on_error() 恒 false，计数跳过行为逐字节不变。
+    fn prepare(&mut self, ev: RawEvent) -> Result<Option<Job>, PipelineError> {
         let (trx_id, _status) = self.trx.feed(&ev);
         if !matches!(ev.kind, RawKind::Rows(..)) {
             // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）。
@@ -363,15 +366,14 @@ impl<'a> Runner<'a> {
                         .push((ev.timestamp, ev.binlog.clone(), ev.start_pos, sql.clone()));
                 }
             }
-            return None;
+            return Ok(None);
         }
         if !self.filters.accept(&ev, None) {
-            return None;
+            return Ok(None);
         }
         let Some(tm) = ev.tm.clone() else {
             // FileReader 已保证 rows 必带 tm（源不变式），防御分支
-            self.bump_error(&ev, "rows event without table_map");
-            return None;
+            return self.prepare_fail(&ev, "rows event without table_map");
         };
         match self.schema_for(&tm) {
             Ok(schema) => {
@@ -383,16 +385,26 @@ impl<'a> Runner<'a> {
                 };
                 self.seq += 1;
                 self.summary.events += 1;
-                Some(job)
+                Ok(Some(job))
             }
-            Err(e) => {
-                self.bump_error(
-                    &ev,
-                    &format!("schema lookup for `{}.{}`: {e:#}", tm.schema, tm.table),
-                );
-                None
-            }
+            Err(e) => self.prepare_fail(
+                &ev,
+                &format!("schema lookup for `{}.{}`: {e:#}", tm.schema, tm.table),
+            ),
         }
+    }
+
+    /// prepare 侧单事件错误分派：stop 形态 → 整跑 Err（tmp/半成品清场由
+    /// run_flash 错误路径负责）；否则计数跳过（原 robust-continue 通道）。
+    fn prepare_fail(&mut self, ev: &RawEvent, what: &str) -> Result<Option<Job>, PipelineError> {
+        if self.stop_on_error() {
+            return Err(PipelineError::Config(format!(
+                "event at {}:{} aborted (--on-error stop): {what}",
+                ev.binlog, ev.start_pos
+            )));
+        }
+        self.bump_error(ev, what);
+        Ok(None)
     }
 
     fn bump_error(&mut self, ev: &RawEvent, what: &str) {
@@ -448,7 +460,7 @@ impl<'a> Runner<'a> {
         mut reader: FileReader<R>,
     ) -> Result<(), PipelineError> {
         while let Some(ev) = reader.next()? {
-            let Some(job) = self.prepare(ev) else {
+            let Some(job) = self.prepare(ev)? else {
                 continue;
             };
             let seq = job.seq;
@@ -507,7 +519,7 @@ impl<'a> Runner<'a> {
         drop(res_tx); //  dispatcher 侧只 recv；所有 worker 结束后通道才闭合
 
         while let Some(ev) = reader.next()? {
-            if let Some(job) = self.prepare(ev) {
+            if let Some(job) = self.prepare(ev)? {
                 // 反压前清收 + 超限阻塞收取（progress 保证：worker 永不阻塞在发送侧）
                 self.reap(&res_rx)?;
                 while self.reorder.pending() > self.threads * 2 {

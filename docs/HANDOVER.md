@@ -976,15 +976,19 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   stop 清场（并行+直通双形态循环）、skip 头部 WARNING 行逐字节、DDL 排除+
   摘要不污染、to-sql 正向守卫（同款 fixture 经 run_to_sql 钉正向字节面）。
   worker 层新增哨兵单测（Err/panic 置位 + stop=false 永不置位）。全量
-  `cargo test` 274 绿（lib 259/e2e 5/cli 3/flashback 5/fuzz_seed 2）、
+  `cargo test` 275 绿（lib 259/e2e 5/cli 3/flashback 6/fuzz_seed 2）、
   clippy --all-targets -D 净、fmt 净。
 - 遗留/对后续影响：T5 消费 `run_flashback` + `Config{work_type,keep_trx,
   on_error}` 覆写面；`WorkType::Stats` 枚举位已立（T4 消费）。**登记边界**：
   a) flashback 形态忽略 `--to-stdout`（Writer 恒 stdout=false 文件 sink——
   reverse 需要磁盘文件；T5 CLI 层应拒收 flashback+to-stdout 组合或文档化）；
-  b) **dispatcher 侧 schema 获取失败在 stop 形态仍计数跳过**（简报 Step 1 只
-  把哨兵接在 build/decode 错误路径，prepare 错误不在其列——T6 真件若遇
-  schema 缺表+stop 预期需按此口径归错）；c) file-per-table 的
+  b) ~~dispatcher 侧 schema 获取失败在 stop 形态仍计数跳过~~ **修复轮 1 已收口**：
+  `prepare` 改 `Result<Option<Job>,_>`，stop 形态下 prepare 侧错误（缺表
+  MetaError / 无 tm / strict-align）经 `prepare_fail` 直接升整跑 Err（spec §3.2
+  完整性优先——**登记对简报 Step 1 只接 build/decode 哨兵的 scoped 偏离**，
+  spec 优先级高于简报；to-sql 恒 skip 语义字节不变，新增
+  `flashback_on_error_stop_aborts_missing_table` 用例钉死 Err+全清场）；
+  c) file-per-table 的
   `.flashback.tmp.d.t.N.sql → flashback.d.t.N.sql` 装配按 parent().join 泛化
   接线（final_for_tmp 单测已钉名，端到端覆盖归 T6 真件）；d) 并行 stop 不
   提前中断投递/收取（哨兵后仍走完整收束再 Err——只损失败路径时延，不损
