@@ -10,3 +10,4 @@ pub mod metadata;
 pub mod output;
 pub mod pipeline;
 pub mod sqlopen;
+pub mod stats;

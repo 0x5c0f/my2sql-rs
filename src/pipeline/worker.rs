@@ -28,11 +28,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::binlog::error::BinlogError;
-use crate::binlog::rows::decode_rows;
+use crate::binlog::rows::{RowsKind, decode_rows};
 use crate::metadata::schema::TableSchema;
-use crate::pipeline::source::{RawEvent, RawKind};
+use crate::pipeline::source::{RawEvent, RawKind, TrxStatus};
 use crate::sqlopen::SqlError;
 use crate::sqlopen::dml::DmlBuilder;
+use crate::stats::{FactKind, StatFact};
 
 /// 一条 rows 事件生成的 SQL 批次（简报接口绑定：写出侧最小单元；
 /// trx_id 为 P2 keep-trx/回滚顺序预留，P1 仅透传）。
@@ -52,11 +53,38 @@ pub struct SqlGroup {
 }
 
 /// dispatcher → worker 的工作单元：seq 保序编号 + 原始事件 + 备好的表结构。
+/// P2 T4：`status` = 该事件的事务状态（`self.trx.feed` 第二返回元，
+/// stats 通道 biglong 判定的物化事件流所需）。
 pub struct Job {
     pub seq: u64,
     pub ev: RawEvent,
     pub trx_id: u64,
     pub schema: Arc<TableSchema>,
+    pub status: TrxStatus,
+}
+
+/// worker→dispatcher 回流的统一载荷（P2 T4 简报钉死）：SQL 组（to-sql/
+/// flashback）、stats 轻量事实、事务标记。`Status` 仅由 dispatcher 在
+/// stats 形态直推 reorder（不经 worker——它是 dispatcher 已有信息）；
+/// `Sql` 包装不改变任何写出字节（to-sql/flashback 行为守卫在既有 e2e）。
+#[derive(Debug, Clone)]
+pub enum Out {
+    Sql(SqlGroup),
+    Fact(StatFact),
+    Status {
+        binlog: String,
+        pos: u32,
+        ts: u32,
+        status: TrxStatus,
+    },
+}
+
+/// worker_loop 的作业形态（P2 T4）：Sql = 现路径（build_groups）；
+/// Stats = 只解码计数（build_out_stats），不触碰 SQL 构建器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutMode {
+    Sql,
+    Stats,
 }
 
 /// 纯函数形态的单事件处理（threads=1 直通路径与 worker 线程共用）：
@@ -93,6 +121,50 @@ pub fn build_groups(job: &Job, builder: &DmlBuilder) -> Result<Vec<SqlGroup>, Sq
     }])
 }
 
+/// stats 形态的单事件处理（P2 T4 简报钉死实现）：rows 事件 → 恰一条
+/// `Out::Fact`（update 行数 = 行对数，`rows.len()/2` 镜像上游
+/// stats_process.go:111）；非 rows 事件投空批填洞（Query/Xid 的 Status
+/// 标记由 dispatcher 侧直接入 reorder 流，seq 与 rows 事件同源编号）。
+/// 解码错误原样上抛——填洞/计数契约与 SQL 形态共用 `process_job`。
+pub fn build_out_stats(job: &Job) -> Result<Vec<Out>, SqlError> {
+    match &job.ev.kind {
+        RawKind::Rows(kind, v2) => {
+            let tm = job.ev.tm.as_deref().ok_or::<SqlError>(
+                BinlogError::InvalidData("rows event without table_map".into()).into(),
+            )?;
+            let rows = decode_rows(&job.ev.body, tm, &job.schema, *kind, *v2)?;
+            Ok(vec![Out::Fact(StatFact {
+                binlog: job.ev.binlog.clone(),
+                start_pos: job.ev.start_pos,
+                end_pos: job.ev.end_pos,
+                timestamp: job.ev.timestamp,
+                db: tm.schema.clone(),
+                table: tm.table.clone(),
+                kind: match kind {
+                    RowsKind::Write => FactKind::Insert,
+                    RowsKind::Update => FactKind::Update,
+                    RowsKind::Delete => FactKind::Delete,
+                },
+                rows: match kind {
+                    RowsKind::Update => (rows.len() / 2) as u64,
+                    _ => rows.len() as u64,
+                },
+                trx_id: job.trx_id,
+            })])
+        }
+        // Query/Xid：Out::Fact 空——marker 由 dispatcher 侧直接入 reorder 流
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// 按作业形态分派单事件构建（worker_loop / pump_direct 共用）。
+pub fn build_out(job: &Job, builder: &DmlBuilder, mode: OutMode) -> Result<Vec<Out>, SqlError> {
+    match mode {
+        OutMode::Sql => build_groups(job, builder).map(|gs| gs.into_iter().map(Out::Sql).collect()),
+        OutMode::Stats => build_out_stats(job),
+    }
+}
+
 /// worker 线程主循环：recv → build → 回投 `(seq, groups)`。
 /// 错误即计数 + `tracing::error!` + 投空批（空洞必须填，否则 reorder 永挂）。
 /// `job_rx` 断开（dispatcher 投递完成）→ 自然退出。
@@ -106,18 +178,20 @@ pub(crate) const PANIC_MARKER: &str = "__panic__";
 /// 永挂——存活 worker 持有 sender 时 `recv()` 不会断开）。
 /// P2 T3：Err 分支额外置 abort 哨兵——**当且仅当** `stop_on_error`（flashback
 /// `--on-error stop` 形态；to-sql 侧恒 false，行为零变）。
+/// P2 T4：`mode` 决定构建分派（Sql/Stats），产物统一 `Vec<Out>`。
 fn process_job(
     job: &Job,
     builder: &DmlBuilder,
     errors: &AtomicU64,
     abort: &AtomicBool,
     stop_on_error: bool,
-) -> Vec<SqlGroup> {
+    mode: OutMode,
+) -> Vec<Out> {
     #[cfg(test)]
     if job.ev.binlog == PANIC_MARKER {
         panic!("injected worker panic (seq={})", job.seq);
     }
-    match build_groups(job, builder) {
+    match build_out(job, builder, mode) {
         Ok(g) => g,
         Err(e) => {
             errors.fetch_add(1, Ordering::Relaxed);
@@ -153,19 +227,22 @@ fn panic_payload(p: &(dyn Any + Send)) -> String {
 /// P2 T3 新末两参：`stop_on_error=true`（flashback `--on-error stop`）时
 /// Err/panic 两分支在计数后置 `abort` 哨兵，由 Runner 收取循环后统一转 Err；
 /// to-sql 侧恒 `stop_on_error=false` + 独立哨兵（零改动行为）。
+/// P2 T4 新末参 `mode`：Sql = 既有路径（载荷 `Out::Sql` 包装，写出字节不变）；
+/// Stats = `build_out_stats` 轻量事实流。
 /// `job_rx` 断开（dispatcher 投递完成）→ 自然退出。
 pub fn worker_loop(
     job_rx: Receiver<Job>,
-    res_tx: Sender<(u64, Vec<SqlGroup>)>,
+    res_tx: Sender<(u64, Vec<Out>)>,
     builder: DmlBuilder,
     errors: Arc<AtomicU64>,
     abort: Arc<AtomicBool>,
     stop_on_error: bool,
+    mode: OutMode,
 ) {
     while let Ok(job) = job_rx.recv() {
         let seq = job.seq;
         let groups = match catch_unwind(AssertUnwindSafe(|| {
-            process_job(&job, &builder, &errors, &abort, stop_on_error)
+            process_job(&job, &builder, &errors, &abort, stop_on_error, mode)
         })) {
             Ok(g) => g,
             Err(p) => {
@@ -249,6 +326,7 @@ mod tests {
             },
             trx_id: 3,
             schema: Arc::new(schema1()),
+            status: TrxStatus::Process,
         }
     }
 
@@ -289,7 +367,7 @@ mod tests {
     #[test]
     fn worker_loop_panics_are_caught_and_hole_filled() {
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<SqlGroup>)>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<Out>)>();
         let errors = Arc::new(AtomicU64::new(0));
         let abort = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
@@ -302,7 +380,7 @@ mod tests {
                 abort.clone(),
             );
             handles.push(std::thread::spawn(move || {
-                worker_loop(rx, tx, b, e, a, false)
+                worker_loop(rx, tx, b, e, a, false, OutMode::Sql)
             }));
         }
         drop(job_rx);
@@ -341,13 +419,13 @@ mod tests {
     #[test]
     fn worker_loop_stop_on_error_sets_abort_sentinel_on_err_and_panic() {
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<SqlGroup>)>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u64, Vec<Out>)>();
         let errors = Arc::new(AtomicU64::new(0));
         let abort = Arc::new(AtomicBool::new(false));
         let builder = DmlBuilder::default();
         let handle = std::thread::spawn({
             let (e, a) = (errors.clone(), abort.clone());
-            move || worker_loop(job_rx, res_tx, builder, e, a, true)
+            move || worker_loop(job_rx, res_tx, builder, e, a, true, OutMode::Sql)
         });
         job_tx.send(rows_job(0, write_body(7, 1))).unwrap(); // 正常批
         job_tx.send(rows_job(1, write_body(8, 2))).unwrap(); // table_id 不符 → Err

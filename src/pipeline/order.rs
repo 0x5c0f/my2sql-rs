@@ -12,13 +12,24 @@ use std::collections::HashMap;
 use crate::pipeline::worker::SqlGroup;
 
 /// 保序缓冲：`next` = 下一个待弹出的连续 seq；`buf` = 超前完成的乱序批次。
-#[derive(Debug, Default)]
-pub struct Reorder {
+/// P2 T4：载荷泛型化 `T = SqlGroup`（默认参——to-sql/flashback 既有调用与
+/// 测试零改）；stats 通道以 `T = Out` 复用同一保序语义。
+#[derive(Debug)]
+pub struct Reorder<T = SqlGroup> {
     next: u64,
-    buf: HashMap<u64, Vec<SqlGroup>>,
+    buf: HashMap<u64, Vec<T>>,
 }
 
-impl Reorder {
+impl<T> Default for Reorder<T> {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            buf: HashMap::new(),
+        }
+    }
+}
+
+impl<T> Reorder<T> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -26,7 +37,7 @@ impl Reorder {
     /// 收入一个事件的完成批次：`seq` 恰为下一个 → 立即弹出并顺带清空后续连续段
     /// （返回可直接写出，通常非空）；否则挂缓冲等待空洞补齐（返回空）。
     /// seq 必须单调唯一（dispatcher 保证）；重复 push 覆盖缓冲（debug 下断言）。
-    pub fn push(&mut self, seq: u64, g: Vec<SqlGroup>) -> Vec<SqlGroup> {
+    pub fn push(&mut self, seq: u64, g: Vec<T>) -> Vec<T> {
         debug_assert!(!self.buf.contains_key(&seq), "duplicate seq {seq} pushed");
         if seq != self.next {
             self.buf.insert(seq, g);
@@ -48,7 +59,7 @@ impl Reorder {
 
     /// 收尾：全部 seq 到齐后缓冲应为空；若非空（上游断流/bug）按 seq 升序
     /// 强制吐出，不丢数据。
-    pub fn drain_remaining(&mut self) -> Vec<SqlGroup> {
+    pub fn drain_remaining(&mut self) -> Vec<T> {
         let mut keys: Vec<u64> = self.buf.keys().copied().collect();
         keys.sort_unstable();
         let mut out = Vec::new();

@@ -24,7 +24,7 @@ use crate::output::{Writer, datetime_str};
 use crate::pipeline::filter::Filters;
 use crate::pipeline::order::Reorder;
 use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine};
-use crate::pipeline::worker::{Job, SqlGroup, build_groups, worker_loop};
+use crate::pipeline::worker::{Job, Out, OutMode, build_out, worker_loop};
 use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
 
 /// 装配层错误（管道终止级：源文件级损坏/IO、schema 源不可用、写盘失败；
@@ -161,7 +161,7 @@ struct Runner<'a> {
     trx: TrxStateMachine,
     /// 已派发事件数 = 下一个 seq 编号。
     seq: u64,
-    reorder: Reorder,
+    reorder: Reorder<Out>,
     summary: RunSummary,
     /// table_id → (建立时的 tm Arc, 表结构)。tm 更替（ptr 不等）即重取
     /// ——DDL 后结构漂移的保守重查路径；SchemaStore 自身还有 db.table 缓存。
@@ -198,6 +198,12 @@ impl<'a> Runner<'a> {
 
     fn is_flash(&self) -> bool {
         matches!(self.emitter, Emitter::Flash { .. })
+    }
+
+    /// worker/reorder 载荷形态（P2 T4）：Stats emitter → Stats 事实流；
+    /// 其余（Sql/Flash）走既有 SQL 组路径（`Out::Sql` 包装，字节不变）。
+    fn out_mode(&self) -> OutMode {
+        OutMode::Sql
     }
 
     /// `--on-error stop` 生效形态：仅 flashback（to-sql 恒 robust-continue，
@@ -352,7 +358,7 @@ impl<'a> Runner<'a> {
     /// （spec §3.2 完整性——不完整且不标记的回滚脚本绝不落盘）；to-sql 侧
     /// stop_on_error() 恒 false，计数跳过行为逐字节不变。
     fn prepare(&mut self, ev: RawEvent) -> Result<Option<Job>, PipelineError> {
-        let (trx_id, _status) = self.trx.feed(&ev);
+        let (trx_id, status) = self.trx.feed(&ev);
         if !matches!(ev.kind, RawKind::Rows(..)) {
             // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）。
             // flashback 形态：非事务性 QUERY（DDL 等）登记排除清单，run 收尾
@@ -382,6 +388,7 @@ impl<'a> Runner<'a> {
                     ev,
                     trx_id,
                     schema,
+                    status,
                 };
                 self.seq += 1;
                 self.summary.events += 1;
@@ -441,15 +448,17 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn emit(&mut self, groups: Vec<SqlGroup>) -> Result<(), PipelineError> {
-        for g in &groups {
-            self.summary.statements += g.sqls.len() as u64;
-        }
+    /// 写出保序弹出批次（P2 T4 泛型载荷）：SQL 形态仅消费 `Out::Sql`
+    /// （包装不改变写出字节）；Fact/Status 在 SQL 形态不可达（防御忽略）。
+    fn emit(&mut self, outs: Vec<Out>) -> Result<(), PipelineError> {
         let w = match &mut self.emitter {
             Emitter::Sql(w) | Emitter::Flash { tmp: w } => w,
         };
-        for g in &groups {
-            w.write_group(g)?;
+        for o in &outs {
+            if let Out::Sql(g) = o {
+                self.summary.statements += g.sqls.len() as u64;
+                w.write_group(g)?;
+            }
         }
         Ok(())
     }
@@ -464,7 +473,7 @@ impl<'a> Runner<'a> {
                 continue;
             };
             let seq = job.seq;
-            let groups = match build_groups(&job, &self.builder) {
+            let groups = match build_out(&job, &self.builder, self.out_mode()) {
                 Ok(g) => g,
                 Err(e) => {
                     self.summary.errors += 1;
@@ -498,12 +507,13 @@ impl<'a> Runner<'a> {
         mut reader: FileReader<R>,
     ) -> Result<(), PipelineError> {
         let (job_tx, job_rx) = bounded::<Job>(self.threads * 2);
-        let (res_tx, res_rx): (Sender<(u64, Vec<SqlGroup>)>, _) = unbounded();
+        let (res_tx, res_rx): (Sender<(u64, Vec<Out>)>, _) = unbounded();
         let errors = Arc::new(AtomicU64::new(0));
         // P2 T3 abort 哨兵：stop 形态下 worker Err/panic 置位，收取循环后转 Err；
         // to-sql 侧 stop=false 恒不置位（行为零变），仍传独立原子量保持签名统一。
         let abort = Arc::new(AtomicBool::new(false));
         let stop = self.stop_on_error();
+        let mode = self.out_mode();
         let mut handles = Vec::with_capacity(self.threads);
         for _ in 0..self.threads {
             let job_rx = job_rx.clone();
@@ -512,7 +522,7 @@ impl<'a> Runner<'a> {
             let errors = errors.clone();
             let abort = abort.clone();
             handles.push(thread::spawn(move || {
-                worker_loop(job_rx, res_tx, builder, errors, abort, stop)
+                worker_loop(job_rx, res_tx, builder, errors, abort, stop, mode)
             }));
         }
         drop(job_rx);
@@ -566,7 +576,7 @@ impl<'a> Runner<'a> {
     }
 
     /// 非阻塞收取全部已就绪结果并写出（反压前置）。
-    fn reap(&mut self, res_rx: &Receiver<(u64, Vec<SqlGroup>)>) -> Result<(), PipelineError> {
+    fn reap(&mut self, res_rx: &Receiver<(u64, Vec<Out>)>) -> Result<(), PipelineError> {
         while let Ok((seq, g)) = res_rx.try_recv() {
             let ready = self.reorder.push(seq, g);
             self.emit(ready)?;
