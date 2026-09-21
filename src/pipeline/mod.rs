@@ -154,6 +154,11 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
     match st.run_flash() {
         Ok((mut summary, files)) => {
             summary.files = files;
+            // --schema-dump：与 run_to_sql 同款装配层收口（P2 T7 补消费——
+            // flashback 参数面与 to-sql 同构，旗标不得挂空）
+            if let Some(p) = &cfg.schema_dump {
+                st.dump_schema(p)?;
+            }
             Ok(summary)
         }
         Err(e) => Err(e), // run_flash 内部已清 tmp/final（见 cleanup_flash_files）

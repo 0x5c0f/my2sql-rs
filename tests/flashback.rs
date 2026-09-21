@@ -334,3 +334,26 @@ fn to_sql_path_unchanged_by_wiring() {
     );
     std::fs::remove_dir_all(f.dir()).ok();
 }
+
+// ---------- 用例 7（P2 T7 实跑暴露的 T3/T5 挂空缺口）：flashback 消费 --schema-dump ----------
+
+/// `run_flashback` 必须与 `run_to_sql` 同款在成功后落 `--schema-dump`
+/// （T7 harness 步骤 7 离线回放依赖该产物；此前旗标被 parse 受理但无
+/// 消费点——inert affordance，与 c522c33 对 to-sql inert 旗标的裁定同类，
+/// 修复取「补消费」而非「拒旗标」：回滚与正向同为 SQL 文本产物，参数面同构）。
+#[test]
+fn flashback_honors_schema_dump() {
+    let f = Fix::new("sdump", good_trx);
+    let out = f.dir().join("out");
+    let dump = f.dir().join("dump.json");
+    let mut cfg = cfg_for(f.dir(), &out, true, OnError::SkipBadEvent);
+    cfg.threads = 1;
+    cfg.schema_dump = Some(dump.clone());
+    run_flashback(&cfg).expect("run_flashback ok");
+    let text = std::fs::read_to_string(&dump).expect("flashback 必须落 --schema-dump 文件");
+    assert!(
+        text.contains("\"d\"") && text.contains("version"),
+        "dump 形如 schema 文件: {text}"
+    );
+    std::fs::remove_dir_all(f.dir()).ok();
+}
