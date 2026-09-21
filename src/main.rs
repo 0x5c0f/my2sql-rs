@@ -3,7 +3,7 @@
 use std::process::exit;
 
 use my2sql_rs::config::{Config, WorkType};
-use my2sql_rs::pipeline::{run_flashback, run_stats, run_to_sql};
+use my2sql_rs::pipeline::{run_flashback, run_repl, run_stats, run_to_sql};
 
 fn main() {
     let cfg = Config::from_args();
@@ -19,6 +19,9 @@ fn main() {
             run_flashback(&cfg).map(|s| println!("{}", s.display_with("flashback done")))
         }
         WorkType::Stats => run_stats(&cfg).map(|s| println!("{s}")),
+        // P3 T1：repl dispatch 面定稿（run_repl 现为真实 Err 空壳 → 下方统一
+        // 打印 `error: …` 并退 1；T5 仅换函数体）。
+        WorkType::Repl => run_repl(&cfg).map(|s| println!("{}", s.display_with("repl done"))),
     };
     match rc {
         Ok(()) => {}

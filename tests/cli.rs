@@ -75,6 +75,86 @@ fn bad_dml_value_rejected() {
     assert!(!out.status.success());
 }
 #[test]
+fn repl_subcommand_visible_and_rejects_bad_args() {
+    // P3 T1：repl 第四子命令上帮助面，专属旗标可见
+    let out = bin().args(["repl", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("--server-id"), "{s}");
+    assert!(s.contains("--resume-file"), "{s}");
+    assert!(s.contains("--heartbeat-secs"), "{s}");
+    // 裸 repl：clap 缺必填参数 → exit 2
+    let out = bin().arg("repl").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    // --server-id 拒绝代答：其余齐备仍缺它 → exit 2 且 stderr 指名
+    let out = bin()
+        .args([
+            "repl",
+            "--binlog-dir",
+            "/tmp",
+            "--start-file",
+            "",
+            "--start-pos",
+            "0",
+            "--uri",
+            "mysql://x@y",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("server-id"), "{err}");
+    // --uri 在 repl 下 validate 硬校（clap 面仍 Option，与 to-sql/flashback 共用）：
+    // 另给 schema-file 也拒，exit 2 且错误串点名 uri
+    let out = bin()
+        .args([
+            "repl",
+            "--binlog-dir",
+            "/tmp",
+            "--start-file",
+            "",
+            "--start-pos",
+            "0",
+            "--server-id",
+            "7",
+            "--schema-file",
+            "/nonexistent.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("uri"), "{err}");
+}
+
+#[test]
+fn repl_valid_args_dispatch_to_run_repl_stub_exit_1() {
+    // dispatch 面本任务定稿：参数合法 → run_repl 空壳真实 Err → main 打印并退 1
+    // （非 clap/validate 的 exit 2 通道；T5 仅替换函数体）。
+    let out = bin()
+        .args([
+            "repl",
+            "--binlog-dir",
+            "/tmp",
+            "--start-file",
+            "",
+            "--start-pos",
+            "0",
+            "--uri",
+            "mysql://x@y",
+            "--server-id",
+            "7",
+            "--output-dir",
+            "/tmp/my2sql-p3t1-repl-out",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("repl: pipeline not built (P3 T5)"), "{err}");
+}
+
+#[test]
 fn to_sql_rejects_on_error_stop() {
     // P2 T5 review 裁定：to-sql 恒 best-effort，stop 无消费 → validate 期
     // 拒绝并走 exit(2) 统一错误出口（不静默受理）。
