@@ -123,6 +123,12 @@ pub struct Writer {
     /// true = 块索引模式：每写一个 rows-event 批次登记
     /// `(offset, len, trx_id)`，供 flashback 逆序回读（偏移仅文件 sink）。
     index: bool,
+    /// P3 T3：true = File sink 也每批次即刷（repl 模式实时可见性；
+    /// false 保持 file 模式旧行为：BufWriter 批量 + finish 统一刷）。
+    streaming: bool,
+    /// P3 T3：true = 文件 sink 创建见**既存同名文件**即拒（防覆盖中断恢复
+    /// 现场），经既有 io::Error 通道上抛；file 模式默认 false 行为字节不变。
+    no_clobber: bool,
     sinks: HashMap<PathBuf, Sink>,
     /// 块索引：tmp 路径 → `Vec<(offset, len, trx_id)>`（写入顺序）。
     blocks: HashMap<PathBuf, Vec<(u64, u64, u64)>>,
@@ -149,6 +155,37 @@ impl Writer {
         prefix: String,
         index: bool,
     ) -> Self {
+        // file 模式默认：不开流式刷、不防覆盖（P1/P2 字节面回归钉）。
+        Self::with_live(
+            dir,
+            stdout,
+            file_per_table,
+            extra_info,
+            tz,
+            prefix,
+            index,
+            false,
+            false,
+        )
+    }
+
+    /// P3 T3 pinned 接口：`new` 前 7 参同序 + 尾两开关。
+    /// `streaming` = File sink 每批次随 `flush_short` 即刷（repl 实时可见）；
+    /// `no_clobber` = 文件 sink 创建见既存同名文件即
+    /// `io::Error::other("refusing to overwrite …")`（复用 write_group 的
+    /// io::Error 通道；构造 Writer 本身不失败，首写才失败）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_live(
+        dir: PathBuf,
+        stdout: bool,
+        file_per_table: bool,
+        extra_info: bool,
+        tz: FixedOffset,
+        prefix: String,
+        index: bool,
+        streaming: bool,
+        no_clobber: bool,
+    ) -> Self {
         Self {
             dir,
             stdout,
@@ -157,6 +194,8 @@ impl Writer {
             tz,
             prefix,
             index,
+            streaming,
+            no_clobber,
             sinks: HashMap::new(),
             blocks: HashMap::new(),
             created: Vec::new(),
@@ -195,6 +234,12 @@ impl Writer {
             let sink = if self.stdout {
                 Sink::Screen
             } else {
+                if self.no_clobber && key.exists() {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to overwrite {}",
+                        key.display()
+                    )));
+                }
                 if let Some(parent) = key.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -253,7 +298,16 @@ impl Writer {
         if let Sink::File { written, .. } = sink {
             *written += batch.len() as u64;
         }
-        sink.flush_short()
+        sink.flush_short(self.streaming)
+    }
+
+    /// 强制刷全部 sink（P3 T4：checkpoint 写入前确保 `written_files` 实物已
+    /// 落盘可见；对 Screen 与 flush_short 幂等）。
+    pub fn flush_all(&mut self) -> std::io::Result<()> {
+        for sink in self.sinks.values_mut() {
+            sink.flush()?;
+        }
+        Ok(())
     }
 
     /// 收尾：flush 全部句柄，返回写出的文件数（stdout 模式 = 0）。
@@ -272,10 +326,17 @@ impl Sink {
             Sink::Screen => std::io::stdout().write_all(buf),
         }
     }
-    /// Screen 每批次即刷（交互体验）；文件靠 BufWriter 批量 + finish 统一刷。
-    fn flush_short(&mut self) -> std::io::Result<()> {
+    /// Screen 每批次即刷（交互体验）；文件默认靠 BufWriter 批量 + finish
+    /// 统一刷，`streaming=true`（repl 模式，P3 T3）时 File 也随批次即刷。
+    fn flush_short(&mut self, streaming: bool) -> std::io::Result<()> {
         match self {
-            Sink::File { .. } => Ok(()),
+            Sink::File { .. } => {
+                if streaming {
+                    self.flush()
+                } else {
+                    Ok(())
+                }
+            }
             Sink::Screen => self.flush(),
         }
     }
@@ -564,6 +625,129 @@ mod tests {
             a, "SET NAMES utf8mb4;\nSELECT 1;\n",
             "无 extra-info 仅头+语句"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P3 T3 Step 1 测试②：`streaming=true` 时 File sink 每批次即刷——未
+    /// `finish` 即可 `fs::read` 到全部已写内容；`(false, …)` 默认路径钉死旧
+    /// 行为（finish 前落盘为空 = BufWriter 未刷），file 模式字节面不变。
+    #[test]
+    fn writer_streaming_flushes_file_sink_early() {
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let dir = std::env::temp_dir().join(format!("my2sql-p3t3-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let full = "SET NAMES utf8mb4;\nSELECT 1;\n";
+        // streaming=true：write_group 返回即全盘可见，且 finish 后字节一致
+        {
+            let mut w = Writer::with_live(
+                dir.clone(),
+                false,
+                false,
+                false,
+                utc,
+                "to_sql".into(),
+                false,
+                true,
+                false,
+            );
+            w.write_group(&grp("mysql-bin.000001", "d", "t")).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join("to_sql.1.sql")).unwrap(),
+                full,
+                "streaming 下未 finish 即可见全部内容"
+            );
+            w.flush_all().unwrap();
+            assert_eq!(w.finish().unwrap(), 1);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("to_sql.1.sql")).unwrap(),
+                full
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // streaming=false（即 Writer::new 默认）：finish 前读为空 = 钉旧行为
+        {
+            let mut w = Writer::new(
+                dir.clone(),
+                false,
+                false,
+                false,
+                utc,
+                "to_sql".into(),
+                false,
+            );
+            w.write_group(&grp("mysql-bin.000001", "d", "t")).unwrap();
+            let before = std::fs::read(dir.join("to_sql.1.sql")).unwrap();
+            assert!(
+                before.is_empty(),
+                "非 streaming finish 前不得可见落盘字节, got: {before:?}"
+            );
+            assert_eq!(w.finish().unwrap(), 1);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("to_sql.1.sql")).unwrap(),
+                full
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P3 T3 Step 1 测试③：`no_clobber=true` 时 sink 创建见既存同名文件即
+    /// Err（io::Error::other，文案含 "refusing to overwrite" + 路径），且
+    /// 既存档字节分毫未动；回归钉：`(false, false)`（= `Writer::new`）照常
+    /// 覆盖、file 模式默认行为字节不变。
+    #[test]
+    fn writer_no_clobber_refuses_existing() {
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let dir = std::env::temp_dir().join(format!("my2sql-p3t3-clob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("to_sql.1.sql");
+        std::fs::write(&target, b"PREEXISTING").unwrap();
+        {
+            let mut w = Writer::with_live(
+                dir.clone(),
+                false,
+                false,
+                false,
+                utc,
+                "to_sql".into(),
+                false,
+                false,
+                true,
+            );
+            let e = w
+                .write_group(&grp("mysql-bin.000001", "d", "t"))
+                .expect_err("no_clobber 见既存同名文件必须 Err");
+            assert_eq!(e.kind(), std::io::ErrorKind::Other, "other() 通道");
+            let msg = e.to_string();
+            assert!(msg.contains("refusing to overwrite"), "got: {msg}");
+            assert!(
+                msg.contains("to_sql.1.sql"),
+                "错误须含目标文件名, got: {msg}"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"PREEXISTING",
+                "拒绝覆盖：既存档不得被截断"
+            );
+        }
+        // 回归钉：默认 (false, false) 形态照常覆盖（file 模式行为字节不变）
+        {
+            let mut w = Writer::new(
+                dir.clone(),
+                false,
+                false,
+                false,
+                utc,
+                "to_sql".into(),
+                false,
+            );
+            w.write_group(&grp("mysql-bin.000001", "d", "t")).unwrap();
+            assert_eq!(w.finish().unwrap(), 1);
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "SET NAMES utf8mb4;\nSELECT 1;\n"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
