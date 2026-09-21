@@ -26,6 +26,8 @@ pub enum WorkType {
     ToSql,
     Flashback,
     Stats,
+    /// P3 T1：repl 实时跟流（dispatch 键，run_repl 在 T5 前为真实 Err 空壳）。
+    Repl,
 }
 
 /// 逐事件错误策略（P2 T3）：`Stop` = 首错即整跑 Err + 清场（flashback 专用
@@ -53,6 +55,8 @@ pub enum Command {
     Flashback(FlashbackArgs),
     /// binlog 统计分析：输出 binlog_status.txt / biglong_trx.txt 报表，不生成 SQL
     Stats(StatsArgs),
+    /// 实时跟流（P3）：以从库协议拉取主库 binlog，按事务边界流式产出 to-sql
+    Repl(ReplArgs),
 }
 
 /// 三子命令共享的定位/过滤/schema 源/输出目录/并发旗标（P2 T5 flatten 重构；
@@ -196,6 +200,30 @@ pub struct StatsArgs {
     pub stats_json: bool,
 }
 
+/// repl 子命令参数（P3 T1）。位点三态：`--resume-file` 接续 / now 哨兵
+/// （`--start-file ""` + `--start-pos 0`，T5 以 `SHOW MASTER STATUS` 定位）/
+/// 显式 start-*（file+pos 或 datetime）。`--uri` 走 CommonArgs（clap 面保持
+/// Option 与 to-sql/flashback 共用），repl 下**必填**——硬校在 `validate_repl`。
+#[derive(Args, Debug, Clone)]
+pub struct ReplArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub text: SqlTextArgs,
+    /// 从库协议注册的 server-id（无默认=拒绝代答：冲突表现为静默丢事件）
+    #[arg(long)]
+    pub server_id: u32,
+    /// checkpoint 文件路径（事务边界原子落盘，存在即从其记录的位点接续）
+    #[arg(long)]
+    pub resume_file: Option<PathBuf>,
+    /// 心跳探活间隔秒（0=禁用，有效范围 0..=3600，校验在 validate_repl）
+    #[arg(long, default_value_t = 30)]
+    pub heartbeat_secs: u32,
+    /// 输出到标准输出（与 --resume-file 互斥：checkpoint 需与盘上产物对账）
+    #[arg(long)]
+    pub to_stdout: bool,
+}
+
 /// 校验并归一化后的运行配置。后续所有任务从这里取参数。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -245,6 +273,12 @@ pub struct Config {
     pub long_trx_seconds: u32,
     /// `--stats-json`：两份报表同步输出 JSONL 版（P2 T4 消费；默认 false）。
     pub stats_json: bool,
+    /// repl 从库协议 server-id（P3 T1；仅 `validate_repl` 填 Some，其余模式 None）。
+    pub server_id: Option<u32>,
+    /// repl checkpoint 文件（P3 T1；None=不接续/不落盘）。
+    pub resume_file: Option<PathBuf>,
+    /// repl 心跳探活秒（P3 T1；0=禁用，默认 30，非 repl 恒取默认无消费）。
+    pub heartbeat_secs: u32,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -280,6 +314,7 @@ impl Config {
             Command::ToSql(args) => Config::validate_to_sql(args),
             Command::Flashback(args) => Config::validate_flashback(args),
             Command::Stats(args) => Config::validate_stats(args),
+            Command::Repl(args) => Config::validate_repl(args),
         };
         cfg.unwrap_or_else(|e| {
             eprintln!("error: {e}");
@@ -364,6 +399,64 @@ impl Config {
         cfg.big_trx_rows = args.big_trx_rows;
         cfg.long_trx_seconds = args.long_trx_seconds;
         cfg.stats_json = args.stats_json;
+        Ok(cfg)
+    }
+
+    /// 校验并归一化 `repl` 参数 → `Config`（P3 T1；骨架依 `validate_to_sql`）。
+    /// repl 专属拒绝（均先于 build_common，错误串面向用户可操作）：
+    /// 1. `--uri` 硬必填（clap 面保持 Option 共用，schema 与流同源主库，
+    ///    schema-file 不可替代）；
+    /// 2. `--resume-file` 与显式 start-* 互斥——位点三态（resume / now 哨兵 /
+    ///    显式位点）只允许一态，同给即歧义；now 哨兵 = start_file 空且
+    ///    start_pos==0（`repl_defaults` 钉），非哨兵即视为显式 start；
+    /// 3. `--resume-file` + `--to-stdout` 拒——checkpoint 的 written_files 需
+    ///    与盘上产物对账（T3 契约），stdout 形态无从对账；
+    /// 4. `--heartbeat-secs` 仅上限 3600（0 合法=禁用，spec §1）。
+    ///    其余位点/窗口对偶校验（stop_pos>start_pos、start<stop datetime 等）
+    ///    复用 `build_common`。server-id 无 clap 默认=拒绝代答（冲突静默丢事件）。
+    pub fn validate_repl(args: ReplArgs) -> Result<Config, String> {
+        if args.common.uri.is_none() {
+            return Err(
+                "repl: --uri is required (live stream and schema both come from the master; \
+                 --schema-file cannot replace it)"
+                    .into(),
+            );
+        }
+        if let Some(rf) = &args.resume_file
+            && (!args.common.start_file.is_empty()
+                || args.common.start_pos != 0
+                || args.common.start_datetime.is_some())
+        {
+            return Err(format!(
+                "repl: --resume-file {rf:?} conflicts with an explicit start position \
+                 (位点歧义: pass either --resume-file, or the now sentinel \
+                 --start-file \"\" --start-pos 0, or start-* — exactly one)"
+            ));
+        }
+        if args.resume_file.is_some() && args.to_stdout {
+            return Err(
+                "repl: --resume-file requires an on-disk --output-dir (checkpoint written_files \
+                 are verified against files on disk; --to-stdout is not supported with resume)"
+                    .into(),
+            );
+        }
+        if args.heartbeat_secs > 3600 {
+            return Err(format!(
+                "--heartbeat-secs must be in 0..=3600, got {} (0 disables heartbeat probing)",
+                args.heartbeat_secs
+            ));
+        }
+        let mut cfg = build_common(&args.common)?;
+        apply_sql(&mut cfg, &args.text);
+        cfg.to_stdout = args.to_stdout;
+        // repl 恒 to-sql 文本语义（流式版）：keep_trx 中性默认、on_error 恒
+        // SkipBadEvent（急停无消费——断链/终止语义归 run_repl，T5）。
+        cfg.work_type = WorkType::Repl;
+        cfg.keep_trx = true;
+        cfg.on_error = OnError::SkipBadEvent;
+        cfg.server_id = Some(args.server_id);
+        cfg.resume_file = args.resume_file.clone();
+        cfg.heartbeat_secs = args.heartbeat_secs;
         Ok(cfg)
     }
 }
@@ -460,6 +553,10 @@ fn build_common(args: &CommonArgs) -> Result<Config, String> {
         big_trx_rows: 10,
         long_trx_seconds: 1,
         stats_json: false,
+        // repl 三字段中性默认：仅 validate_repl 覆写（P3 T1）
+        server_id: None,
+        resume_file: None,
+        heartbeat_secs: 30,
     })
 }
 
@@ -611,6 +708,158 @@ mod tests {
         // T9 措辞收口：`--on-error` 旗标只存在于 to-sql/flashback 两处，stats 无
         // 该旗标（`validate_stats` 恒 SkipBadEvent）→ 错误串须点名 flashback-only。
         assert!(e.contains("flashback-only"), "{e}");
+    }
+
+    /// 校验并归一化 `repl` 参数 → `Config`（P3 T1 红例，先测后实现）。
+    /// `args` = `my2sql-rs repl` 之后的全部旗标（clap 4 单值旗标重复出现即
+    /// ArgumentConflict，故不做 base+extra 拼接）。
+    fn repl_parsed(args: &[&str]) -> ReplArgs {
+        let mut v = vec!["my2sql-rs", "repl"];
+        v.extend_from_slice(args);
+        let cli = Cli::try_parse_from(v).unwrap();
+        let Command::Repl(a) = cli.cmd else {
+            panic!("repl only")
+        };
+        a
+    }
+
+    /// now 哨兵 + server-id 的合法最小基座（uri 由 extra 决定有无）。
+    fn rargs(extra: &[&str]) -> ReplArgs {
+        let mut v = vec![
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "",
+            "--start-pos",
+            "0",
+            "--server-id",
+            "7",
+        ];
+        v.extend_from_slice(extra);
+        repl_parsed(&v)
+    }
+
+    #[test]
+    fn repl_requires_uri_and_server_id() {
+        // uri 缺位即使另备 schema-file 也拒（repl 的 schema 与流同源于主库）；
+        // 错误串点名 uri。
+        let e = Config::validate_repl(rargs(&["--schema-file", "/s"])).unwrap_err();
+        assert!(e.contains("uri"), "{e}");
+        // 两源全无时同样先撞 uri 拒绝（早于 build_common 的 schema source 报错）
+        let e = Config::validate_repl(rargs(&[])).unwrap_err();
+        assert!(e.contains("uri"), "{e}");
+        // --server-id 无默认=拒绝代答（冲突静默丢事件）：clap 缺参面直接失败，
+        // 进程级 exit(2) 由 tests/cli.rs -binary 面钉
+        assert!(
+            Cli::try_parse_from([
+                "x",
+                "repl",
+                "--binlog-dir",
+                "/d",
+                "--start-file",
+                "",
+                "--start-pos",
+                "0",
+                "--uri",
+                "mysql://x@y"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn repl_rejects_resume_with_explicit_start() {
+        // resume 在场时任何显式 start-* 均为歧义（三态互斥：resume/now 哨兵/显式位点）
+        let e = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "f.000001",
+            "--server-id",
+            "7",
+            "--uri",
+            "mysql://x@y",
+            "--resume-file",
+            "/r.json",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("歧义"), "{e}");
+        // start_pos 非 0（脱离 now 哨兵）同样歧义
+        let e = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "",
+            "--start-pos",
+            "4",
+            "--server-id",
+            "7",
+            "--uri",
+            "mysql://x@y",
+            "--resume-file",
+            "/r.json",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("歧义"), "{e}");
+        // start_datetime 在场同样歧义
+        let e = Config::validate_repl(repl_parsed(&[
+            "--binlog-dir",
+            "/d",
+            "--start-file",
+            "",
+            "--start-pos",
+            "0",
+            "--server-id",
+            "7",
+            "--uri",
+            "mysql://x@y",
+            "--resume-file",
+            "/r.json",
+            "--start-datetime",
+            "2026-09-21 10:00:00",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("歧义"), "{e}");
+        // resume + --to-stdout：checkpoint 的 written_files 需与盘上产物对账 → 拒
+        let e = Config::validate_repl(rargs(&[
+            "--uri",
+            "mysql://x@y",
+            "--resume-file",
+            "/r.json",
+            "--to-stdout",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("output-dir"), "{e}");
+        // resume + now 哨兵 = 合法二态组合
+        assert!(
+            Config::validate_repl(rargs(&["--uri", "mysql://x@y", "--resume-file", "/r.json"]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn repl_defaults() {
+        // 缺省位点=now 哨兵（start_file 空且 start_pos==0 且无 resume）→ Ok
+        let c = Config::validate_repl(rargs(&["--uri", "mysql://x@y"])).unwrap();
+        assert_eq!(
+            (c.start_file.as_str(), c.start_pos, c.uri.as_deref()),
+            ("", 0, Some("mysql://x@y"))
+        );
+        assert_eq!(c.resume_file, None);
+        assert_eq!(c.server_id, Some(7));
+        assert_eq!(c.heartbeat_secs, 30);
+        assert_eq!(c.work_type, WorkType::Repl);
+        // heartbeat：0 合法（禁用），仅上限 3600
+        assert_eq!(
+            Config::validate_repl(rargs(&["--uri", "mysql://x@y", "--heartbeat-secs", "0"]))
+                .unwrap()
+                .heartbeat_secs,
+            0
+        );
+        assert!(
+            Config::validate_repl(rargs(&["--uri", "mysql://x@y", "--heartbeat-secs", "3601"]))
+                .is_err()
+        );
     }
 
     #[test]

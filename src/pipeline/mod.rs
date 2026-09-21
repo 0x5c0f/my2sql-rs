@@ -234,6 +234,16 @@ pub fn run_stats(cfg: &Config) -> Result<StatsRun, PipelineError> {
     })
 }
 
+/// repl 装配入口（P3 T1 空壳，T5 仅替换函数体，dispatch 面已定稿）。
+/// 不用 `todo!()`：参数合法（`validate_repl` 通过、main 分派到此）即以真实
+/// `Err(Config)` 返回——main 打印该 Err 并退 1，出口链路（含 tests/cli.rs
+/// 桩测）自本任务起可回归。实现见 T5（resume/三态定位/重连/心跳/SIGINT）。
+pub fn run_repl(_cfg: &Config) -> Result<RunSummary, PipelineError> {
+    Err(PipelineError::Config(
+        "repl: pipeline not built (P3 T5)".into(),
+    ))
+}
+
 /// 一次运行的装配状态（dispatcher 侧独占；`SchemaStore` `&mut` 语义天然单线程）。
 struct Runner<'a> {
     cfg: &'a Config,
