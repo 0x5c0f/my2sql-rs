@@ -52,23 +52,33 @@ tools/compat-matrix.sh` 重跑生成（探针步骤全脚本化，声明自此�
 `WORK_TYPE=rollback|stats` 的裁判+我方+比较器（run-difftest 自含产数，
 非复用旧 binlog 文件——每次重新产数保证与 to-sql 族同数据同源）。
 
-| 用例 | 版本 | 裁判 vs 我方 | 结果（groups/冒烟行如实抄自 tsv） |
+| 用例 | 版本 | 裁判 vs 我方 | 结果（`out/compat-results.tsv` 第 3 列逐字抄录） |
 |---|---|---|---|
-| flashback-5.6 | 5.6.51 | Go `-work-type rollback` vs `flashback` | PASS 19/19 组 red=0（JSON 数据级排除沿用¹） |
-| flashback-5.7 | 5.7.44 | 同上 | PASS 21/21 组 red=0 |
-| flashback-8.0 | 8.0.46 | 同上 | PASS 21/21 组 red=0 |
-| flashback-8.4 | 8.4.11 | 同上 | PASS 21/21 组 red=0 |
-| stats-5.6 | 5.6.51 | 冒烟（不裁判比较；Go stats 输出留档 `out/difftest-5.6-stats/go-stats/`） | PASS report total=32 == to-sql DML lines=32 |
-| stats-8.0 | 8.0.46 | 同上（留档 `out/difftest-8.0-stats/go-stats/`） | PASS report total=36 == to-sql DML lines=36 |
+| flashback-5.6 | 5.6.51 | Go `-work-type rollback` vs `flashback` | `PASS groups A=19 B=19 aligned=19 green=19 red=0`（JSON 数据级排除沿用¹） |
+| flashback-5.7 | 5.7.44 | 同上 | `PASS groups A=21 B=21 aligned=21 green=21 red=0` |
+| flashback-8.0 | 8.0.46 | 同上 | `PASS groups A=21 B=21 aligned=21 green=21 red=0` |
+| flashback-8.4 | 8.4.11 | 同上 | `PASS groups A=21 B=21 aligned=21 green=21 red=0` |
+| stats-5.6 | 5.6.51 | 冒烟（不裁判比较；Go stats 输出留档 `out/difftest-5.6-stats/go-stats/`） | `PASS stats smoke: report total=32 to-sql DML lines=32` |
+| stats-8.0 | 8.0.46 | 同上（留档 `out/difftest-8.0-stats/go-stats/`） | `PASS stats smoke: report total=36 to-sql DML lines=36` |
 
 - **keep-trx scaffold 结构断言实证**（防 `_rb_struct` 无 scaffold 早退=守卫睡死）：
-  四个版本的 B 侧产物均含 scaffold 且满足 begin 数 = commit 数 − 1 = 事务段数
-  （我方默认 `--keep-trx true` 与 Go KeepTrx 缺省一致）。抽样计数（本轮产物）：
+  四个版本的 B 侧产物均含 scaffold 且满足 begin 数 = commit 数 − 1 = 事务段数。
+  **口径勘误（T9 复审修正）**：这是**我方默认开**（`--keep-trx` 缺省 true）的效果，
+  **与上游缺省并不一致**——上游 `KeepTrx` 是纯 struct 字段（context.go:126），
+  `InitFlags`（context.go:184-233）内**零旗标绑定**，故恒为 Go 零值 false，
+  `-work-type rollback` 的裁判产物天然无脚手架（本轮 A 侧实测 begin=commit=0，
+  见下条）。我方「默认开 + 提供 `--keep-trx/--no-keep-trx` 开关」是 spec §2.5/§3.3
+  登记的三处有意超越之一，比较器以「A 侧语句缓冲+注释绑定 / B 侧剥离脚手架」双模
+  吸收该差异（ALW-RB-SCAFFOLD）。抽样计数（本轮 B 侧产物）：
   5.7/8.0/8.4 `flashback.3.sql` begin=15/commit=16、5.6 `flashback.4.sql`
   begin=14/commit=15，违例会经 STRUCT-RED 计入 tsv 的 red=——red=0 即断言真跑过。
 - **scaffold-free 对照**：A 侧（Go 裁判）本轮四版本产物实测均无 begin;/commit;
-  行（begin=commit=0，与 compare.py 注释「A 侧 KeepTrx=false 天然无 scaffold」
-  一致）——结构断言实际只经 B 侧触发，B 侧计数上条即为守卫非睡死的实证。
+  行（begin=commit=0，上游 KeepTrx 无旗标绑定、恒 false）——结构断言实际只经
+  B 侧触发，B 侧计数上条即为守卫非睡死的实证。
+  **守卫适用面登记（T9）**：`tools/comparator/compare.py::_rb_struct` 对无
+  scaffold 的文件早退，故本矩阵的 B 侧结构断言只对 **keep-trx（默认）产物**生效；
+  `--no-keep-trx` 的我方输出与 A 侧同形 → 结构面平凡通过、不获该守卫保护
+  （本轮 14 用例全为默认 keep-trx，未跑该组合；如需钉该形态须另立断言）。
 - **范围裁决（brief 12 行 scope，不外溢）**：CKSUM=none 与 V1ROWS=1 特殊用例
   不扩展 rollback/stats 变体（checksum 双态已在 to-sql 族 8 用例覆盖解码器，
   flashback 与其共用同一解码路径；V1 逆序已由 T6 e2e + 单测钉，矩阵不重复）。

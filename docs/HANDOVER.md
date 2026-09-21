@@ -21,8 +21,15 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 
 ## 当前进度
 
-- 分支：`main`（`feat/p1` 已于终审修复后合入并删除，merge commit `62d9f6a`，
-  合并复跑 245+3+5+2 全绿）
+- 分支：`feat/p2`（worktree `.qoder/worktrees/feat+p2`，base `main@205512b`；
+  P2 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`，
+  spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p2-flashback-stats-design.md`；
+  SDD 台账 `.superpowers/sdd/2026-09-21-my2sql-rs-p2-flashback-stats/progress.md`）
+- **P2 计划 9 任务全部完成（T1–T9 节点齐）**：flashback（记录原子逆序 +
+  keep-trx + 完整性硬规则）与 stats（两报表 + JSONL + tick 对齐）交付，
+  差分/矩阵/活库对账/bench 闸全走查，DoD 对账见「P2 DoD 对账」节。
+  待全分支终审后合入 main。
+- 前史（P1）：`main` 分支（`feat/p1` 已于终审修复后合入并删除，merge commit `62d9f6a`）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成；全分支终审
   已做，唯一一轮终审修复（#1 decimal panic 闸 / #2 SHOW 标识符转义 / #3 本文
   档口径修正）见 Task 16 节点「终审修复轮」与挂账清单**。
@@ -1237,6 +1244,158 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   钉该形态需另立断言；③ worktree 内 `reference/` 为实体拷贝（软链会让
   go build `-o ../../tools/bin/...` 相对路径落到主库——实踩）。
 
+### P2 Task 8: compat 矩阵扩展（flashback×4 + stats 冒烟×2 → 14 用例）
+
+- 做了什么：`tools/compat-matrix.sh` 的 `run_case` 接 WORK_TYPE 维度——
+  每版本 plain 默认捕获的同套 datadir 流程**续跑** `WORK_TYPE=rollback|stats`
+  的裁判+我方+比较器（run-difftest 自含产数，与 to-sql 族同数据同源）；
+  `docs/compat/matrix.md` 增「P2 Task 8 追加族」节（结果列 = tsv 第 3 列
+  逐字抄录）。范围裁决：CKSUM=none 与 V1ROWS 特殊用例不扩 rollback/stats
+  变体（理由登记于 matrix.md「范围裁决」条）；stats 5.7/8.4 有意不跑
+  （spec §3.6 省时裁决，聚合与服务器版本无关，5.6+8.0 两点覆盖）。
+- **单轮真实跑 14/14 PASS**（commit `a2cebca`，2026-09-21，日志
+  `out/compat-p2-full.log` + `out/compat-results.tsv` 14 行，tsv/log/产物
+  mtime 13:41:56–13:44:53 互证）。逐用例数字（T9 本轮对 artifact 复验）：
+  flashback-5.6 `PASS groups A=19 B=19 aligned=19 green=19 red=0`、
+  flashback-5.7/8.0/8.4 同式 21/21；stats-5.6 `report total=32 == to-sql
+  DML lines=32`、stats-8.0 `36 == 36`。scaffold 计数实证（T9 现场 grep
+  `out/difftest-*-rb/rs/`）：5.7/8.0/8.4 `flashback.3.sql` begin=15/
+  commit=16、5.6 `flashback.4.sql` begin=14/commit=15；A 侧（Go 裁判）
+  四版本 begin=commit=0（上游 KeepTrx 无旗标绑定恒 false 的实证，
+  context.go:126/184-233）。证据位置：`out/compat-results.tsv`、
+  `out/compat-flashback-*.log`、`out/compat-stats-*.log`、
+  `out/difftest-{5.6,5.7,8.0,8.4}-rb/`、`out/difftest-{5.6,8.0}-stats/`。
+- T7 移交风险处置：① `_rb_struct` 组合闸未触发（本矩阵 14 用例全默认
+  keep-trx）；② stats `--schema-dump` 空转旗标 → T9 补消费收口；
+  ③ type 39 未触发（矩阵件无 PARTIAL_JSON）。
+- 评审：Approved（零 Critical；1 Important + 2 Minor 为文档债 → **本表
+  T9 节点清偿**：matrix.md「与 Go KeepTrx 缺省一致」措辞失实已在 T9 的
+  matrix.md「口径勘误（T9 复审修正）」段勘误——我方默认开是有意超越、
+  非上游缺省；stats 结果行非逐字 → T9 改为 tsv 第 3 列逐字抄录 +
+  「守卫适用面登记（T9）」条）。Important 程序债：本节点即 T8 缺席
+  节点的 T9 补记（用户常设要求：每任务一节点）。
+
+### P2 Task 9: 文档收口 + DoD 对账 + 性能回归闸
+
+- 做了什么（轮1 截断 + 轮2 收尾合并为一棵未提交树 → 本提交）：
+  ① README：三形态特性矩阵行、吞吐行如实挂 P2 finding（R11 措辞，无
+  「无回归」宣称）、快速上手补 flashback/stats 两子命令**实测例句**
+  （`--uri` 在线形态，出自 tools/run-difftest.sh 第 5 步同构；本轮真跑：
+  `flashback done: events=21, statements=36, files=1, errors=0` +
+  `stats done: events=60, … skipped=0`，产物 out/quick-{flashback,stats}/）、
+  上游差异清单追加 16–22 七项（P2 族）、修复悬空引用「差异 21」→ 22、
+  `make difftest/compat` 注释与 selftest 组数（8→9）同步。
+  ② matrix.md：P2 追加族结果列逐字化 + keep-trx 口径勘误（T8 评审
+  Important 清偿）+ `_rb_struct` 守卫适用面登记。
+  ③ docs/bench/p2.md 新建：DoD-4 回归闸全文（原始 −14.9% → 环境 −8.3% +
+  代码 −3.2%、95% CI 跨 0；测量陷阱三条；复现脚本）——R11 裁决落文档。
+  ④ 代码收口三项：`run_stats` 补消费 `--schema-dump`（b487a31 同构、
+  TDD 用例 6 先红后绿，Err 路径不落半成品）；`--on-error stop` 拒绝措辞
+  flashback-only（T5 挂账 nit：stats 无该旗标，tests/cli.rs + config.rs
+  单测双钉 + 顺序钉桩）；tools/flashback-reconcile.sh 原子
+  `SHOW MASTER STATUS` 单取 (File,Position)（rotate 竞态）+ after-dump
+  `|| true` 摘除（吞失败→空文件假绿）+ 产物留档口径注释（T6 挂账清偿）。
+  ⑤ **B.4 上游一致性四风险族裁决**（逐项实读 reference/my2sql-go，
+  结论=一修三平/挂账，详见下节 DoD-附）：
+  (a) GTID→begin 折叠：上游 MySQL GTID(33/34) 在 com.go:153-155 default
+  分支 C_reContinue → **不喂** StatChan（file.go:220-221 continue 先于
+  :274）；唯一折叠 = MARIADB_GTID_EVENT（stats_process.go:131-135
+  sql="begin"），MariaDB 超范围（spec §1/D5）。我方 source.rs Gtid 状态
+  透明 + prepare 不派发 = **一致，不改**（legal MySQL 事务恒有 BEGIN
+  query 定界，两侧记账同构）。
+  (b) 非派发事件与 interval tick：上游 tick 对**每个喂入事件**判定
+  （stats_process.go:247-257），喂入集 = 过滤后 rows ∪ **任意 QUERY_EVENT**
+  ∪ XID（com.go:144-151 query/xid 分支零过滤 + file.go:274-281）——
+  被 --db/--table/--dml 过滤的 rows 不喂故不 tick（我方 prepare:504 过滤
+  先于 Fact，一致）；**但 DDL/`use`/空文本 QUERY 上游喂入并冲刷窗口、
+  重设锚点，我方历史实现完全不派发 = legal-input 真分歧**（binlog 中段
+  DDL 跨 interval 边界时窗口行切分不同）→ **Rust 修复（TDD）**：
+  `StreamEvent::Tick`（src/stats/mod.rs）+ prepare 非关键字 QUERY 派发
+  Process + emit 映射 Tick（src/pipeline/mod.rs）；RED=`tests/stats.rs`
+  用例 7 `stats_misc_query_ticks_window_like_upstream` 断言 windows
+  (2,0)≠(3,0)（修复前实测），GREEN=7/7 stats 全绿、既有用例 golden
+  零扰动（其 fixture 无杂 QUERY）。真 8.0 冒烟复跑：36==36 不变
+  （捕获数据全部同秒、无跨界，tick 修复在该数据上不可见——纯加法
+  保序派发，`stats done: events=` 51→60 = +9 条 DDL tick）。
+  (c) duration `saturating_sub` vs Go uint 回绕：上游
+  stats_process.go:200 `StopTime - StartTime`（uint32，commit 早于首行
+  即回绕成 ~4.29e9 巨值 → :201 `>= longTrxSecs` 必命中垃圾「超长事务」）；
+  锚点 `Timestamp + printInterval` 同型（:180,255）。我方 saturating 钳制
+  （src/stats/mod.rs feed/write）→ 仅**非单调时间戳输入**（损坏/人为篡改）
+  可见分歧；stats 威胁模型不含手工恶意 binlog（且 Go 侧回绕值本身即
+  垃圾），legal-input（事件 ts 随位点非降）逐字节同 → **不改，挂账**。
+  (d) 被过滤表的窗口行/markers：上游 rows 过滤即不进窗口
+  （com.go:119-140 → file.go:220 先于 :274）；begin/commit markers 两侧
+  **都不受** db/dml 过滤（query/xid 零过滤 vs 我方 prepare 标记派发先于
+  :504 过滤检查）；整事务被过滤时上游 StartTime==0 守卫不发 biglong 行
+  （stats_process.go:196 注释「the rows event may be skipped by
+  --databases --tables」）vs 我方 `bl_start_time > 0` 同位守卫
+  （src/stats/mod.rs feed Commit/Rollback 分支）= **一致，不改**。
+  ⑥ 本 HANDOVER：T8/T9 节点（本节）+「P2 DoD 对账」节 + 挂账清单更新。
+- 测试：全量 `cargo test` 296 通过 / 0 失败 / 1 ignored（lib 265 + cli 6 +
+  e2e 9 + flashback 7 + fuzz_seed 2 + stats 7），
+  `cargo clippy --all-targets -- -D warnings` 净、`cargo fmt --check` 净；
+  三门均在本轮 Tick 修复后复跑。
+- 遗留/对后续影响：p1.md `5.903 s` 笔误（真值 5.093 s，p2.md 注记为权威）
+  移交集成方一行修；bench 判定工装（governor/taskset）与 --dml×stats
+  裁判维度归 P3+；详见挂账清单。
+
+## P2 DoD 对账（spec §6，Task 9 收尾）
+
+> 取证纪律：每条 = 证据命令 + 结果摘要。**引用既往真实跑**时显式标注
+> commit 与 artifact 位置；本轮（T9 工作树）能便宜复跑的均已复跑。
+
+1. **差分与矩阵**（spec §6.1）——
+   - `WORK_TYPE=rollback make difftest`：**T9 本轮真复跑 exit 0**（工作树
+     含全部 T9 代码改动）：`comparator selftest: 9/9 groups ... OK` +
+     `groups A=21 B=21 aligned=21 green=21 red=0` +
+     `OK difftest(rollback) 8.0: diff-green + replay-byte-identical`；
+     产物 `out/difftest-8.0-rb/` 重生成（B 侧 scaffold begin=15/commit=16
+     复验不变）。
+   - `WORK_TYPE=stats make difftest`：**T9 本轮真复跑 exit 0**
+     （`stats smoke: report total=36 to-sql DML lines=36`）——B.4(b) tick
+     修复后冒烟无回归的直接证据。
+   - 变异红（结构闸非睡死）：引 T7 真跑（`51f79ae` 节点）：删真实
+     `flashback.3.sql` 尾行 `commit;` → 2×STRUCT-RED、exit 1。
+   - `make compat` 14 用例：**引 T8 真实跑（commit `a2cebca`，未在本轮
+     复跑——整矩阵需 docker×4 版本产数 ~4 分钟 + 判定面无 T9 解码改动；
+     显式引用）**：`out/compat-results.tsv` 14 行全 PASS（逐字抄录见
+     docs/compat/matrix.md P2 追加族表），日志 `out/compat-p2-full.log`。
+   - T6 活库正逆对账：引 `e5b8d30` 真跑（未复跑，人工触发非常驻）：
+     `baseline checksum = 3944497573 == after-apply checksum = 3944497573`
+     + 剔噪逐行 dump 全等；持久 artifact `out/flashback-reconcile/`
+     （baseline.sql/after.sql/rows/flashback.log/binlog）。
+2. **完整性立场落地**（spec §6.2）——三 hard 规则：
+   `sqlopen::dml::tests::flashback_rejects_padded_dropped_columns_as_event_error`（a/Padded）、
+   `flashback_missing_value_error_hints_row_image_full`（b/Missing，含
+   `binlog_row_image=FULL` 提示语）、c=由 a 拦截（无键全列 WHERE 与 P1 一致）；
+   真件证明 `tests/e2e.rs::real_capture_flashback_minimal_image_hard_errors`
+   （000003 MINIMAL → stop 整跑 Err / skip 计 1 跳续产）。默认 stop：
+   `config::tests::flashback_defaults_and_flags`。skip 告警链：
+   `tests/flashback.rs::flashback_skip_marks_header`（`-- WARNING` 头行
+   逐字节）+ e2e 真件事先核。DDL 排除告警：`flashback_ddl_excluded_with_summary`
+   + T9 快速上手真跑实测（9 条 DDL/query excluded stderr 汇总）。
+   证据命令：`cargo test`（本轮 296/296 绿）。
+3. **keep-trx 逐字节 golden（差分独立）**（spec §6.3）——
+   `src/flashback/reverse.rs` 单测 `reverse_bytes_byte_equal_upstream_keeptrx_quirk`
+   （首部悬空 `commit;`、事务边界注入、文件尾 `commit;`——逐字节复刻
+   rollback_process.go 语义）+ `no_keeptrx_emits_pure_reverse_without_scaffold`
+   + `tests/flashback.rs::flashback_e2e_multi_trx_bytes`（threads 全等）；
+   运行 = `cargo test` 同闸。差分侧独立证据 = 上条 compat scaffold 计数。
+4. **stats 报表 + bench 闸**（spec §6.4）——双报表 + JSONL 逐字节 golden：
+   `cargo test --test stats` 7/7（单元 golden = e2e 同串、T9 新增用例 7
+   tick 语义）。事实流零延迟：to-sql bench 见 **docs/bench/p2.md**——
+   DoD-3 绝对线 threads=8 = 88.352 MiB/s（92.6 MB/s）≥ 40 MB/s **PASS**；
+   §6.4 回归闸 R11 裁决：原始 −14.9% 归因环境 −8.3% + 代码 −3.2%
+   （配对 95% CI [−2.4%, +9.0%] 跨 0）→ **不 STOP；但如实挂「未判定
+   finding」，不写「无回归」**；判定工装（governor/taskset）留 P3/P4。
+5. **文档收口**（spec §6.5）——README 三形态矩阵行 + 快速上手实测例句 +
+   上游差异清单 16–22（P2 七项：flashback 命名/记录原子化/keep-trx
+   默认开+开关/WARNING 头与 SET NAMES/stats 表序确定化/DDL 排除策略/
+   stats 不裁判差分）；docs/compat/matrix.md 14 用例 + 口径勘误 +
+   守卫适用面；本文件 T1–T9 节点齐 + 本节 DoD + 挂账更新。
+   P1→P2 行为差异入差异清单 = 差异 16–22（承接 P1 清单 1–15）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -1254,10 +1413,53 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
 - 本机：docker（镜像 mysql:5.6/5.7/8.0/8.4 全部就绪，T17 已拉 8.4）、Go 工具链 /opt/go/bin、cargo/rustc 最新 stable
 - 工作区：`/home/cxd/Projects/aiediter/my2sql`
 - SDD 台账：`.superpowers/sdd/2026-09-20-my2sql-rs-p1/progress.md`（git-ignored，恢复上下文先读它）
+- SDD 台账（P2）：`.superpowers/sdd/2026-09-21-my2sql-rs-p2-flashback-stats/progress.md`
+  （git-ignored；任务简报/评审 diff/各任务报告同目录）
 
 ## 遗留/挂账清单
 
-- [ ] P2：flashback + stats（另出计划）
+- [x] ~~P2：flashback + stats（另出计划）~~——T1–T9 全部完成（本表上方
+  节点 + 「P2 DoD 对账」节），待全分支终审合入。
+- **P2 T9 新增挂账**：
+  - [ ] 已知差异（stats，T9-B.4(c)，**不修**）：biglong duration =
+    commit_ts − 事务内首 rows_ts，我方 `saturating_sub`（src/stats/mod.rs
+    feed 的 Commit/Rollback 分支），上游 uint32 裸减回绕
+    （stats_process.go:200——commit 早于 begin 的损坏输入会回绕成 ~4.29e9
+    巨值使 `:201 >= longTrxSecs` 必命中垃圾行）；窗口锚点
+    `ts+printInterval` 同理（:180,255 vs 我方 saturating_add）。
+    仅非单调时间戳（损坏/人为篡改）可见，legal-input-only 论证入册
+    （stats 威胁模型不含手工恶意 binlog，对齐 P1 frac_text 先例口径）。
+  - [ ] 已修复入册（stats，T9-B.4(b)，**勿回退**）：非关键字 QUERY
+    （DDL/`use`/空文本）上游会喂 StatChan 并参与窗口冲刷/锚点重设
+    （file.go:274-281 + stats_process.go:247-257；rows 的 db/dml 过滤
+    上游同样先于喂入 = 不 tick，两侧一致），我方以 `StreamEvent::Tick`
+    对齐（tests/stats.rs 用例 7 逐字节钉 RED→GREEN）。P3 若改 stats
+    派发面须保持该集合：喂入集 = 过滤后 rows ∪ 任意 QUERY ∪ XID；
+    MySQL GTID(33/34)/TABLE_MAP/FDE 等永不喂入（com.go:153-155 default）。
+  - [ ] `_rb_struct` 结构断言守卫适用面仅 **keep-trx（默认）产物**：
+    无 scaffold 文件早退 → `--no-keep-trx` 输出结构面平凡通过、不获该
+    保护；已登记 docs/compat/matrix.md「守卫适用面登记（T9）」条
+    （T8 全 14 用例均为默认形态，范围裁决不扩跑该组合；如需钉该形态
+    须另立断言——T7/T8 移交同源风险）。
+  - [ ] `to-sql --on-error stop` 拒绝时序：validate_to_sql 的 stop 检查
+    先于 build_common → 同时缺 schema 源时用户先见 on-error 条。可辩护
+    （旗标语义优先级更高），已按 T5 挂账在 src/config.rs 注释 +
+    tests/cli.rs 顺序钉桩收口为**文档化行为**，不再是测试债。
+  - [ ] **docs/bench/p1.md 笔误待修（移交集成方，一行）**：记录表
+    threads=8 用时 `5.903 s` 应为 **5.093 s**（其 criterion 摘录
+    `[5.0501 s 5.0927 s 5.1408 s]` 与判定文字为准；p2.md 开头注记为
+    权威说明）。不属本分支改动面，故未动。
+  - [ ] stats 报表尾注 `# skipped events: N` 为**自定口径**：上游两报表
+    无尾注（stats_process.go:262-265 收尾仅冲刷窗口）——格式/落点由本
+    计划简报裁定；比较器已约定跳 `#` 行（T7），该行不受裁判差分保护，
+    改动须同步 run-difftest 冒烟内联脚本。
+  - [ ] `--dml` 过滤与上游 stats 计数一致性**未做裁判差分**：T9 仅源码
+    路径核对（上游 FilterSqlLen 于 com.go:75-101 拦 rows、query/xid
+    直通 = 我方 prepare 过滤位形），差分维度 P3 再说（承 T7 口径）。
+  - [ ] bench 判定工装（P3/P4）：若要判定 P2 未解析的 −3.2% 代码增量，
+    需 `governor=performance` + `taskset` 钉 8 P 核重做 A/B（~30 分钟）；
+    threads 1→8 并行效率 2.5× 的 P1 挂账保留。证据 docs/bench/p2.md
+    「后续动作」节（T9 移入本条统一索引）。
 - [ ] P3：repl 模式（另出计划；认证含 caching_sha2）
 - [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 4 件——终审 #1
   补第 4 件 `decimal_full_group_overflow.bin`，DECIMAL 满组溢出 repro +

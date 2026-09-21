@@ -3,28 +3,31 @@
 MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / stats），
 能力对齐 Go 版 [my2sql](https://github.com/ultradb/my2sql)（本仓库内
 `reference/my2sql-go/` 作为行为参考与差分裁判），但 CLI 全新设计、无 async
-（std::thread + crossbeam-channel）。当前处于 **P1：file 模式 to-sql 已达发布
-标准**；flashback / stats / 复制协议模式在后续阶段（P2/P3）。
+（std::thread + crossbeam-channel）。当前处于 **P2：file 模式 to-sql /
+flashback / stats 三个工作形态已达发布标准**；复制协议模式（repl）在 P3。
 
 ## 功能矩阵
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| `to-sql` file 模式（binlog 目录离线读取） | ✅ | `make compat` 8 用例全绿 |
+| `to-sql` file 模式（binlog 目录离线读取） | ✅ | `make compat` 14 用例全绿（= to-sql 族 8 + flashback 族 4 + stats 冒烟 2，逐字结果见 [docs/compat/matrix.md](docs/compat/matrix.md)） |
 | MySQL 5.6 / 5.7 / 8.0 / 8.4 | ✅ | ROW 格式；full/minimal/noblob 镜像；CRC32/NONE 校验和；V1/V2 rows 事件（V0 硬拒，见下文差异 6） |
 | 在线 schema（`--uri`） | ✅ | mysql://user@host:port；8.4 caching_sha2 与 native 双通过 |
-| 离线 schema 回放（`--schema-file` / `--schema-dump`） | ✅ | 无 DB 可解码；导出→回放逐字节一致（difftest 第 7 步硬闸） |
+| 离线 schema 回放（`--schema-file` / `--schema-dump`） | ✅ | 无 DB 可解码；导出→回放逐字节一致（difftest 第 7 步硬闸）；三形态（to-sql/flashback/stats）均消费 `--schema-dump` |
 | 并行 `--threads` | ✅ | 乱序并行解码 + reorder 保序刷出 + 反压；同输入任意 threads 输出字节一致 |
 | 事件/库表过滤（`--db/--table/--ignore-*`、`--dml`、start/stop 窗口） | ✅ | |
 | 输出形态（`--output-dir/--to-stdout/--file-per-table/--add-extra-info/--no-db-prefix/--full-columns` 等） | ✅ | |
-| `flashback`（反向 SQL） | ❌ | P2 |
-| `stats`（事件统计） | ❌ | P2 |
+| `flashback`（反向/回滚 SQL，记录原子逆序 + keep-trx 事务脚手架） | ✅ | Go `-work-type rollback` 裁判差分 4 版本全绿（`flashback-{5.6,5.7,8.0,8.4}`）+ `WORK_TYPE=rollback make difftest` + 活库正逆对账（`tools/flashback-reconcile.sh`）；DDL 反向明确不做（D5） |
+| `stats`（窗口×表 DML 行数 + 大/长事务识别，两报表 + JSONL） | ✅ | `stats-{5.6,8.0}` 冒烟绿（报表 DML 总和 == 同流 to-sql 行数）；上游报表字节面复刻，**不做**裁判差分（spec §3.6，理由见差异 22） |
 | repl 模式（伪装 replica 拉流） | ❌ | P3 |
 | DDL 回滚 / `--apply` 直写库 / MariaDB / 8.0.1 default_metadata | ❌ | 明确不做（设计决策 D5） |
 | fuzz 正式接入 / 影子库端到端回放 / musl 静态性能 | ❌ | P4（musl 构建本身已可用，见 docs/bench/p1.md） |
 
 吞吐基线（DoD-3，发布态，528 MiB 合成 binlog）：**threads=8 ≈ 103.9 MiB/s**
-（≥ 40 MB/s 通过），明细见 [docs/bench/p1.md](docs/bench/p1.md)。
+（≥ 40 MB/s 通过），明细见 [docs/bench/p1.md](docs/bench/p1.md)。P2 回归闸
+（spec §6.4）：原始读数 −14.9%，同机 A/B 归因为环境漂移 −8.3% + 代码增量
+−3.2%（95% CI 跨 0，未达 5% 判定线）——**未判定 finding**，不宣称「无回归」，
+全程证据与测量陷阱见 [docs/bench/p2.md](docs/bench/p2.md)。
 
 ## 快速上手
 
@@ -67,6 +70,32 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
 不带 `--to-stdout` 时按默认写 `--output-dir`（可加 `--file-per-table` 分表落盘）。
 断网/无 DB 场景：在线跑一次时加 `--schema-dump schema.json` 导出表结构，
 之后用 `--schema-file schema.json` 替代 `--uri` 离线回放（输出逐字节一致）。
+
+同一区间做**回滚 SQL** 与**统计报表**（以下两条同样实测；形态出自
+`tools/run-difftest.sh` 第 5 步与 `tools/flashback-reconcile.sh`）：
+
+```bash
+# 5) flashback：逆向 SQL 落文件（记录原子逆序 + keep-trx 事务脚手架；
+#    DDL/非事务 QUERY 不进脚本、stderr 汇总告警——见差异 21）
+./target/release/my2sql-rs flashback \
+  --binlog-dir data/8.0 --start-file "$BIN" \
+  --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
+  --threads 8 --output-dir out/flashback
+# flashback done: events=21, statements=36, files=1, errors=0
+# （out/flashback/flashback.3.sql 头部：`SET NAMES utf8mb4;` / `commit;` /
+#   `begin;` / `INSERT INTO \`dt\`.\`t_nokey\` …`——末事务最先反序）
+
+# 6) stats：窗口×表 DML 行数 + 大/长事务两报表（--stats-json 追加 JSONL）
+./target/release/my2sql-rs stats \
+  --binlog-dir data/8.0 --start-file "$BIN" \
+  --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
+  --threads 8 --output-dir out/stats
+# stats done: events=60, statements rows=36, windows flushed=1,
+#             big/long trx=0, skipped=0
+# binlog_status.txt 首行内容（逐字节）：
+# mysql-bin.000003  2026-09-21_07:30:31 2026-09-21_07:30:31 1605       34706      7        1        0        dt              t_all
+```
+
 收尾清理：`docker rm -f my2sql-dt-8.0`。
 
 ## 差分测试（正确性底座）
@@ -76,16 +105,20 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
 ```bash
 make difftest   # 7 步：comparator 自检 → 构建 Go 裁判+Rust → mysql:8.0 产全类型矩阵
                 # → 双方各自 to-sql → 语义比较（白名单闸口）→ 离线回放逐字节对差
-make compat     # 全版本矩阵：5.6/5.7/8.0/8.4 × {差分, checksum 双态, V1 rows 探针,
-                # 8.4 caching_sha2}，结果表 docs/compat/matrix.md
+                # WORK_TYPE=rollback|stats make difftest → flashback 裁判差分 /
+                #   stats 冒烟配平（同 7 步骨架，产物目录加 -rb/-stats 后缀）
+make compat     # 全版本矩阵 14 用例：5.6/5.7/8.0/8.4 × {差分, checksum 双态,
+                # V1 rows 探针, 8.4 caching_sha2} + flashback×4 + stats 冒烟×2，
+                # 结果表 docs/compat/matrix.md
 make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustfmt
 ```
 
 - 裁判源码在 `reference/my2sql-go/`（只读，勿改动）；`make difftest` 每次经
   `go build` 现编到 `tools/bin/my2sql-go`（该目录不入库）——**差分测试需要本机
   Go 工具链**（脚本假定 `go` 在 PATH，含 `/opt/go/bin` 兜底）。
-- 比较器 `tools/comparator/compare.py` 带自检（8 组正反例），语义等价判定 +
-  显式白名单（每条差异都有编号与准入理由，见 `docs/HANDOVER.md` 挂账清单）。
+- 比较器 `tools/comparator/compare.py` 带自检（9 组正反例，含 rollback 模式
+  结构断言组），语义等价判定 + 显式白名单（每条差异都有编号与准入理由，见
+  `docs/HANDOVER.md` 挂账清单）。
 - 需要 docker。除差分测试（`make difftest`/`make compat`）外不需要 Go 工具链。
 - 吞吐基线：`bash tools/gen-bench-binlog.sh && cargo bench --bench decode`
   （输入缺失或 debug 编译档时 bench 自动跳过，不影响 `cargo test --all-targets`）。
@@ -131,12 +164,50 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
 14. **CRC32 逐事件校验，且比上游更严**：FDE 的校验和也校验（含 mysqld
     「先算校验后置 flag 位」特例口径）；go-mysql 对 FDE 完全不校验。
 15. **file 模式 DDL/Query 事件不产出 SQL**（与上游一致，仅喂事务状态机），
-    flashback/DDL 处理明确不在一期范围（D5）。
+    flashback 对 DDL 的处置策略见差异 21（P2 已落地，D5 边界不变）。
+16. **`rollback` 更名 `flashback` 且语义分层重做**（P2）：子命令
+    `flashback` 对应上游 `-work-type rollback`；逆向 DML 语义等价
+    （INSERT↔DELETE 互逆、UPDATE 的 SET=before 值 / WHERE=after 值），
+    但**不继承**上游「JSON 列恒进 SET」quirk——逆向与正向同样按实际
+    diff 省略未变化列（活库对账实证，tools/flashback-reconcile.sh）。
+17. **记录原子化注释绑定**（超越项，P2）：extra-info 的「注释行+SQL 行」
+    为一个原子单元整体参与逆序；上游
+    `reference/my2sql-go/base/rollback_process.go` 按**裸行**逆序，注释
+    与其 SQL 拆对、漂移到事务组尾部（比较器 ALW-RB-COMMENT-DRIFT 吸收
+    该裁判面差异，我方产物为修正形态）。
+18. **keep-trx 默认开 + 显式开关**（P2）：上游 `KeepTrx` 是纯 struct
+    字段（context.go:126），`InitFlags`（context.go:184-233）**无任何
+    旗标绑定** → 恒为 Go 零值 false，`-work-type rollback` 的裁判产物
+    天然无事务脚手架。我方 `--keep-trx` 默认开（注入 `begin;`/`commit;`
+    逐字节对齐上游注入位置，含首部悬空 `commit;` 原样 quirk 与文件尾
+    `commit;`），`--no-keep-trx` 得纯逆序无脚手架形态（差异 矩阵级登记：
+    docs/compat/matrix.md「口径勘误」条）。
+19. **flashback 产物头部注入**（P2）：`--on-error skip-bad-event` 显式
+    带病产出时，文件头注入 `-- WARNING: skipped N events, positions in
+    stderr`（上游坏输入即 `Fatalf` 终止、无对应形态，ALW-RB-WARN-HEADER）；
+    正向的 `SET NAMES utf8mb4;` 头行在 flashback 产物中沿用（上游
+    rollback 文件无头行，ALW-SETNAMES-HEADER 同闸）。
+20. **stats 报表表序确定化**（超越项，P2）：上游窗口 map 与 biglong
+    明细 map 均为 Go map（stats_process.go:156,67），同输入跨运行行序
+    随机；我方窗口行 = 表**首次出现序**、`[db.tb(...)]` 明细 = db.tb
+    升序（逐字节可复现，golden/冒烟断言的前提）。
+21. **flashback 的 DDL 排除策略与完整性硬规则**（P2，spec §3.2/D5）：
+    DDL/非事务 QUERY 事件**绝不进**反向脚本且绝不猜测其反向——收尾在
+    stderr 汇总告警（datetime+位点+原文）交用户决策；另有三条硬规则
+    （Padded 结构删列 / MINIMAL Missing 值参与逆向 WHERE/VALUES 即报错，
+    `--on-error` 默认 **stop** 整跑中止不留半成品）对齐并显式化上游
+    events.go:87 的 fail-hard 立场。
+22. **stats 不做裁判差分**（P2，spec §3.6）：上游 stats 报表为自由文本
+    且窗口落盘时机受 print-interval/喂入时序影响，语义差分判据不成立——
+    以 golden 逐字节断言（tests/stats.rs + src/stats 单测同源串）+
+    冒烟配平（报表 DML 总和 == 同流 to-sql 行数）为准；裁判 stats 输出
+    仅作人工对照留档 `out/difftest-*-stats/go-stats/`。
 
 ## 文档
 
 - 设计权威：`docs/superpowers/specs/2026-09-20-my2sql-rust-design.md`
 - 进度/决策/白名单台账：[docs/HANDOVER.md](docs/HANDOVER.md)
-- 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)
+- 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)（P1 基线）、
+  [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）
 - 版本兼容矩阵：[docs/compat/matrix.md](docs/compat/matrix.md)
 - 模糊测试种子语料：`tests/fuzz_seed/`（P4 fuzz 正式接入的起点语料）
