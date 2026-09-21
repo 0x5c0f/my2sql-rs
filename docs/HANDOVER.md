@@ -1772,7 +1772,22 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     仅 warn 不判红（files=2 计数闸兜底）；DML 指纹只钉 round-1 前置批
     （若 1213 类死锁杀在 round1 前置批，会**严格向误红**而非漏红——
     可接受方向，改口径须重跑矩阵）。
-- **P3 终审修复轮（FIX A–F）新增挂账**：
+- **P3 终审修复轮（FIX A–F，2026-09-22，本分支六件全 TDD 先红后绿）**：
+  全分支终审 6 findings 入册——A：pump_parallel 源错误早退跳收尾段 →
+  Reorder 永久卡洞、同 Runner 复用下水位停表（fix 8ef0279）；B：resume
+  对账「缺/多均硬错」overstate 死锁崩溃恢复 → 多实物降 warn、Missing
+  仍硬错、Stale 变体删除（dde6515）；C：no_clobber 文档口径对齐实现
+  （首个冲突文件创建时刻 O_EXCL 原子拒绝，非启动预扫，a0e0499）；D：
+  空闲 master 心跳恒流上 Ctrl-C/stop 停摆 → ReplSource 帧顶中断门
+  （d3b9970）；E：无 1236 特征的裸互踢断连无限循环 → Disconnect 同因
+  3 连秒断纳入快速终止闸（864c4a9）；F：裸 repl 静默写 CWD 且永无
+  checkpoint → 输出目标闸前移 validate_repl（d4c11a7）。
+  - [ ] **心跳/中断联动（FIX D，运维注记）**：空闲 master 上 Ctrl-C/stop
+    的停泵延迟以心跳周期为界（默认 30s，live 件
+    `repl_sigint_idle_master_exits_130` 实测钉）；`--heartbeat-secs 0`
+    **同时**禁用死链探测与空闲期即时停泵（中断要等下一个真事件，语义
+    自负）；stop-datetime/stop-position 在空闲 master 上等下一**数据**
+    事件生效（心跳不参与 stop 判定——登记行为，不修）。
   - [ ] **read_verify 对账契约改判（FIX B，运维向）**：resume 启动自检
     只对「written_files 承诺而盘上缺失」（Missing）与档损坏/畸形硬错；
     盘上多出的未登记实物（撕裂事务半块、rename 前崩溃残骸等 at-least-
