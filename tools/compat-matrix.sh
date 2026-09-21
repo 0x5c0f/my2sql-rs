@@ -125,8 +125,12 @@ repl_body() { # <ver> <sid>；全部 stdout/stderr 由 repl_run 汇入用例日�
   local work="$ROOT/out/compat-repl-work-$ver"
   local ro="$work/repl" fo="$work/file" bd="$work/bins"
   rm -rf "$work"; mkdir -p "$ro" "$fo" "$bd"
-  p3e2e_container_start "$ver" "t7$$" >/dev/null || return 1
+  # 先调后取名：P3E2E_CTR 在 docker run 前即置（lib:59），wait_healthy 超时等
+  # 中途失败时容器已存在——失败路径同样要把它交给 trap 收尸（T7 评审 I1）。
+  p3e2e_container_start "$ver" "t7$$" >/dev/null
+  local start_rc=$?
   REPL_CTR=$P3E2E_CTR
+  [ "$start_rc" -eq 0 ] || return 1
   local ctr=$P3E2E_CTR uri=$P3E2E_URI
   p3e2e_seed_schema "$ctr" "$db" || return 1
   local f0 p0
@@ -197,9 +201,10 @@ repl_run() { # label ver
   echo "==== [$label] repl live vs file-mode 同窗等价（无 Go 裁判，spec §8）→ $log ===="
   (
     REPL_FEEDER=""; REPL_CTR=""
+    # 信号/中断下的唯一保险形态（lib 头契约）：EXIT trap 兜底清 feeder 与容器
+    trap '[ -n "$REPL_FEEDER" ] && kill "$REPL_FEEDER" 2>/dev/null || true
+          p3e2e_container_stop "${REPL_CTR:-}" >/dev/null 2>&1 || true' EXIT
     repl_body "$ver" "$((7200 + ${REPL_SEQ:-0}))"; rc=$?
-    [ -n "$REPL_FEEDER" ] && kill "$REPL_FEEDER" 2>/dev/null || true
-    p3e2e_container_stop "${REPL_CTR:-}"
     exit $rc
   ) > "$log" 2>&1 || rc=$?
   REPL_SEQ=$(( ${REPL_SEQ:-0} + 1 ))
