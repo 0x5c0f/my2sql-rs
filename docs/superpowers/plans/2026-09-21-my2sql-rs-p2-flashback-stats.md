@@ -243,7 +243,7 @@ fn flashback_missing_value_error_hints_row_image_full() {
 
 **Files:**
 - Create: `src/flashback/mod.rs`、`src/flashback/reverse.rs`
-- Modify: `src/output.rs`（path_for 前缀参数化、Sink 偏移计数、Writer 块索引模式）、`src/lib.rs`（`pub mod flashback;`）
+- Modify: `src/output.rs`（path_for 前缀参数化、Sink 偏移计数、Writer 块索引模式）、`src/lib.rs`（`pub mod flashback;`）、`src/pipeline/mod.rs:77`（唯一外部调用点：`Writer::new(dir, false, fpt, extra, tz, "to_sql".into(), false)`——签名加参后必须同步，否则 T2 收尾编译红）
 - Test: `src/output.rs`、`src/flashback/reverse.rs` 同文件 tests
 
 **Interfaces:**
@@ -752,7 +752,7 @@ dispatcher `prepare()`：stats 形态下 **所有** 事件都编号派发（现�
 ### Task 5: CLI 三子命令（config 重构 + main dispatch）
 
 **Files:**
-- Modify: `src/config.rs`（主体重构）、`src/main.rs`、`tests/cli.rs`
+- Modify: `src/config.rs`（主体重构；`Cli::from_args` 的 `match cli.cmd`（:183）补两臂 dispatch 到 `run_flashback`/`run_stats`）、`src/main.rs`、`tests/cli.rs`、`tests/e2e.rs`（`config_from` 的穷尽 `match cli.cmd`（:260）在三变体后不再穷尽——改 let-else，同 T3 flashback.rs 的 `cfg_for` 形制）
 - Test: `src/config.rs` 内 tests（迁移+新增）、`tests/cli.rs`
 
 **Interfaces:**
