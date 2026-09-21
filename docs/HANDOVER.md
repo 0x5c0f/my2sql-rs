@@ -33,7 +33,8 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   （伪装 replica 拉流，to-sql 流式形态）交付——超集四件（checkpoint/resume、
   自动重连、心跳探活、resume 防覆盖闸）+ 等价性总闸（repl==file 逐字节）；
   live 套件 10/10、compat 矩阵 18/18，DoD 对账见「P3 DoD 对账」节。
-  待全分支终审后合入 main。
+  全分支终审已做（六件 A–F，两轮终审修复 + 合流亲跑 11/11·349 绿，
+  见该节第 7 条），正合入 main。
 - 前史（P2）：`feat/p2`（worktree `.qoder/worktrees/feat+p2`，base
   `main@205512b`；P2 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`，
   spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p2-flashback-stats-design.md`；
@@ -41,7 +42,7 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 - **P2 计划 9 任务全部完成（T1–T9 节点齐）**：flashback（记录原子逆序 +
   keep-trx + 完整性硬规则）与 stats（两报表 + JSONL + tick 对齐）交付，
   差分/矩阵/活库对账/bench 闸全走查，DoD 对账见「P2 DoD 对账」节。
-  待全分支终审后合入 main。
+  已合入 main（`0905368`，tag `v0.2.0-p2`）。
 - 前史（P1）：`main` 分支（`feat/p1` 已于终审修复后合入并删除，merge commit `62d9f6a`）
 - 里程碑：P1 计划 17 任务（执行序 1..15, 17, 16）——**全部完成；全分支终审
   已做，唯一一轮终审修复（#1 decimal panic 闸 / #2 SHOW 标识符转义 / #3 本文
@@ -1663,6 +1664,21 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
    挂账条已勾销（见下表 T8-debt 消费注）。
    注：①的失败运行会毁上一份好 JSONL（create 即 O_TRUNC + Drop unlink），
    合同合法「absent」——运维向一句话入新挂账 #1。
+7. **全分支终审与合流复跑**（终审 = whole-branch review @ `590bac1`，
+   修复轮 `8ef0279..2cfd916` + E 精化 `3ffac7e` + 措辞微修 `b683e57`）——
+   终审六件 A(F)/B/E/C(文档随实现)/D/F：默认 threads>1 源错误冻结水位、
+   written_files 滞后假 Stale、空闲 master Ctrl-C 无界、bare-Disconnect
+   互踢永重连、裸 repl 写 CWD 无 checkpoint、no-clobber 文档过陈述；
+   scoped re-review 判 A/B/C/D/F ADDRESSED、E PARTIAL（3-streak 60s 窗在
+   封顶退避下数学性误杀 docker-restart 承诺）→ 轮2 改「仅 open-ok 零事件
+   裸断计入 streak，refused/有进展复位」并红钉 `master_restart_timeline_not_fast_failed`。
+   **合流轮控制方亲跑**（本工作树 @ `b683e57`，/tmp/p3-merge-repltest.log）：
+   `make repl-test` **11 passed / 0 failed / 585.90s**（新增空闲-SIGINT 件
+   真跑 exit130；restart 件 reconnect #1..#N refused 后恢复、基准 132 块
+   前缀全等；threads>1 水位件 92 出样全真事务界；等价件 636224B repl≡file）；
+   `cargo test` 非 live **349 passed / 0 failed**、clippy -D 净、fmt 净、
+   `git diff main..HEAD -- src/binlog/ benches/ reference/` **空**、
+   `grep -rn repl_spike src/` **空**。
 
 ## P3 挂账消费/新增一览
 
