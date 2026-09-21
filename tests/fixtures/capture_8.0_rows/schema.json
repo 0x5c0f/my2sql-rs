@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "db": "t10",
+      "table": "u",
+      "cols": [
+        {"name": "a", "type_name": "int", "unsigned": false},
+        {"name": "b", "type_name": "varchar", "unsigned": false},
+        {"name": "c", "type_name": "int", "unsigned": false},
+        {"name": "d", "type_name": "int", "unsigned": false},
+        {"name": "e", "type_name": "int", "unsigned": false},
+        {"name": "f", "type_name": "int", "unsigned": false},
+        {"name": "g", "type_name": "int", "unsigned": false},
+        {"name": "h", "type_name": "int", "unsigned": false},
+        {"name": "i2", "type_name": "int", "unsigned": false}
+      ],
+      "pk": [],
+      "uks": []
+    },
+    {
+      "db": "t10",
+      "table": "j",
+      "cols": [
+        {"name": "id", "type_name": "int", "unsigned": false},
+        {"name": "doc", "type_name": "json", "unsigned": false},
+        {"name": "tag", "type_name": "varchar", "unsigned": false}
+      ],
+      "pk": ["id"],
+      "uks": []
+    }
+  ]
+}

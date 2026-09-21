@@ -1115,6 +1115,74 @@ Rust 独立重写 MySQL binlog 解析工具（to-sql / flashback / stats），�
   不涉行为。`fargs/sargs` helper 与 `args()` 同放 config.rs tests，
   真件 e2e（T6）可直接复用子命令串形态。
 
+### P2 Task 6: 真件 e2e（capture_8.0_rows）+ 一次性正逆活库对账脚本（P2 语义总闸）
+
+- 做了什么：① 手抄 `tests/fixtures/capture_8.0_rows/schema.json`
+  （version-1，表 `t10`.`u` 9 列无 PK——README 的 8.0.46 CREATE 无主键，
+  WHERE 全列 = P1 语义；`t10`.`j` id PK + doc json + tag varchar）；正确性
+  由真件 decode 全 Ok（列数/类型不符必报）+ to-sql 语句人工目核双向证实。
+  ② `tests/e2e.rs` +4 真件用例（常驻跑，无需 docker，fixture 在库）：
+  - `real_capture_flashback_full_image_and_forward_reconcile`（000002）：
+    run_flashback 默认 stop Ok，摘要 (2,2,0,1)；结构断言首行 SET NAMES、
+    尾行 commit;、`begin;` 计数=事务段数=2、`commit;`=begin+1、无
+    .flashback.tmp* 残留；正逆对账 = 最小语句解析器（INSERT/UPDATE/DELETE →
+    有序 (col,lit) 表，`col IS NULL` 与 `=NULL` 同型归一）+ 镜像重建
+    （ins↔del 互换；upd：逆向 SET[c]=正向 WHERE[c]，逆向 WHERE[c]=正向
+    SET 有则取之、无则 WHERE 值——依赖本 fixture 无 PK → WHERE 恒全列前提，
+    测试注释已钉）→ 逆序产物 == 正序逐条镜像且序反转（有序全等 ⊇ multiset
+    相等）；
+  - `real_capture_flashback_minimal_image_hard_errors`（000003）：**真件版
+    §3.2b 硬规则证明**——MINIMAL UPDATE（after 仅 f=123 其余 Missing）在
+    Stop 下整跑 Err（threads=1 消息含 "MINIMAL row image"+"binlog_row_image
+    =FULL"；threads=2 哨兵串同 Err），两形态半成品全清场；SkipBadEvent →
+    Ok、坏事件计 1 跳、FULL UPDATE#2 照常逆产（逐字节含 WARNING 头行：
+    `UPDATE `t10`.`u` SET `c`=NULL WHERE …i2`=-5;`）；对照 to-sql 同件
+    skip 默认 Ok（Missing 是事件级编码错误非源级）；
+  - `real_capture_partial_event_is_source_level_error`（000004）：**实测
+    勘正简报**——event 39 在 FileReader::next 源层即 Err(PartialNotSupported)，
+    **不经逐事件通道 → stop/skip 两策略、flashback/to-sql/stats 三形态全部
+    整跑 Err**（简报预期「skip 可绕」为不成立；以现实为准钉死）。stats 错误
+    路径产物 = binlog_status.txt 仅头行（finish 未达、无 skipped 尾注，
+    重跑 O_TRUNC 覆盖）——现状记录，非本任务修复项；
+  - `real_capture_stats_totals_match_fixture_rows`（000002→000003，
+    --stop-file 跨文件）：报表行总和 inserts/updates/deletes = (1,3,0) ==
+    README 独立计数（000002 1ins+1upd；000003 2upd **含 MINIMAL 件**——
+    实测 stats 计数不挑镜像（decode 成功、len/2 折算照算），000003 行
+    updates=2 硬证）；`summary.statements`=4 互证、windows=2（binlog 切换
+    落盘）、biglong 仅头+尾注（零命中）、skipped=0。
+  ③ 新建 `tools/flashback-reconcile.sh`（spec §5.5 活库总闸，人工触发、
+  不入 CI/Makefile）：容器 mysql:8.0 无宿主 bind mount（datadir 全在容器
+  可写层，破坏性操作零外溢）→ rec_db.rec_t（id PK + val + **doc JSON**）
+  100 行 → 基线 CHECKSUM TABLE + 全表 dump → FLUSH + 记起点 → 混合 DML
+  7 ins/5 upd（**含 1 条 JSON 列 update** 正靶）/3 del + 1 多行事务 +
+  「UPDATE 打空=假绿」行数闸（104）→ docker cp 出 binlog → 宿主 flashback
+  （离线 --schema-file——**登记**：mysqldump --no-data 是 DDL SQL、离线
+  loader 只认 version-1 JSON，故脚本自写 JSON；不给 stop-pos——终点点出
+  的事件按「等号也停」会被排除，单文件边界用 --start-file 即足）→ 产物
+  原样灌回活库 → CHECKSUM TABLE == 基线 且 剔噪逐行 dump diff 双闸。
+  trap DROP DATABASE + docker rm 自清理（KEEP=1 失败保容器）。
+- **对账实跑（本任务内一次性，GREEN）**：`flashback done: events=15,
+  statements=15, files=1, errors=0`；`baseline checksum = 3944497573 ==
+  after-apply checksum = 3944497573` + row-data identical；binlog=
+  mysql-bin.000004（start_pos=157→end_pos=4547）；全程 19s。JSON 列
+  UPDATE 往返实证：正向 `SET doc=JSON_SET(…'$.tag','p2')` → 逆向
+  `UPDATE … SET `doc`='{"n":3,"tag":"init"}' WHERE `id`=3;`（diff-based
+  SET，未变化 JSON 列不入 SET；回灌值 = before 镜像规范文本，checksum 终判
+  通过——**上游「JSON 恒进 SET」quirk 未被继承**的活库证明）。首跑 RED 为
+  脚本自身比对缺陷（mysqldump「Dump completed」时间戳尾行混入 diff），非
+  产品 bug；数据行两跑均全等。
+- 测试：RED/GREEN 台账 = 探针先行（CLI 三文件两策略实测钉死现实 → 测试
+  断言按现实写）；e2e 5→9；全量 `cargo test` 293 绿（lib 265 + cli 6 +
+  e2e 9 + flashback 6 + fuzz_seed 2 + stats 5）、clippy --all-targets -D
+  净、fmt 净。真件脚本非 CI（一次性语义闸 + 可重跑）。
+- 遗留/对后续影响：① 000004 partial 的「skip 也硬拒」现实进 T7 比较器/
+  T9 文档口径（上游 my2sql-go 对 39 的处置是 nil 值继续——本侧选择源级
+  拒收，差异登记 P1 T12 已有、T6 实测复核）；② stats Err 路径残留头行
+  文件如需收口属 P3 打磨（现语义 = 头行无尾注即「未完成」标记）；③ 脚本
+  的 JSON dump 逐行 diff 依赖「单库单表、无触发器」前提，扩展多表时须换
+  按表 CHECKSUM 循环；④ T7 difftest WORK_TYPE=rollback 可直接复用本脚本
+  的容器 idioms（无 bind mount + docker cp 出 binlog）。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
