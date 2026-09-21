@@ -79,7 +79,7 @@ ReplSource(EventSource) ──RawEvent──▶ pump（过滤/事务状态机/�
 
 - **内容**：`{"file":"mysql-bin.000007","pos":<已完整落盘事务的提交后位点>,"ts":"2026-09-21_15:04:05","written_files":["to_sql.7.sql", ...]}`（serde_json 单对象，tmp 写 + rename 原子替换；`written_files` 供 §5 防覆盖闸核对）。
 - **推进点**：与 §3 事务边界 flush 同点——该事务 SQL 已 write 完成后才写 checkpoint。**语义 = 每事务至少一次（at-least-once per transaction）**：崩溃重放最多重复 checkpoint 之后的完整事务，绝不半途切开一条事务；输出目录使用者按 `written_files` 名单整文件处置。
-- **resume 启动**：`--resume-file` 存在 → 校验 JSON 合法 + `written_files` 与目录实际文件一致（不一致 = 上次跑崩在 rename 之前/有人删了产物 → 硬错，拒绝猜测）；请求的 file 若已被主库 purge（1236 错误）→ 明确报「位点已失效，需人工指定新起点」，不自动跳最新（静默丢数据是重罪）。
+- **resume 启动**：`--resume-file` 存在 → 校验 JSON 合法 + `written_files` 承诺的产物全部在盘（承诺而缺失 = 有人删了产物/档被外来篡改 → 硬错，拒绝猜测；盘上**多出**未登记实物 = at-least-once 崩溃的预期残骸（撕裂事务半块等）→ `warn` 放行，不死锁恢复——终审 FIX B 精确化，原文「不一致即硬错」对"多"侧 overstate 已纠正）；请求的 file 若已被主库 purge（1236 错误）→ 明确报「位点已失效，需人工指定新起点」，不自动跳最新（静默丢数据是重罪）。
 - 重连后拉流起点 = checkpoint 位点（不用内存中「已读到的更远位置」——内存可能含未落盘事件）。
 
 ## 5. 输出文件命名与防覆盖

@@ -1,7 +1,10 @@
 //! repl 模式断点档（P3 T3）：JSON 序列化的消费水位 + 已写文件清单，
 //! **原子写**（隐藏 tmp + rename，POSIX 同目录 rename 对读者恒为整档新旧
-//! 二态），以及启动自检用的 `written_files` ↔ 输出目录实物**一一对应**校验
-//! （缺/多均为硬错——陈旧/半截 checkpoint 必须让运维看见，而非静默续写）。
+//! 二态），以及启动自检用的 `written_files` ↔ 输出目录实物对账。
+//! 契约（终审 FIX B 精确化）：**manifest 承诺而盘上缺失 = 硬错**
+//! （产物被人删/档被篡改，续跑必基于假账）；**盘上多出未登记实物 =
+//! `tracing::warn!` 放行**（at-least-once 崩溃恢复的预期形态——撕裂事务
+//! 半块、rename 前崩溃的未登记产物，静默让运维看见即可，死锁恢复是误伤）。
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -20,8 +23,9 @@ pub struct Checkpoint {
     pub written_files: Vec<String>,
 }
 
-/// `read_verify` 错误面：IO / JSON 非法 / 实物缺失（Missing）/
-/// 目录多出未登记实物（Stale）。全变体消息均含定位文件名。
+/// `read_verify` 错误面：IO / JSON 非法 / manifest 承诺的实物缺失
+/// （Missing）/ 登记条目畸形（Malformed）。目录中多出的未登记实物**不是
+/// 错误**（FIX B 契约：warn 放行，见模块头）。全变体消息均含定位文件名。
 #[derive(Debug, thiserror::Error)]
 pub enum CpError {
     #[error("checkpoint io: {0}")]
@@ -32,10 +36,8 @@ pub enum CpError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("stale checkpoint: written file missing from disk: {0}")]
+    #[error("checkpoint promises written file missing from disk: {0}")]
     Missing(String),
-    #[error("stale checkpoint: extra file on disk not in checkpoint: {0}")]
-    Stale(String),
     #[error("malformed checkpoint written_files entry (not a single file name): {0}")]
     Malformed(String),
 }
@@ -95,11 +97,12 @@ pub fn write_atomic(path: &Path, cp: &Checkpoint) -> io::Result<()> {
 }
 
 /// 读档并交叉验证：JSON 合法后，先做 `written_files` 条目卫生校验（畸形
-/// 名 → `Malformed` 硬错），再与 `dir` 下实物**一一对应**——登记了但盘上
-/// 缺 → `Missing`（硬错）；盘上有但未登记 → `Stale`（硬错；checkpoint 档
-/// 自身与其 `.{name}.tmp` 崩溃残骸除外——后者是本工具自己在 create 与
-/// rename 之间崩溃的瞬态垃圾，恰在崩溃恢复主场景，误报即死锁）。
-/// Missing/Stale/Malformed 消息均含文件名，供运维定位清场范围。
+/// 名 → `Malformed` 硬错），再对账——manifest 承诺但盘上缺 → `Missing`
+/// （硬错：档与实物脱节即拒猜，续跑必基于假账）；盘上多出未登记实物 →
+/// `tracing::warn!` 放行（FIX B 契约：at-least-once 崩溃恢复的预期残骸，
+/// 如撕裂事务半块；checkpoint 档自身与其 `.{name}.tmp` 崩溃残骸连告警都
+/// 豁免——下次写原子档自然覆盖）。Missing/Malformed 消息均含文件名，
+/// 未登记实物的告警同样含名，供运维定位清场范围。
 pub fn read_verify(path: &Path, dir: &Path) -> Result<Checkpoint, CpError> {
     let raw = fs::read(path)?;
     let cp: Checkpoint = serde_json::from_slice(&raw).map_err(|source| CpError::BadJson {
@@ -131,10 +134,16 @@ pub fn read_verify(path: &Path, dir: &Path) -> Result<Checkpoint, CpError> {
         if Some(fname.as_os_str()) == own_tmp.as_deref() {
             continue; // 本工具自己的崩溃残留 tmp：瞬态垃圾，下次写会覆写
         }
-        match fname.to_str() {
-            Some(s) if listed.contains(s) => {}
-            // 非 UTF-8 名不可能是本工具写出的登记名，一律按未登记实物处理。
-            _ => return Err(CpError::Stale(fname.to_string_lossy().into_owned())),
+        // FIX B 契约：未登记实物（含非 UTF-8 名——不可能是本工具写出的
+        // 登记名）一律降级为告警放行；恢复死锁才是更大的罪。
+        if !listed.contains(fname.to_string_lossy().as_ref()) {
+            tracing::warn!(
+                "repl resume reconcile: untracked file {} present in {} \
+                 (at-least-once crash residue, proceeding; remove it manually \
+                 if this is not expected)",
+                fname.to_string_lossy(),
+                dir.display()
+            );
         }
     }
     Ok(cp)
@@ -166,7 +175,8 @@ mod tests {
     }
 
     /// Step 1 测试①：写→读等值；残留 tmp 不顶正式档（rename 原子性）；
-    /// read_verify 对 written_files 与目录实物不符（缺/多）→ 硬错且含文件名。
+    /// read_verify 对账：缺实物（manifest 承诺而盘上无）→ 硬错且含文件名；
+    /// 多实物 → FIX B 契约 warn 放行（见 `read_verify_warns_extras_...`）。
     #[test]
     fn checkpoint_roundtrip_and_rename_atomicity() {
         let dir = tmpdir("rt");
@@ -193,15 +203,15 @@ mod tests {
         );
         assert!(e.to_string().contains("to_sql.9.sql"), "错误消息含文件名");
 
-        // 多实物：目录里有 written_files 未记的文件 → Stale 硬错，含文件名
+        // 多实物：FIX B 契约——未登记实物告警放行，不再阻断（旧 Stale 硬错
+        // 死锁崩溃恢复，终审裁定降级）。
         write_atomic(&path, &c).unwrap();
         fs::write(dir.join("to_sql.3.sql"), b"z").unwrap();
-        let e = read_verify(&path, &dir).unwrap_err();
-        assert!(
-            matches!(&e, CpError::Stale(s) if s == "to_sql.3.sql"),
-            "多实物应 Stale(to_sql.3.sql)，got: {e}"
+        assert_eq!(
+            read_verify(&path, &dir).unwrap(),
+            c,
+            "多实物应 warn 放行（FIX B 契约）"
         );
-        assert!(e.to_string().contains("to_sql.3.sql"), "错误消息含文件名");
 
         // JSON 非法 → 硬错（不是静默默认值）
         fs::write(&path, b"{oops").unwrap();
@@ -213,8 +223,9 @@ mod tests {
 
     /// Fix round 1（Important）：本工具 `write_atomic` 在 create 与 rename
     /// 之间进程崩溃 → 目录里残留 `.{ckpt-name}.tmp`。下一次 `read_verify`
-    /// 恰好在“崩溃后恢复”这一最需要成功的场景把它误报 Stale 是 bug——
-    /// 自有 tmp 名属瞬态垃圾，须豁免；**其他**任何未登记文件仍须 fail-loud。
+    /// 恰好在“崩溃后恢复”这一最需要成功的场景必须放行——自有 tmp 名属
+    /// 瞬态垃圾，连告警都豁免（下次写会覆写）。FIX B 后其余未登记实物也
+    /// 只 warn 不阻断（撕裂事务残骸是 at-least-once 的预期形态）。
     #[test]
     fn read_verify_tolerates_own_crash_leftover_tmp() {
         let dir = tmpdir("crashtmp");
@@ -227,15 +238,44 @@ mod tests {
         assert_eq!(
             read_verify(&path, &dir).unwrap(),
             c,
-            "自有崩溃残留 tmp 不得误报 Stale（崩溃恢复主场景）"
+            "自有崩溃残留 tmp 不得误报阻断（崩溃恢复主场景）"
         );
-        // fail-loud 教条对其余文件原样生效
+        // 其余未登记实物：FIX B 契约——放行（旧 Stale 硬错死锁恢复，
+        // 终审裁定降级为告警）；缺档面（Missing）仍 fail-loud，另件钉。
         fs::write(dir.join("to_sql.9.sql"), b"junk").unwrap();
+        assert_eq!(
+            read_verify(&path, &dir).unwrap(),
+            c,
+            "非 tmp 的游离实物按 FIX B 契约 warn 放行"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 终审 FIX B 契约（正向钉）：manifest [a] + 盘上多出未登记实物
+    /// （崩溃期撕裂事务半块等 at-least-once 预期残骸）→ **Ok 放行**；
+    /// manifest 承诺 [a,b] 而 b 缺失 → 仍**硬错 Missing**。
+    /// 修复前形态：多实物 → `Err(Stale)`，崩溃恢复恰在最需要续跑时死锁。
+    #[test]
+    fn read_verify_warns_extras_but_hard_errors_missing() {
+        let dir = tmpdir("extras-warn");
+        fs::write(dir.join("to_sql.1.sql"), b"x").unwrap();
+        fs::write(dir.join("to_sql.9.sql"), b"partial-trashed-trx").unwrap();
+        let path = dir.join("checkpoint.json");
+        // 多实物：不再阻断（旧契约 Err Stale = 修复前红点）
+        write_atomic(&path, &cp(&["to_sql.1.sql"])).unwrap();
+        assert_eq!(
+            read_verify(&path, &dir).unwrap(),
+            cp(&["to_sql.1.sql"]),
+            "未登记实物（崩溃残骸）应 warn 放行，不得硬错"
+        );
+        // 缺实物：manifest 承诺而盘上无 → 依旧硬错，含文件名
+        write_atomic(&path, &cp(&["to_sql.1.sql", "to_sql.2.sql"])).unwrap();
         let e = read_verify(&path, &dir).unwrap_err();
         assert!(
-            matches!(&e, CpError::Stale(s) if s == "to_sql.9.sql"),
-            "非 tmp 的游离实物仍须 Stale(to_sql.9.sql)，got: {e}"
+            matches!(&e, CpError::Missing(m) if m == "to_sql.2.sql"),
+            "缺实物必须仍 Missing(to_sql.2.sql)，got: {e}"
         );
+        assert!(e.to_string().contains("to_sql.2.sql"), "错误消息含文件名");
         fs::remove_dir_all(&dir).ok();
     }
 

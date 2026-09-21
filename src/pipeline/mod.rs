@@ -663,8 +663,8 @@ pub(crate) fn run_repl_with(
     // {output-dir}/resume.json（缺目录 = 无写档，同 --to-stdout 形态）；
     // 读档 = 显式 --resume-file 优先。resume run 里消费的档是上一 run 的
     // 审计产物，按 §5「旧产物字节不可变」须原样保留——若续写它，首个事务
-    // 水位就会把 run1 的 written_files 改写成 run2 清单：旧 manifest 蒸发、
-    // 且第二跳的 `read_verify(rf, rf.parent())` 双向对账当场失效。启动时以
+    // 水位就会把 run1 的 written_files 改写成 run2 清单：旧 manifest 蒸发，
+    // 第二跳的 `read_verify(rf, rf.parent())` 对账随即失去审计意义。启动时以
     // 消费档的位点给新目录**播种**一份 fresh 档，此后 mid-run 水位、每次
     // 重连的 `cp_start_for_retry` 读取、epilogue 终档全部只认新目录路径。
     let dir_cp: Option<PathBuf> = cfg.output_dir.as_ref().map(|d| d.join("resume.json"));
@@ -673,6 +673,8 @@ pub(crate) fn run_repl_with(
     // ── 定位：resume 优先（read_verify 对账），否则三态 ──
     // 对账目录 = checkpoint 的**所在目录**（written_files 描述的上一段产物
     // 与档共存一处；resume 的新产物按 §5 进新 --output-dir）。
+    // FIX B 契约：硬错仅限 manifest 承诺而盘上缺失（Missing）与档损坏/
+    // 畸形；盘上多出未登记实物（崩溃残骸）由 read_verify warn 放行。
     let mut is_resume_run = false;
     let (mut file, mut pos) = match &resume_file {
         Some(rf) => match checkpoint::read_verify(rf, rf.parent().unwrap_or(Path::new("."))) {
@@ -707,9 +709,12 @@ pub(crate) fn run_repl_with(
                     None => "this run has no on-disk checkpoint (--to-stdout shape)".to_string(),
                 };
                 return Err(PipelineError::Config(format!(
-                    "repl resume check of {} failed: {e} — repl never appends to existing .sql \
-                     artifacts; resume into a FRESH --output-dir (keep the consumed checkpoint \
-                     beside the previous run's output — it is never rewritten; {wp_hint})",
+                    "repl resume check of {} failed: {e} — hard failure only when the checkpoint \
+                     promises artifacts that are absent on disk, or the checkpoint itself is \
+                     corrupt/malformed (untracked leftovers beside it are warned, not fatal); \
+                     repl never appends to existing .sql artifacts; resume into a FRESH \
+                     --output-dir (keep the consumed checkpoint beside the previous run's \
+                     output — it is never rewritten; {wp_hint})",
                     rf.display()
                 )));
             }
@@ -1945,7 +1950,7 @@ mod live_tests {
         assert_eq!(cp.file, "mysql-bin.000001");
         assert_eq!(cp.ts, datetime_str(1700000100, cfg.time_zone));
         assert_eq!(cp.written_files, vec!["to_sql.1.sql".to_string()]);
-        read_verify(&ckpt_path, &out).expect("written_files 与实物一一对应");
+        read_verify(&ckpt_path, &out).expect("written_files 承诺的实物均在盘上");
         let s = std::fs::read_to_string(&sql_file).unwrap();
         assert!(
             s.contains("VALUES (4)"),
@@ -2825,12 +2830,65 @@ mod repl_tests {
         );
     }
 
+    /// 终审 FIX B 契约（resume 面）：上一 run 目录含 manifest 登记的
+    /// `to_sql.1.sql` **加上**未登记的崩溃残骸（撕裂事务半块 `to_sql.9.sql`）
+    /// → resume 启动自检 **放行续跑**（旧契约为多实物硬 Stale → 崩溃恢复
+    /// 在最需要续跑时死锁 = 修复前红点）；manifest 承诺而盘上缺失仍硬错
+    /// （上臂 (b) 钉）。
+    #[test]
+    fn resume_run_proceeds_with_untracked_extras() {
+        let (dir, out, base) = repl_cfg(&["--start-file", ""]);
+        let prev = dir.join("prev");
+        std::fs::create_dir_all(&prev).unwrap();
+        std::fs::write(prev.join("to_sql.1.sql"), b"run1-artifact").unwrap();
+        std::fs::write(prev.join("to_sql.9.sql"), b"torn-trx-residue").unwrap();
+        let rf = prev.join("resume.json");
+        checkpoint::write_atomic(
+            &rf,
+            &Checkpoint {
+                file: "mysql-bin.000001".into(),
+                pos: 4,
+                ts: "t".into(),
+                written_files: vec!["to_sql.1.sql".into()],
+            },
+        )
+        .unwrap();
+        let mut cfg = base;
+        cfg.resume_file = Some(rf.clone());
+        let opens: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(vec![]));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut opener = stop_after(1, &opens, &flag, None);
+        let mut wait = |_| {};
+        let mut clock = || 0u64;
+        let mut env = ReplEnv {
+            open: &mut opener,
+            wait: &mut wait,
+            now_ms: &mut clock,
+            interrupt: flag.clone(),
+        };
+        run_repl_with(&cfg, store_for(&dir), &mut env)
+            .expect("未登记残骸只 warn，resume 必须续跑（修复前：硬 Stale 死锁）");
+        assert_eq!(
+            *opens.lock().unwrap(),
+            vec![("mysql-bin.000001".to_string(), 4u32)],
+            "resume 位点即开流起点（自检放行后照常消费档）"
+        );
+        // 消费档字节不变（I1 审计面不回归）：written_files 仍是 run1 的账
+        let consumed: Checkpoint = serde_json::from_slice(&std::fs::read(&rf).unwrap()).unwrap();
+        assert_eq!(consumed.written_files, vec!["to_sql.1.sql".to_string()]);
+        assert!(
+            out.join("resume.json").is_file(),
+            "I1 播种/写档恒在新输出目录"
+        );
+    }
+
     /// I1（fix round）：resume run 的写档与读档分离——消费的 `--resume-file`
     /// 是上一 run 的审计产物，字节不可变（§5「旧产物字节不可变」+ 第二跳
     /// 仍可对其 `read_verify` 对账）；本 run 的水位/重连起点/终档全部落
     /// **新输出目录** `{output-dir}/resume.json`（启动即以消费档位点播种）。
     /// 修复前：首个事务水位即把 run1 档的 written_files 改写为 run2 清单
-    /// ——旧 manifest 蒸发且第二跳对账必炸（Stale）。
+    /// ——旧 manifest 蒸发、第二跳对账失去审计意义（FIX B 契约下多实物仅
+    /// warn，恰须靠档本身不可变守住 run1 的账）。
     #[test]
     fn resume_run_never_rewrites_consumed_checkpoint() {
         // 「run1 产物」手工落盘：A=out（to_sql.1.sql + 与其对账的 resume.json，

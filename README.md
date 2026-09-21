@@ -133,6 +133,8 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
 - 语义 = **每事务至少一次**：崩溃重放最多重复 checkpoint 之后的完整事务，
   绝不半途切开；重复段可由产物与 `written_files` 名单界定
   （kill-9 接续零丢失由 live 件 `repl_kill9_resume_zero_loss` 钉死）。
+  resume 启动对账只对「名单承诺而盘上缺失」硬错；盘上多出的未登记残骸
+  （撕裂事务半块等）告警放行，不死锁恢复。
 - 一键回归：`make repl-test`（起一次性 mysql:8.0 容器跑 tests/repl.rs 全部
   live 件，`VER=5.7 make repl-test` 换版本；单轮实测 10 passed / 0 failed / 476.76s）。
 

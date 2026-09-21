@@ -1489,7 +1489,8 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   no-clobber 闸（`create_new` 原子归零 TOCTOU）+ `src/repl/checkpoint.rs`
   （serde_json 单对象、tmp+rename 原子替换、`write_atomic`/`read_verify`、
   written_files 对账）。修复轮：`read_verify` 豁免自家 `.{ckpt}.tmp` 崩溃
-  残留（skip 不 unlink；异名 stray 仍硬 Stale，新测试钉）；written_files
+  残留（skip 不 unlink；异名 stray 当时硬 Stale，新测试钉——**终审 FIX B
+  改判**：未登记多实物降为 warn 放行，缺档 Missing 仍硬错，见后文挂账）；written_files
   段名校验 `CpError::Malformed`（T4/T5 dispatch 需补 catch-all 臂）；
   crash≠power-fail 耐久注记。
 - LOW drift 登记不修：目标为目录时 create_new 走 EISDIR 原始错而非钉文案
@@ -1771,6 +1772,14 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     仅 warn 不判红（files=2 计数闸兜底）；DML 指纹只钉 round-1 前置批
     （若 1213 类死锁杀在 round1 前置批，会**严格向误红**而非漏红——
     可接受方向，改口径须重跑矩阵）。
+- **P3 终审修复轮（FIX A–F）新增挂账**：
+  - [ ] **read_verify 对账契约改判（FIX B，运维向）**：resume 启动自检
+    只对「written_files 承诺而盘上缺失」（Missing）与档损坏/畸形硬错；
+    盘上多出的未登记实物（撕裂事务半块、rename 前崩溃残骸等 at-least-
+    once 预期形态）降为 `tracing::warn!` 放行——旧契约「缺/多均硬错」在
+    崩溃恢复主场景会死锁续跑，属 overstate 纠正而非门弱化；`CpError::Stale`
+    变体随之删除（不可达）。「多实物绝不静默」由告警日志 + §5 防覆盖闸
+    （新目录永不与残骸同名冲突）双兜底，清场核验责任转向运维读告警。
 - [x] ~~P3：repl 模式（另出计划；认证含 caching_sha2）~~——T0–T8 全部
   完成（本表上方「P3 Task 0–7」节点 + 「P3 DoD 对账」节），caching_sha2
   与 native 双认证 spike 钉死、8.4 矩阵经 `SHOW BINARY LOG STATUS` 改口
