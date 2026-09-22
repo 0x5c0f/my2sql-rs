@@ -57,6 +57,8 @@ pub fn read_lns<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], BinlogEr
     // P4a T1 fuzz 红钉（种子 tm_meta_len_overflow）：0xFE 8B 前缀可声明
     // len = u64::MAX，`*pos + len` usize 加溢出 panic——溢出 ⇒ 切片必然
     // 越界，同 TooShort（go-mysql 侧等价的越界读在其运行时是 err）。
+    // 审计链红钉实体 = 本文件 tests::read_lns_u64max_declared_len_is_too_short_not_panic
+    // （去闸即红；seed6 磁盘件因表名长度漂移够不到本闸，见 task-1-report §7）。
     let end = pos.checked_add(len).ok_or(BinlogError::TooShort)?;
     let s = buf.get(*pos..end).ok_or(BinlogError::TooShort)?;
     *pos = end;
@@ -175,6 +177,19 @@ mod tests {
     fn read_lns_short_payload_is_too_short() {
         let buf = [0x05u8, b'a', b'b'];
         let mut pos = 0;
+        assert_eq!(read_lns(&buf, &mut pos).unwrap_err(), BinlogError::TooShort);
+    }
+
+    /// read_lns 溢出红钉（评审修复轮 2 审计链配套）：0xFE 8B 前缀声明
+    /// len=u64::MAX → `*pos + len` usize 加在 debug 下 panic / release 回绕。
+    /// 本钉专打 [`read_lns`] 的 `checked_add` 闸——去掉闸即红（seed6 磁盘件
+    /// 因表名声明长 8 实给 9 的漂移先拐进 parse_charset，够不到本闸，
+    /// 故 fuzz_seed 面对 guard 回退不红；见 task-1-report §7）。
+    #[test]
+    fn read_lns_u64max_declared_len_is_too_short_not_panic() {
+        let mut buf = vec![0xFEu8];
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut pos = 0usize;
         assert_eq!(read_lns(&buf, &mut pos).unwrap_err(), BinlogError::TooShort);
     }
 
