@@ -30,6 +30,14 @@ for t in "${TARGETS[@]}"; do
     mv "$D"/crash-* "$D/prev/"
     echo "[fuzz-min] $t: 上轮 crash 件已归档 $D/prev/（不计入本轮）"
   fi
+  # 终审轮 FIX C：prev/ 非空（含上条刚归档的）即显式 WARNING——
+  # 防「归档后重跑绿」被误读为「从未 crash」。
+  if [ -d "$D/prev" ]; then
+    pc=$(find "$D/prev" -maxdepth 1 -type f -name 'crash-*' | wc -l)
+    if [ "$pc" != 0 ]; then
+      echo "[fuzz-min] $t: WARNING: $pc 件历史 crash 于 prev/（本轮计数不含上轮）"
+    fi
+  fi
   # 语料隔离：仓库内 fuzz/corpus/<t> 只读，副本落 out/
   rm -rf "$D/corpus"
   mkdir -p "$D/corpus"

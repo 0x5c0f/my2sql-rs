@@ -13,6 +13,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# 终审轮 FIX E（沿 edb2148 接线口径）：debug 二进制路径随 CARGO_TARGET_DIR
+# 解析（并行 lane 各自独立 target 目录，spec §6），与 run-difftest.sh 的
+# RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs" 同口径。
+RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 NAME=my2sql-p4a-rt
 VER=8.0
 DB=p4a
@@ -47,7 +51,7 @@ docker cp "$NAME:/var/lib/mysql/$BIN" "$OUT/binlog/$BIN"
 
 echo "== [3/6] rust to-sql (online schema via --uri)"
 cargo build --quiet
-./target/debug/my2sql-rs to-sql \
+"$RSBIN" to-sql \
   --binlog-dir "$OUT/binlog" --start-file "$BIN" \
   --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
   --add-extra-info --threads 4 --output-dir "$OUT/rs" > "$OUT/rs.log" 2>&1 \

@@ -221,7 +221,7 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
    上游 = Go map 字典序 + `%v` + `json.Marshal` 转义（ALW-JSON-* 白名单，深比较
    判等）。防恶意 binlog 的实际口径：解码器对**已知**敌意输入做了 panic
    加固 + 回归闸（JSON 深度闸 100、DECIMAL 满组越界闸、截断/位图/charset
-   畸形面，`tests/fuzz_seed/` 4 件种子逐字节钉死）；连续探索式 fuzz
+   畸形面，全部 `tests/fuzz_seed/` 种子（现 7 件）逐字节钉死）；连续探索式 fuzz
    （cargo-fuzz 正式 campaign）P4a 已接入为常态闸（`make fuzz-min` 两靶 300s
    0 新 crash + `tests/fuzz_seed/` 病理语料回归钉），但本工具不宣称穷尽防恶意
    binlog。

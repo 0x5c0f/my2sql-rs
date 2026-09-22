@@ -2614,8 +2614,8 @@ fn idle_heartbeat_case(ver: &str, slug: &str, db: &str, sidbase: u32) {
     let server_v = libf(&format!("p3e2e_sql {} -N -e \"SELECT VERSION()\"", bt.ctr))
         .trim()
         .to_string();
-    // ── 心跳变量面探测（brief Step 2）：sql_soft 容忍（5.6 无此变量 =
-    // 空集/失败均不红，注记走 fallback 文本）──
+    // ── 心跳变量面探测（brief Step 2）：sql_soft 容忍（5.6 实测：SHOW 变量面
+    // 为空，心跳实走会话级 SET @master_heartbeat_period，见下方实测措辞分支）──
     let hbprobe = libf_soft(&format!(
         "p3e2e_sql {} -N -e \"SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%'\"",
         bt.ctr

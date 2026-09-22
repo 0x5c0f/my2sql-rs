@@ -1,6 +1,9 @@
 # my2sql-rs —— P1 任务绑定入口（Task 15 起；其余目标直通 cargo）
 .PHONY: test lint fmt difftest compat repl-test fuzz-min shadow-test
 
+# difftest/compat/repl-test 等共享 my2sql-dt-8.0 等固定名容器，make -j 并行会互踩，强制整体串行
+.NOTPARALLEL:
+
 test:
 	cargo test
 

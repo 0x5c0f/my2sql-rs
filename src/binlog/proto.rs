@@ -59,6 +59,9 @@ pub fn read_lns<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], BinlogEr
     // 越界，同 TooShort（go-mysql 侧等价的越界读在其运行时是 err）。
     // 审计链红钉实体 = 本文件 tests::read_lns_u64max_declared_len_is_too_short_not_panic
     // （去闸即红；seed6 磁盘件因表名长度漂移够不到本闸，见 task-1-report §7）。
+    // 32 位截断注记（终审轮 FIX F）：32 位目标上 `as usize` 会截 u64 高 32
+    // 位、checked_add 溢出面随之漏判；本项目目标支持为 64 位，上述闸已把
+    // 64 位面的溢出补全（零逻辑改动，仅登记口径）。
     let end = pos.checked_add(len).ok_or(BinlogError::TooShort)?;
     let s = buf.get(*pos..end).ok_or(BinlogError::TooShort)?;
     *pos = end;

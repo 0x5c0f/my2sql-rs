@@ -1890,6 +1890,24 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   （table_map.rs:79/:299 红钉真 panic 先行 + proto.rs::read_lns 预防闸独立单测），
   本轮 compat 18 + 350 非 live + difftest 双模 + repl 13 全绿 = 事后全量回归
   合同兑现；T2/T3/T4 src/ 零改动。
+- **终审轮 FIX A–F**（全分支终审裁定 With-fixes → 单修复轮已全部落地，base tip
+  `1d519ac`；范围 2149ce1..<新tip> 由 controller 记录）：A README 差异 9 种子计数改
+  版本稳定措辞「全部 `tests/fuzz_seed/` 种子（现 7 件）逐字节钉死」（对齐
+  `tests/fuzz_seed.rs` `SEEDS.len()` 全量断言）；B Makefile 加 `.NOTPARALLEL:` +
+  一行注释（difftest/compat/repl-test 共享 my2sql-dt-8.0 固定名容器，`make -j`
+  不得互踩；scripts 零改动）；C `tools/fuzz-min.sh` crash-* 归档后 prev/ 非空即显式
+  `WARNING: N 件历史 crash 于 prev/（本轮计数不含上轮）`（防归档后重跑绿被读成
+  从未 crash）；D `tests/repl.rs` idle 模块注释删「注记走 fallback 文本」旧措辞、
+  同步 `92a62ea` 实测口径（SHOW 变量面为空；会话级 SET @master_heartbeat_period
+  实生效），纯注释、断言零触碰；E `tools/p4a-roundtrip.sh` 硬编码
+  `./target/debug/my2sql-rs` 换 `RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"`
+  （`edb2148` 同口径，lane 脚本补漏）；F `src/binlog/proto.rs::read_lns` 与
+  `src/binlog/table_map.rs` TLV 循环登记 32 位 `as usize` 截断注记（目标支持面 =
+  64 位，checked_add 闸已补全 64 位溢出表面），纯注释、零逻辑改动。本轮为
+  注释/接线-only：免跑 difftest（无 Go oracle 需求），三门重跑 =
+  `cargo test` **350 passed / 0 failed** + clippy `--all-targets -D warnings` rc=0 +
+  `fmt --check` rc=0（`CARGO_TARGET_DIR=/tmp/p4a-fixr1`）；`bash -n` 两脚本 +
+  `make -n fuzz-min` 通过。
 
 ## P4a DoD 对账（spec §1–§5 + §6，T5 收尾）
 

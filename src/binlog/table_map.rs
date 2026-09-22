@@ -303,6 +303,9 @@ fn decode_optional_meta(
         // P4a T1 fuzz 红钉（种子 tm_tlv_len_overflow）：payload 长 0xFE 8B
         // 可声明 u64::MAX，`pos + l` usize 加溢出 panic——溢出 ⇒ payload
         // 必然越出 rest 末尾，与截断同口径报 InvalidData（D5 不猜残段）。
+        // 32 位截断注记（终审轮 FIX F）：32 位目标上 `as usize` 截 u64 高
+        // 32 位可漏本溢出面；本项目目标支持为 64 位，下方闸已补全 64 位面
+        // 的溢出表面（零逻辑改动，仅登记口径）。
         let end = pos
             .checked_add(l)
             .ok_or_else(|| invalid(format!("TLV type {t}: payload length {l} out of bounds")))?;
