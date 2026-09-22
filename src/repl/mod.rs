@@ -10,6 +10,7 @@
 //!
 //! 注：本文件与 checkpoint lane 的合并由 controller 取 `pub mod` 并集。
 
+pub mod assembly;
 pub mod checkpoint;
 pub mod source;
 pub mod transport;
