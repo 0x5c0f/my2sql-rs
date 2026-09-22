@@ -6,7 +6,7 @@
 name: release
 on:
   push:
-    tags: ['v[0-9]*']
+    tags: ['v*']
 permissions:
   contents: write
 jobs:
@@ -15,10 +15,13 @@ jobs:
     strategy:
       matrix:
         include:
+          # C1：suffix = 完整 triple，使 cp 与 upload glob（均引 matrix.suffix）随动，
+          # 云端资产名逐字 = spec D4 模板 my2sql-rs-<ver>-x86_64-unknown-linux-{gnu,musl}，
+          # 与本机 release-build.sh 产物名同形（原 gnu/musl 短后缀偏离 D4，已修）。
           - target: x86_64-unknown-linux-gnu
-            suffix: gnu
+            suffix: x86_64-unknown-linux-gnu
           - target: x86_64-unknown-linux-musl
-            suffix: musl
+            suffix: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
