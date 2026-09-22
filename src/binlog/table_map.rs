@@ -75,11 +75,15 @@ pub fn parse_table_map(body: &[u8], with_crc: bool) -> Result<TableMapEvent, Bin
     pos += tlen + 1;
     // n_cols（LNE）+ 列类型数组
     let n_cols = read_lne(body, &mut pos)? as usize;
+    // P4a T1 fuzz 红钉（种子 tm_ncols_overflow）：0xFE 8B LNE 可声明
+    // n_cols = u64::MAX，`pos + n_cols` usize 加溢出即 panic（debug/fuzz
+    // profile）/ 回绕成错误切片（release）。溢出 ⇒ types 区必然越界，同 TooShort。
+    let types_end = pos.checked_add(n_cols).ok_or(BinlogError::TooShort)?;
     let column_type = body
-        .get(pos..pos + n_cols)
+        .get(pos..types_end)
         .ok_or(BinlogError::TooShort)?
         .to_vec();
-    pos += n_cols;
+    pos = types_end;
     // metadata：LNE 总长 + 逐列 meta（对照 go-mysql LengthEncodedString + decodeMeta）
     let meta_bytes = read_lns(body, &mut pos)?;
     let column_meta = decode_meta(meta_bytes, &column_type)?;
@@ -296,13 +300,19 @@ fn decode_optional_meta(
         let l = read_lne(rest, &mut pos)
             .map_err(|_| invalid(format!("TLV type {t}: truncated length prefix")))?
             as usize;
-        let v = rest.get(pos..pos + l).ok_or_else(|| {
+        // P4a T1 fuzz 红钉（种子 tm_tlv_len_overflow）：payload 长 0xFE 8B
+        // 可声明 u64::MAX，`pos + l` usize 加溢出 panic——溢出 ⇒ payload
+        // 必然越出 rest 末尾，与截断同口径报 InvalidData（D5 不猜残段）。
+        let end = pos
+            .checked_add(l)
+            .ok_or_else(|| invalid(format!("TLV type {t}: payload length {l} out of bounds")))?;
+        let v = rest.get(pos..end).ok_or_else(|| {
             invalid(format!(
                 "TLV type {t}: truncated payload, need {l} have {}",
                 rest.len() - pos
             ))
         })?;
-        pos += l;
+        pos = end;
         let checked: Result<(), BinlogError> = match t {
             SIGNEDNESS => Ok(()), // 消费即弃（P1 裁定，见函数文档）
             DEFAULT_CHARSET | ENUM_SET_DEFAULT_CHARSET => {
