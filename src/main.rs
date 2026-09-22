@@ -1,5 +1,10 @@
 //! my2sql-rs：MySQL binlog 解析 / 还原 SQL 工具（入口装配，逻辑在库层）。
 
+/// P4b-T3（spec §3 固定项）：mimalloc 全局分配器——P1 musl 悬崖（3.4 MiB/s，
+/// musl malloc arena 竞争）候选解 + glibc 侧 A/B 实测定方向。收益裁定入档。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::process::exit;
 use std::sync::atomic::Ordering;
 
