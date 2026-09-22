@@ -29,13 +29,19 @@ flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）
 | fuzz 正式接入（cargo-fuzz 两靶 + 确定性语料 + 300s 闸） | ✅ | `make fuzz-min`：`fuzz/` 独立 workspace，靶 decode_event/event_stream 各 300s（`FUZZ_TIME=<秒>` 缩窗），0 新 crash 判据；起点语料 = `tests/fuzz_seed/` 同源 seedgen 确定性 40 件（禁随机入仓）；两靶 300s×2 真跑 0 crash 证据（2026-09-22，T5 合流轮逐字）见 HANDOVER P4a 节 |
 | 影子库端到端回放（前向/逆向/往返三段） | ✅ | `make shadow-test [VER=…]`：to-sql 产物灌影子库==主库后态、flashback 产物==前态、往返回前态，逐表 CHECKSUM + 行级 diff 双腿无假绿；8.0 spec 原形态（live 锚），5.7 REF-clone 锚（JSON checksum 上游不可定值，豁免仅 checksum 腿——裁定见 HANDOVER）；`SHADOW_NEGCHECK=1` 负自检验钞机 |
 | P4A 列形捕获（ENUM>255 / GEOMETRY / LONGBLOB>64K） | ✅ | `P4A=1 make difftest`（仅 8.0 主闸）：三形 Go 裁判差分 14/14 组全绿 + 自 roundtrip checksum/行级双门；三形均裁判支持、无新增行为差异（登记见差异 28），明细 docs/p4a-findings.md |
-| musl 静态性能 | ❌ | 挂账续留（musl 构建本身已可用，实测崩塌归 musl malloc arena 竞争，见 docs/bench/p1.md） |
+| musl 静态性能 | ✅ | **P4b mimalloc 消账**：接入全局 mimalloc 后 musl release 端到端 threads=8 **64.2 MiB/s**（此前 3.3 MiB/s 的 musl malloc arena 悬崖，见 [docs/bench/p4b.md](docs/bench/p4b.md) ④）；mimalloc 现为**无条件硬依赖**（无 `--no-default-features` 逃生，musl 交叉编译含其 C 核） |
 
-吞吐基线（DoD-3，发布态，528 MiB 合成 binlog）：**threads=8 ≈ 103.9 MiB/s**
-（≥ 40 MB/s 通过），明细见 [docs/bench/p1.md](docs/bench/p1.md)。P2 回归闸
-（spec §6.4）：原始读数 −14.9%，同机 A/B 归因为环境漂移 −8.3% + 代码增量
-−3.2%（95% CI 跨 0，未达 5% 判定线）——**未判定 finding**，不宣称「无回归」，
-全程证据与测量陷阱见 [docs/bench/p2.md](docs/bench/p2.md)。
+吞吐基线（DoD-3，发布态，528 MiB 合成 binlog，criterion
+`cargo bench --bench decode`）：**当前权威基线 threads=8 median 127.59 MiB/s**
+（P4b mimalloc 落地后终态跑，≥40 MB/s 通过，回归闸 vs P1 真值 103.85 MiB/s
+**+22.86% 更快 → GREEN**）——逐字基线、三套口径（criterion 账本 / `make bench-ab`
+端到端 A/B / `make bench-profile` 曲线）与挂账 #7「P1→P2 代码增量复测钉死不显著」
+见 [docs/bench/p4b.md](docs/bench/p4b.md)。历史账本：P1 基线 **103.9 MiB/s**
+（[docs/bench/p1.md](docs/bench/p1.md)）；P2 回归闸（spec §6.4）原始读数 −14.9%，
+同机 A/B 归因为环境漂移 −8.3% + 代码增量 −3.2%（95% CI 跨 0，未达 5% 判定线）
+——P4b 用 `tools/bench-ab.sh` 工装复测将该 −3.2% 弱信号**钉死为端到端不显著**
+（delta +2.812% < 阈值 0.5714s，N=5，不升级 N=9），证据与测量陷阱见
+[docs/bench/p2.md](docs/bench/p2.md) + [docs/bench/p4b.md](docs/bench/p4b.md) ③。
 
 ## 快速上手
 
@@ -190,6 +196,9 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
 - 需要 docker。除差分测试（`make difftest`/`make compat`）外不需要 Go 工具链。
 - 吞吐基线：`bash tools/gen-bench-binlog.sh && cargo bench --bench decode`
   （输入缺失或 debug 编译档时 bench 自动跳过，不影响 `cargo test --all-targets`）。
+  端到端 A/B 判定与 threads 曲线普查经 `make bench-ab ARGS="--a <binA> --b <binB>
+  [--rounds N]"` / `make bench-profile` 直通（P4b 工装，taskset 钉 P 核、
+  median+MAD 判显著，见 [docs/bench/p4b.md](docs/bench/p4b.md)）。
 - `examples/repl_spike.rs` 为 P3 Task 0 协议 spike 的**诊断样例**（throwaway，
   按裁决保留供排障复跑；`src/` 对其零引用，不参与任何测试/发布链路）。
 
@@ -326,7 +335,10 @@ P4a（质量面）追加：
   `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`
 - 进度/决策/白名单台账：[docs/HANDOVER.md](docs/HANDOVER.md)
 - 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)（P1 基线）、
-  [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）
+  [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）、
+  [docs/bench/p4b.md](docs/bench/p4b.md)（**P4b 当前权威基线 + mimalloc A/B +
+  挂账 #7 复测**）、[docs/bench/p4b-profile.md](docs/bench/p4b-profile.md)
+  （P4b profile 普查：threads 曲线 / 假设判定 / 优化候选排序表）
 - 版本兼容矩阵：[docs/compat/matrix.md](docs/compat/matrix.md)
 - 模糊测试：种子语料 `tests/fuzz_seed/`（回归闸 `tests/fuzz_seed.rs`）+ P4a 起
   `fuzz/` cargo-fuzz workspace 正式接入（seedgen 单源确定性语料，

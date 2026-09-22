@@ -1,5 +1,5 @@
 # my2sql-rs —— P1 任务绑定入口（Task 15 起；其余目标直通 cargo）
-.PHONY: test lint fmt difftest compat repl-test fuzz-min shadow-test
+.PHONY: test lint fmt difftest compat repl-test fuzz-min shadow-test bench-ab bench-profile
 
 # difftest/compat/repl-test 等共享 my2sql-dt-8.0 等固定名容器，make -j 并行会互踩，强制整体串行
 .NOTPARALLEL:
@@ -38,3 +38,9 @@ fuzz-min:
 
 shadow-test:
 	bash tools/shadow-replay.sh $${VER:-8.0}
+
+## P4b 性能面入口（env 透传：A/B/ROUNDS/RSBIN/TASKSET 归脚本自身）
+bench-ab:
+	bash tools/bench-ab.sh $(ARGS)
+bench-profile:
+	bash tools/bench-profile.sh

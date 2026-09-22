@@ -24,7 +24,22 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 
 ## 当前进度
 
-- 分支：`worktree-feat-p4a`（base `main@2149ce1`（= P3 终审后合入态
+- **当前分支：`worktree-feat-p4b`（base `main@aba8293` = v0.4.0-p4a；
+  P4b 计划 = `docs/superpowers/plans/2026-09-22-my2sql-rs-p4b-performance.md`，
+  spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p4b-performance-design.md`；
+  SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p4b-performance/`）
+- **P4b「性能面」计划 5 任务（T1 工装 / T2 profile / T4 搬运 并行 → T3 优化 →
+  T5 合流）全部完成**：`tools/bench-ab.sh` A/B 判定工装（median+MAD，selftest 8 例
+  + 恒等 A/A 冒烟）；`docs/bench/p4b-profile.md` profile 普查（threads 曲线 +
+  假设判定 + 排序表）；mimalloc 全局分配器（glibc A/B 显著快 26.561% + musl 悬崖
+  3.3→64.2 MiB/s 消账）；`src/repl/assembly.rs` 装配块纯搬运（move-only + 逐字节 +
+  350 计数）；T5 落 `make bench-ab`/`make bench-profile` + `docs/bench/p4b.md`
+  新权威基线（threads=8 median **127.59 MiB/s**，回归闸 vs 103.85 **+22.86% 更快
+  GREEN**）+ 挂账 #7 P1→P2 复测**钉死不显著**（+2.812% < 0.5714s，N=5 不升级）+
+  全量回归六闸逐字台账。§0 七条挂账全部销账/书面处置（见「P4b DoD 对账」与
+  挂账清单 P4b 消费注）。**收口 pending = controller 的 merge/tag/push（本轮
+  T5 lane 不并入 main、不打 tag、不 push）**。
+- 分支（P4a 史）：`worktree-feat-p4a`（base `main@2149ce1`（= P3 终审后合入态
   `v0.3.0-p3`）；P4a 计划 =
   `docs/superpowers/plans/2026-09-22-my2sql-rs-p4a-quality-lanes.md`，
   spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p4a-quality-lanes-design.md`；
@@ -1961,6 +1976,187 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   run-difftest.sh/compat-matrix.sh 接线已改按同口径）；测试基线滚动：
   非 live = **350**（≥349 达成），live repl = **13**。
 
+## P4b 任务节点日志（T1–T5）
+
+**P4b「性能面」= 主 spec §9 P4 行的性能侧子集**（质量侧已在 P4a 收官）：把
+P1/P2/P3/P4a 全部在册性能挂账（spec §0 七条）统一消费。派发序 = T1/T2/T4 并行
+→ T3（依赖 T1 工装 + T2 报告）→ T5 合流单写者。本役**唯一 src/ 性能改动 =
+mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历史）。逐字数字全部可在
+`/tmp/p4b-t{1,2,3,4}-*` 源日志与 `docs/bench/p4b*.md` 找到（禁虚账，报告↔日志
+冲突时以日志为准）。
+
+### P4b T1（Lane 0）：`tools/bench-ab.sh` A/B 判定工装 + 挂账 #1/#4/#6/#7（commit `b6844fe` + fix `2c670b9`）
+
+- **交付:** `tools/bench-ab.sh`（端到端 A/B 判定器：taskset 钉 P 核 0-11、
+  governor 只记录、两侧各交替 N=5 轮 wall-clock、median+MAD 判显著，契约
+  exit 0=不显著/1=显著/2=用法错）；`tools/gen-bench-binlog.sh` RSBIN 接线
+  （`RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"`，:24 定义/:116 消费）；
+  `data/bench` 读侧 symlink 复用主仓缓存（零写入）；`/tmp/p4b-t1-ab7.md` 挂账#7
+  全样本表。**零 src/ 改动**（仅 tools/ 两文件）。
+- **Ruling（评审）:** b6844fe 判 FAIL(fixable) → fix 轮 `2c670b9` 逐项修 finding 1–5
+  + bench-profile 同型 finding 6（崩溃 to-sql 被 `$(run_side)` 吞成有效样本 →
+  run_side 显式 `|| rc=$?` + 调用点 `|| exit 1`；`--rounds 0/abc` 空样本 nan 假绿 →
+  参数守护 `case` + verdict 空档/数值闸；悬空选项值 rc=1→rc=2；exit-0 零产物不计样本；
+  `_median` `LC_ALL=C` 防呆 + `medianA<=0` 守卫）。**统计核数学与输出 printf 格式串逐字
+  未动**（唯一 +/- = sort 前加 LC_ALL=C），入档判定无需重跑（当前数学核重投样本 100%
+  复现）。selftest 扩至 8 例（+例5–8 为回归针）。
+- **证据逐字（A/A 恒等冒烟 `/tmp/p4b-t1-aa.log` rc=0）:**
+  `median A=7.6126s B=7.6771s … delta=+0.847% (0.0645s) thr=0.2902s` /
+  `throughput MiB/s A=69.5 B=68.9` / `VERDICT: not-significant (B slower-than A)`。
+- **证据逐字（挂账#7 P1 vs P2 N=5 `/tmp/p4b-t1-ab7-r5.log` rc=0）:**
+  `median A=6.7459s B=6.9356s MAD A=0.2439 B=0.2857 delta=+2.812% (0.1897s) thr=0.5714s` /
+  `throughput MiB/s A=78.4 B=76.3` / `VERDICT: not-significant (B slower-than A)`
+  → 钉死不显著（<3.2% 弱信号落噪声带，N=5 不升级 N=9）。
+- **挂账#4 复验（证伪）:** `grep -n '5\.903' docs/bench/p1.md` → 无输出 rc=1；
+  `docs/bench/p1.md:35` 已是 **5.093 s**（笔误已被后手修正，本 lane 零改动，
+  合同「不触 docs/」）。挂账虚假入账。
+
+### P4b T2（Lane P）：`docs/bench/p4b-profile.md` profile 普查（只测不动，commit `5b6a363`）
+
+- **交付:** `docs/bench/p4b-profile.md`（环境/曲线/perf 面/假设判定/排序表 五段）+
+  `tools/bench-profile.sh`（busy 差值法 + comm 跨进程跟踪支撑 ≥30s）。**红线：src/ 与
+  既有 tools/ 零改动**（构建/测试在 `git archive c59def0` 干净导出树，免疫脏共享 worktree）。
+- **证据逐字（threads 曲线，每档 3 轮中位，taskset 0-11，`/tmp/p4b-t2-run.log`）:**
+  `threads=1 median=12.288s MiB/s=43.0` / `threads=2 52.7` / `threads=4 74.8` /
+  `threads=8 median=6.125s MiB/s=86.3` → **端到端并行效率 86.3/43.0 = 2.01×**
+  （vs P1 挂账 2.5×；收缩全来自 t8 档绝对值 −17%，登记为 X3 待追加实验，未立项）。
+- **假设判定（挂账 #2 逐条）:** A1 channel 交接 **证伪**（busy 8.84≈可忙线程数/R 89%，
+  等待不主导）；A2 Reorder 等待窗 **证伪**（S 11%/D 0%/线程 10<12 钉核）；
+  A3 行级分配上界 **证实（推断级）**（全负载 CPU 工作量 t1 12.2 → t8 54.2 core·s，
+  膨胀 4.45× 换吞吐 2.01×，互证挂 T3 mimalloc A/B）；A4 文件读 syscall **证伪**
+  （t1 busy 0.99/R 100%/D≈0，page-cache 命中）；A5 锁争用 **证据不足**（无 perf，
+  futex 睡眠已排除，on-CPU 自旋与真实分配不可分）。
+- **排序表:** O1 mimalloc（固定项）+ O2 worker 行级分配节食（A3 派生，须 O1 后复测）；
+  A1/A2/A4/A5 证伪/证据不足项未强行入表（禁为动而动）。perf 面：`paranoid=4` →
+  `perf record`/`perf stat` 双双 rc=255 拒绝，降级 = /proc 线程状态采样（函数级热点缺位为
+  环境如实处置，`/tmp/p4b-t2-perfprobe.txt`）。
+- **门禁:** `cargo test` = 350 passed/0 failed/14 ignored（`/tmp/p4b-t2-cargo-test.log`）。
+
+### P4b T4（Lane R）：pipeline repl 装配块纯搬运 → `src/repl/assembly.rs`（commit `8ff5fe0`）
+
+- **交付:** `src/pipeline/mod.rs` 3473 → **1540 行**；新建 `src/repl/assembly.rs` **1949 行**
+  （29 项，按引用图划界：仅被 repl 装配路径引用者移动）；`src/repl/mod.rs` +1
+  `pub mod assembly;`。`Runner`/`Emitter`/`open_store` 留守并 `pub(crate)` 化（file 模式
+  三形态共用）。对外接口零变化（`pub use crate::repl::assembly::run_repl;`）。
+- **Ruling（派发序）:** 本 lane 先行合入（T4 在 T3 前），使 T3 优化 diff 落在稳定结构上
+  （spec §4 src/ 面互斥靠串行序保证）。注：实际合入序上 T4 `8ff5fe0` 早于 T1 fix/T2/T3，
+  controller 已在派发时裁定。
+- **证据逐字（纯 move 机械证明，task-4-report Step 2）:**
+  证明 A（移动体逐字节）`diff <(sed -n '242,245p;252,1012p;2309,3473p' before) <(tail -n +20 assembly.rs)`
+  → `rc=0` 无输出；证明 B（留守侧）仅 11 处 plumbing（删 6 类失效 import + `Duration` 收窄 +
+  插 1 `pub use` + 7 处 `pub(crate)` 前缀），无改名/doc 改写/格式化 churn。
+- **证据逐字（行为恒等产物逐字节）:** base(c59def0) vs new `to-sql`+`flashback` 同参
+  `diff -r` rc=0，sha1 `49c81bcd…`（flashback）/`7c4c0f73…`（to-sql）base≡new。
+- **证据逐字（bench A/A' 抽测，controller 裁定内联法）:** 中位 base 6438ms / new 6517ms
+  → Δ **+1.2%**（≤3% 预期带内，to-sql 热路径不经 assembly）。**350 计数硬证**（repl_tests
+  21 件全过）：`[lib] 314 + cli 8 + e2e 9 + flashback 7 + fuzz_seed 2 + repl(2/13ign) + stats 8 + doc 0`。
+
+### P4b T3（Lane O）：mimalloc 全局分配器 + 机动项 O2（commit `281735d`，唯一 src/ 性能改动）
+
+- **交付:** `Cargo.toml` `mimalloc = "0.1.52"` + `src/main.rs`
+  `#[global_allocator] static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;`
+  （3 files changed, 25 insertions）。**偏离 brief 示例（裁定按 crate 实况）：** brief 写
+  `mimalloc::Mimalloc`，0.1.52 实际导出 `MiMalloc`（E0425 实证）。
+- **glibc A/B（`/tmp/p4b-t3-ab.log`，两侧 sha256 DIFFER）:**
+  `median A=5.9613s B=4.3779s MAD A=0.0293 B=0.0331 delta=-26.561% (1.5834s) thr=0.1192s` /
+  `throughput MiB/s A=88.7 B=120.8` / `VERDICT: significant (B faster-than A)` rc=1 →
+  **显著快 26.561%，保留接入**。
+- **musl 复测（挂账 #3 消账，`/tmp/p4b-t3-musl-{base,tip}.txt`，musl-gcc 在册 ×3 中位）:**
+  `base-musl median=158.0084s MiB/s=3.3`（≈精确复现 P1 在册 3.4 悬崖）/
+  `mimalloc-musl median=8.2347s MiB/s=64.2`（≥50 门）→ **悬崖消账，挂账 #3 = 已解决**（≈19.2×）。
+  std 目标 `--no-default-features` 不可用（mimalloc 硬依赖）→ 对照 = 无 mimalloc 的 BASE_T3
+  worktree 同法 musl 构建。
+- **语义恒等硬证（Step 5）:** base(9970ffb9) vs new(fda6465a) 同参 to-sql+flashback
+  `diff -r` 全等（`TOSQL-IDENTICAL`/`FLASHBACK-IDENTICAL` rc=0），sha256
+  `a54da851…`（to_sql）/`b4b2e69e…`（flashback）base==new → mimalloc 零语义触点。
+- **机动项 O2（Step 6，`/tmp/p4b-t3-o2-ab.log`，base=mimalloc-tip 防双计）:**
+  `delta=+0.282% (0.0128s) thr=0.1614s` / `VERDICT: not-significant (B slower-than A)` rc=0 →
+  按 spec §3「零胜合法、禁为动而动」**回滚 O2**（含行为钉撤除），**未提交、不在历史**。
+- **X3 免责:** mimalloc 把端到端 t8 推至 120.8 MiB/s 顺带越过 103.85 账本线，但**无专属
+  第二 A/B**（P1 终审 tip vs 本 tip），**不作「17% 回退被收复」的归因**，X3 继续在册。
+- **门禁（全在最终 tip）:** cargo test 350/0/14、clippy rc=0、fmt rc=0、compat 18/18、
+  difftest 21/21 + P4A 14/14、语义恒等硬证。
+
+### P4b T5（合流 lane，本轮）：make 入口 + 新基线 + 全量回归六闸 + 文档收口
+
+- **独占面履约:** Makefile/README/HANDOVER/p4b.md 单写者。Makefile `.PHONY` 追加
+  `bench-ab`/`bench-profile` + 两目标行（`bash tools/bench-ab.sh $(ARGS)` /
+  `bash tools/bench-profile.sh`），`make -n` 双验通过；同 commit 附 `chmod +x
+  tools/bench-ab.sh`（评审 nit：兄弟脚本除 gen-bench/p4a-roundtrip/repl-e2e-lib 外均带
+  +x；git diff 仅 `old mode 100644 → new mode 100755`，内容零触碰）。
+- **`docs/bench/p4b.md` 新权威基线:** 六段汇编（机器口径 / criterion 正式跑 / T1 ab7 /
+  mimalloc A/B+musl / 机动项 verdict / T4 抽测）+ 裁定与免责节（mimalloc 硬依赖、X3
+  registered-only、T2 2.01× 取代 P1 2.5×、threads 缩放 post-mimalloc 仍开放）+ traceability。
+- **正式 criterion 基线（终态 tip，`/tmp/p4b-merge-bench.log`）:**
+  `file_to_sql/threads=8/528 MiB time: [4.0550 s 4.1451 s 4.2409 s]
+   thrpt: [124.71 MiB/s 127.59 MiB/s 130.42 MiB/s]`（median 4.1451 s → 127.59 MiB/s）；
+  `threads=1 time: [10.084 s 10.162 s 10.273 s] thrpt: [51.480 MiB/s 52.042 MiB/s 52.445 MiB/s]`。
+  **回归闸判定：127.59 vs 103.85 → +22.86%（更快）→ GREEN**（>5% 劣化 = 红未触发）。
+- **全量回归六闸（串行 fail-fast，`CARGO_TARGET_DIR=/tmp/p4b-merge`，逐字日志
+  `/tmp/p4b-merge-gate*.log` + 戳记 `/tmp/p4b-merge-stamps.txt`；docker 腿全程零重叠、
+  仅自建容器、trap 清理、跑后零泄漏）:**
+  1. **三门（07:55:08Z→）rc=0:** `cargo test --no-fail-fast` awk 汇总 **350 passed / 0 failed /
+     14 ignored**（lib 314/1ign · cli 8 · e2e 9 · flashback 7 · fuzz_seed 2 · repl 2/13ign ·
+     stats 8 · doc 0）；`clippy --all-targets -D warnings` rc=0；`fmt --check` rc=0。
+  2. **`FUZZ_TIME=20 make fuzz-min` rc=0（08:03:00Z→）:** `decode_event: exit=0 crashes=0` /
+     `event_stream: exit=0 crashes=0` / `[fuzz-min] OK 0 new crashes`。
+     （副作用注记：跑后 `fuzz/Cargo.lock` 因 T3 mimalloc 硬依赖被 cargo 就地补入
+     `mimalloc`/`libmimalloc-sys` 条目——非回归路径、T5 独占面外，已 `git checkout` 还原，
+     移交 controller：fuzz 独立 workspace 锁未随 T3 传播，宜后续单独入账。）
+  3. **`make difftest` rc=0（08:06:08Z）:** `groups A=21 B=21 aligned=21 green=21 red=0` +
+     `OK difftest 8.0: diff-green + replay-byte-identical`；
+     **`P4A=1 make difftest` rc=0（08:07:01Z）:** `data script: tools/gen-data-p4a.sql` +
+     `groups A=14 B=14 aligned=14 green=14 red=0` + 同 OK 行。
+  4. **`make compat` rc=0（08:07:37Z→08:13Z）:** **18/18 PASS `COMPAT MATRIX: ALL GREEN`**
+     （非 repl 14 件与 P4a 完全同值：5.6 组 19/21 体系、stats total=32/36、v1rows/caching_sha2
+     在场）；repl 族字节 `175276/144743/140124/162381`（跨 run 窗口漂移，每-run repl≡file
+     `diff -r` 全 PASS 兜底，绝对字节不作跨 run 基线——P4a 裁定沿用）。
+  5. **`make shadow-test`（8.0）rc=0（08:13:18Z）:** 五闸全 GREEN，逐表 checksum 与 P4a 收官
+     **逐位等**（P0 t_doc=**2877097027**/t_ord=**2830880655**；P1 t_doc=**2572327458**/
+     t_ord=**2651036437**）：SETUP_FWD vs P0 / FWD_SHADOW vs P1 / SETUP_REV vs P1 /
+     REV_SHADOW vs P0 / RT_SHADOW vs P0 均 `checksum-equal=2/2 exempt-json=0 rowdiff bytes=0`；
+     `ASSERT OK: to-sql statements=115 == DML lines=115`×2（flashback 同 115）——
+     mimalloc(T3)+搬运(T4) 后影子库三段零语义漂移反证。
+  6. **`make repl-test` rc=0（08:14:12Z→08:28:05Z）:** **13 passed / 0 failed / 0 ignored /
+     2 filtered out / 815.30s**（src/ 动过 = 硬条件，13 件全真跑，逐字名册见 task-5-report），
+     跑后零泄漏容器。
+- **开闸条款台账:** src/ 全役性能改动 = mimalloc 一行 GlobalAlloc（T3）+ assembly move-only
+  （T4）；本轮 compat 18 + 350 非 live + difftest 双模（21/14）+ shadow 五闸逐位 + repl live
+  13 全绿 = 事后全量回归合同兑现（P4a 解码器开闸条款扩展至 pipeline 热路径）。
+- **区间记录:** `aba8293..` = spec/plan 2 件（d9f16d7/c59def0）+ 四 lane（T4 `8ff5fe0`、
+  T1 `b6844fe`、T2 `5b6a363`、T1fix `2c670b9`、T3 `281735d`）+ 本 T5 合流 commit。
+  **本节点后收口（ff main → tag → push）= controller 特权，T5 lane 不执行（明确出界）。**
+
+## P4b DoD 对账（spec §7 七条，T5 收尾）
+
+1. **`tools/bench-ab.sh` 存在 + selftest + 恒等 A/A 冒烟逐字入档（挂账 #1/#4/#6/#7）** ✅
+   （工装 + 8 例 selftest + A/A not-significant + ab7 复测 + gen-bench RSBIN + p1.md 无 5.903 证伪，见 T1 节点/p4b.md ①③）。
+2. **`docs/bench/p4b-profile.md`：曲线 + 热点表 + 挂账 #2 假设逐条判定 + 优化候选排序表** ✅
+   （threads 曲线 2.01×、perf 降级 /proc 采样、A1–A5 逐条判词、O1/O2 + X1–X4，见 T2 节点）。
+3. **mimalloc 接入：A/B 工装对照 + musl 复测数字（挂账 #3 消账）** ✅
+   （glibc A/B 显著快 26.561% + musl 3.3→64.2 MiB/s ≥50 悬崖消账 + 语义恒等逐字节，见 T3 节点/p4b.md ④）。
+4. **机动项按各自 commit「行为恒等 + 显著」双证入账（或零机动裁定）** ✅
+   （O2 尝试→not-significant（+0.282%<thr 0.1614s）→回滚，未入历史；本役唯一 src/ 性能改动 = mimalloc，见 p4b.md ⑤）。
+5. **assembly 搬运完成且 diff 形态审为 move-only（挂账 #5）** ✅
+   （pipeline 3473→1540 + assembly 1949，证明 A/B 机械 diff rc=0 + 产物逐字节 + 350 计数，见 T4 节点）。
+6. **`docs/bench/p4b.md` 新基线 + 回归闸判定（vs 103.85 ±5%）+ HANDOVER 挂账处置全表** ✅
+   （threads=8 median **127.59 MiB/s = +22.86% 更快 → GREEN**；§0 七条逐行销账见下）。
+7. **T5 全量回归六闸全绿逐字入档；改动面含 src/ → repl live 13 件全跑** ✅
+   （六闸 rc 全 0：350/0/14 · fuzz 0crash · difftest 21/21+P4A 14/14 · compat 18/18 ·
+   shadow 五闸逐位 · repl live **13/13 真跑** 815.30s，见 T5 节点 + task-5-report）。
+
+## P4b §0 挂账处置销账表（spec §0 七条逐行）
+
+| # | 挂账（出处） | 处置 | 证据 |
+|---|---|---|---|
+| 1 | bench 判定工装（P2 挂账 :2040、p2.md 后续动作） | ✅ **落地 + 复评审**：`tools/bench-ab.sh` selftest 8 例 + A/A 冒烟 + FAIL(fixable)→fix 全绿 | `b6844fe`+`2c670b9`；`/tmp/p4b-t1-{selftest,aa}.log` |
+| 2 | threads 1→8 并行效率 2.5× 上限「先 profile 再动」（P1 :823） | ✅ **profile done**；优化按 §2 裁定 = T2 归因（A3 证实推断级）→ T3 唯一动刀 = mimalloc；threads 缩放 post-mimalloc **仍开放**（无热路径结构改动，O2 不显著回滚） | `5b6a363`；p4b-profile 曲线/假设判定 |
+| 3 | musl 吞吐悬崖 ~3.4 MiB/s（p1.md，P4 :2136） | ✅ **悬崖消账**：mimalloc musl release 3.3→**64.2 MiB/s**（≥50 门） | `281735d`；`/tmp/p4b-t3-musl-{base,tip}.txt` |
+| 4 | `docs/bench/p1.md` 笔误 5.903→5.093（:2025 移交一行） | ✅ **证伪入账**：p1.md 无 5.903（grep 空），:35 已是 5.093——挂账虚假/已被后手修正，零改动 | `b6844fe`；`grep 5.903 docs/bench/p1.md`（rc=1 空） |
+| 5 | pipeline/mod.rs 2600+ 行装配块迁 `src/repl/assembly.rs`（P3 T8 :2056） | ✅ **搬运**：move-only，逐字节 + 350 计数 + Δ+1.2% 抽测 | `8ff5fe0`；task-4-report Step 2/3/4 |
+| 6 | gen-bench-binlog.sh 硬编码 target（P4a T5 :1845/:2122 同族小账） | ✅ **接线修**：RSBIN `${CARGO_TARGET_DIR:-$ROOT/target}`（edb2148 同口径），trace 实证 | `b6844fe`；`/tmp/p4b-t1-genbench-trace.log:5`；gen-bench :24/:116 |
+| 7 | P2 回归闸未决：代码增量 −3.2%（CI 跨 0，p2.md） | ✅ **钉死不显著**：bench-ab P1 vs P2 N=5，delta **+2.812% < thr 0.5714s**，不升级 N=9（无「跨 0→显著」证据） | `b6844fe`+`2c670b9`；`/tmp/p4b-t1-ab7-r5.log` + p4b.md ③ |
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -1986,6 +2182,10 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 - SDD 台账（P4a）：`.superpowers/sdd/2026-09-22-my2sql-rs-p4a-quality-lanes/progress.md`
   （git-ignored；各 lane 简报/报告/评审同目录；T5 全量回归逐字日志
   `/tmp/p4a-merge-gate*.log` + 戳记 `/tmp/p4a-merge-stamps.txt`）
+- SDD 台账（P4b）：`.superpowers/sdd/2026-09-22-my2sql-rs-p4b-performance/progress.md`
+  （controller-private，git-ignored；各 lane 简报/报告/评审 + task-5-report.md 同目录；
+  各 lane 逐字日志 `/tmp/p4b-t{1,2,3,4}-*`；T5 全量回归逐字日志
+  `/tmp/p4b-merge-gate*.log` + `/tmp/p4b-merge-bench.log` + 戳记 `/tmp/p4b-merge-stamps.txt`）
 - **运维注（P4a T1/T3 实踩，T5 入册）：worktree 跑 difftest/compat 需 `reference/`
   本地真实副本（`cp -a` 主仓 `reference/`），严禁 symlink** ——`go build -o
   ../../tools/bin/my2sql-go` 走**物理路径**解析，symlink 会把裁判二进制漏写进
@@ -2022,10 +2222,12 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     先于 build_common → 同时缺 schema 源时用户先见 on-error 条。可辩护
     （旗标语义优先级更高），已按 T5 挂账在 src/config.rs 注释 +
     tests/cli.rs 顺序钉桩收口为**文档化行为**，不再是测试债。
-  - [ ] **docs/bench/p1.md 笔误待修（移交集成方，一行）**：记录表
+  - [x] ~~**docs/bench/p1.md 笔误待修（移交集成方，一行）**：记录表
     threads=8 用时 `5.903 s` 应为 **5.093 s**（其 criterion 摘录
     `[5.0501 s 5.0927 s 5.1408 s]` 与判定文字为准；p2.md 开头注记为
-    权威说明）。不属本分支改动面，故未动。
+    权威说明）。不属本分支改动面，故未动。~~——**P4b T1 消费（`b6844fe`，挂账 #4）
+    证伪入账**：`grep -n '5\.903' docs/bench/p1.md` 无输出（rc=1），p1.md:35 threads=8
+    已是 **5.093 s**——挂账虚假/已被后手修正，零改动（详见「P4b §0 挂账处置销账表」#4）。
   - [ ] stats 报表尾注 `# skipped events: N` 为**自定口径**：上游两报表
     无尾注（stats_process.go:262-265 收尾仅冲刷窗口）——格式/落点由本
     计划简报裁定；比较器已约定跳 `#` 行（T7），该行不受裁判差分保护，
@@ -2037,10 +2239,17 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     `--dml insert`×stats 双通道配平（真跑 inserts=26 updates=0 deletes=0
     == to-sql(--dml insert) INSERT lines=26；Σupdates/Σdeletes=0 即 dml
     过滤器跨通道语义一致钉），同轮回归 [5.5/7] 36==36 不变。
-  - [ ] bench 判定工装（P3/P4）：若要判定 P2 未解析的 −3.2% 代码增量，
+  - [x] ~~bench 判定工装（P3/P4）：若要判定 P2 未解析的 −3.2% 代码增量，
     需 `governor=performance` + `taskset` 钉 8 P 核重做 A/B（~30 分钟）；
     threads 1→8 并行效率 2.5× 的 P1 挂账保留。证据 docs/bench/p2.md
-    「后续动作」节（T9 移入本条统一索引）。
+    「后续动作」节（T9 移入本条统一索引）。~~——**P4b T1/T2/T3 消费（挂账 #1/#2/#7）**：
+    ① 工装 `tools/bench-ab.sh` 落地 + selftest 8 例 + 恒等 A/A 冒烟（`b6844fe`+fix
+    `2c670b9`，governor 只记录/无 sudo 环境事实，taskset 钉 P 核 0-11）；② P2 −3.2%
+    代码增量**复测钉死不显著**（P1 vs P2 N=5，delta +2.812% < thr 0.5714s，不升级
+    N=9，`/tmp/p4b-t1-ab7-r5.log`）；③ threads 并行效率：T2 端到端实测 **2.01×**
+    取代 P1 账本 2.5×（`5b6a363`），T3 mimalloc 收 allocator 膨胀（glibc A/B −26.561%，
+    `281735d`），但 1→8 缩放 post-mimalloc **仍开放**（无热路径结构改动、O2 不显著回滚、
+    X3 registered-only）——见「P4b §0 挂账处置销账表」#1/#2/#7。
 - **P3 T8 新增挂账（repl 收尾登记，均不修、入终审/P4 视野）**：
   - [ ] **stats 失败运行会毁上一份好 JSONL**：`60a9019` 的 drop-on-error
     取 create 即 O_TRUNC + Drop unlink——本次 Err 运行不留半成品，但
@@ -2053,9 +2262,12 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     生产单 run 无碍，测试同进程多 run 注意）；`SHOW BINARY LOGS` 第三列
     8.0 实为 **Encrypted**（恒 None 的 Purged 语义误读已正名，`col_u32`
     非 panic 通道钉死，列面消费保持）。
-  - [ ] **pipeline/mod.rs 已 2600+ 行**：repl 装配块 ~570 逻辑行可迁
+  - [x] ~~**pipeline/mod.rs 已 2600+ 行**：repl 装配块 ~570 逻辑行可迁
     `src/repl/assembly.rs`——plan 钉死调用点在 pipeline/mod.rs 故本批
-    未迁（纯搬运、无行为变更，留 P4 或终审裁决）。
+    未迁（纯搬运、无行为变更，留 P4 或终审裁决）。~~——**P4b T4 消费（`8ff5fe0`，挂账 #5）**：
+    本役即做它——`pipeline/mod.rs` 3473→1540 行 + 新建 `src/repl/assembly.rs` 1949 行
+    （29 项，按引用图划界）；move-only 机械证明（`diff` 逐字节 rc=0）+ 同输入产物逐字节
+    + 350 计数 + bench A/A' Δ+1.2%（详见「P4b §0 挂账处置销账表」#5 与 T4 节点）。
   - [ ] **restart 件的 dup 路径无天然 live 覆盖**：重连续拉实测恒 n==m
     （无重复段），at-least-once 重复合并面仅由合成钉测
     `tests/repl.rs::reconcile_dup_shape_synthetic` 独扛——**终审勿把
@@ -2119,8 +2331,12 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     成立——P4a 各 lane 即碰巧绿）~~——**T5 合流轮接线修复**：run-difftest.sh +
     compat-matrix.sh 改 `"${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"`
     （与 shadow-replay.sh 同口径，判据零变化；T5 回归轮实测暴露后当场修 `edb2148`，
-    见 T5 节点）；`tools/gen-bench-binlog.sh`、`tools/p4a-roundtrip.sh`、
+    见 T5 节点）；~~`tools/gen-bench-binlog.sh`~~、`tools/p4a-roundtrip.sh`、
     `tools/flashback-reconcile.sh` 同款硬编码留同族小账（非回归链路）。
+    **P4b T1 消费 gen-bench 部分（`b6844fe`，挂账 #6）**：`gen-bench-binlog.sh` 已接
+    RSBIN `${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs`（:24 定义/:116 消费，edb2148
+    同口径，`/tmp/p4b-t1-genbench-trace.log` 实证）；p4a-roundtrip.sh / flashback-reconcile.sh
+    仍留同族小账（非回归链路，未触）。
 - [x] ~~P3：repl 模式（另出计划；认证含 caching_sha2）~~——T0–T8 全部
   完成（本表上方「P3 Task 0–7」节点 + 「P3 DoD 对账」节），caching_sha2
   与 native 双认证 spike 钉死、8.4 矩阵经 `SHOW BINARY LOG STATUS` 改口
@@ -2133,9 +2349,14 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   × 双 crc 态 = seedgen 确定性 40 件）；`make shadow-test`（三段 checksum
   等 + 行级 diff 零 + negcheck 验钞机，8.0 spec 原形态、5.7 REF-clone 锚裁定，
   见「P4a 任务节点日志」）。
-- [ ] P4：**musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
+- [x] ~~P4：**musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
   static-pie 可运行；实测崩塌至 ~3.4 MiB/s——musl malloc arena 竞争，
-  候选 mimalloc / glibc-static，证据 docs/bench/p1.md）
+  候选 mimalloc / glibc-static，证据 docs/bench/p1.md）~~——**P4b T3 悬崖消账
+  （`281735d`，挂账 #3）**：接入 mimalloc 全局分配器（现**无条件硬依赖**，无
+  `--no-default-features` 逃生，musl release 含其 C 核并在 musl-gcc 下正常交叉编译）；
+  musl 端到端 threads=8 复测 base **3.3 MiB/s**（≈精确复现 P1 3.4 悬崖）→ mimalloc
+  **64.2 MiB/s**（≥50 门，≈19.2×）→ **悬崖消账**（`/tmp/p4b-t3-musl-{base,tip}.txt`；
+  详见「P4b §0 挂账处置销账表」#3 与 p4b.md ④）。
 - [x] ~~测试债（P2 邻近，终审登记）——矩阵覆盖缺口：① ENUM >255 成员
   （2B packlen 形态仅 `value.rs::enum_set_ordinals_to_uint` 合成单测，
   真机捕获与差分矩阵均无该列）；② GEOMETRY 真机捕获（裁决 7 字节保真
