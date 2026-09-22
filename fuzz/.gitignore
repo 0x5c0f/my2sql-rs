@@ -1,0 +1,2 @@
+# cargo-fuzz 手工运行（未加 -artifact_prefix）时的 crash 产物目录：不入库
+artifacts/

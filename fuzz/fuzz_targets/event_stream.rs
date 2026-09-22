@@ -6,10 +6,12 @@
 //! `parse_table_map`/`decode_rows`；`with_crc` 取首字节选择器（语料两态都跑，
 //! 见 seedgen 的 crc0/crc1 双件）。
 //!
-//! 流级不变量：遇 QUERY(2)/XID_EVENT(15,16)（简报绑定值；15 在 MySQL 官方
-//! 序为 FORMAT_DESC——按简报逐字，两值都喂 Xid 只影响状态机语义分类，不触
-//! 解码器）或 QUERY 文本为 BEGIN 的语义体，构造 `RawEvent` 喂
+//! 流级不变量：遇 QUERY(2)/XID(16)/GTID(33,34) 语义体构造 `RawEvent` 喂
 //! `TrxStateMachine::feed`，断言 `trx_id` 不回退（assert 触发即 crash 报告）。
+//! 事件号以本 crate 权威表 `src/binlog/event.rs::EventType` 为准（简报把 XID
+//! 记作「15,16」，15 实为 FORMAT_DESC——评审修复轮 1 勘正，见下事件路由 match）。
+//! FORMAT_DESC(15) 不当 Xid 喂：误分类会让状态机在流首凭空 Commit，掩盖
+//! 「Query(BEGIN) → Rows → Xid」真实序的观测。
 //!
 //! 表→schema 映射默认 = 2×INT 合成（同靶 1，禁 panic：`decode_rows` 对
 //! schema 越位列走 `cols.get(i).unwrap_or(dropped)`，无索引 panic 面）。
@@ -47,18 +49,22 @@ fn synth_schema(tm: &TableMapEvent) -> TableSchema {
     }
 }
 
-/// QUERY 事件体（已剥 19B 头与 CRC）取 SQL 文本：
-/// `[4 thread_id][4 exec_time][1 db_len][2 err_code][2 sv_len][sv..][db\0][sql..]`。
+/// QUERY 事件体（已剥 19B 头与 CRC）取 SQL 文本，口径与 crate 的
+/// `FileReader::query_text`（`src/binlog/file_reader.rs:179-196`）逐字段对齐：
+/// `[4 thread_id][4 exec_time][1 schema_len][2 err_code][2 sv_len][sv..][schema\0][sql..]`
+/// → sql 起点 = `13 + sv_len + schema_len + 1`。
 /// 畸形 → 空串（状态机对 "" 为 Process no-op），全程无 panic。
 fn query_text(body: &[u8]) -> String {
-    let Some(&db_len) = body.get(8) else {
+    let Some(&schema_len) = body.get(8) else {
         return String::new();
     };
-    let Some(sv) = body.get(9..11) else {
+    // sv_len 在 11..13（13 前是 err_code 9..11——读错字段会让 SQL 起点整体
+    // 位移，Begin/Commit 关键字恒不命中，状态机面形同未跑）。
+    let Some(sv) = body.get(11..13) else {
         return String::new();
     };
     let sv_len = u16::from_le_bytes([sv[0], sv[1]]) as usize;
-    let start = 13usize + sv_len + db_len as usize + 1;
+    let start = 13usize + sv_len + schema_len as usize + 1;
     match body.get(start..) {
         Some(rest) => String::from_utf8_lossy(rest).into_owned(),
         None => String::new(),
@@ -102,11 +108,14 @@ fuzz_target!(|data: &[u8]| {
                     let _ = decode_rows(&body, t, &synth_schema(t), kind, v2);
                 }
             }
-            2 | 15 | 16 => {
-                let kind = if h.event_type.0 == 2 {
-                    RawKind::Query(query_text(&body))
-                } else {
-                    RawKind::Xid
+            // 语义事件喂状态机：QUERY=2 / XID=16 / GTID=33,34（crate 权威常量
+            // EventType::QUERY / XID / GTID_LOG / ANONYMOUS_GTID_LOG）。
+            // 15=FORMAT_DESC 不喂（误当 Xid 会在流首凭空 Commit）。
+            2 | 16 | 33 | 34 => {
+                let kind = match h.event_type.0 {
+                    2 => RawKind::Query(query_text(&body)),
+                    16 => RawKind::Xid,
+                    _ => RawKind::Gtid,
                 };
                 let raw = RawEvent {
                     binlog: "fuzz".into(),

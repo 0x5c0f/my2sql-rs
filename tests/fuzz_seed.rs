@@ -21,8 +21,12 @@
 //! `parse_table_map`/`read_lns`/`decode_optional_meta` 三处 usize
 //! 加溢出 panic（修复前；P4a 解码器开闸红钉）。
 //!
-//! 用途注记：**这些文件是 P4 正式 fuzz（cargo-fuzz/libfuzzer）的起始语料
-//! 种子**（spec §挂账 P4）。P4 接入时直接以 tests/fuzz_seed/ 为 corpus 目录；
+//! 用途注记：P4a T1 已把 cargo-fuzz 正式接入（`fuzz/`）。语料**单源**=本文件
+//! 的 builder：`cargo run --manifest-path fuzz/Cargo.toml --bin seedgen --
+//! fuzz/corpus/<t>` 以 `#[path]` 复用这里的 `seed_*`/`event_bytes`/`tm_body`
+//! /`rows_head` 产出确定性起始语料入库（禁随机入仓）；`tools/fuzz-min.sh` 跑
+//! 的是 `out/fuzz/<t>/corpus/` 副本，本文件的 `tests/fuzz_seed/*.bin` 与
+//! `fuzz/corpus/` 都只读、不被 libfuzzer 写回。
 //! 本测试即语料的回归闸——任何让种子变为 panic / Ok 的解码层改动都在这里红。
 //!
 //! 重生成（builder 调整后钉文件）：`FUZZ_SEED_REGEN=1 cargo test --test fuzz_seed`
