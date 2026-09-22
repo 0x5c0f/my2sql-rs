@@ -2629,10 +2629,10 @@ fn idle_heartbeat_case(ver: &str, slug: &str, db: &str, sidbase: u32) {
         }
         _ => {
             if ver == "5.6" {
-                // brief 冻结的 fallback 注记（5.6 面逐字口径）：
+                // 5.6 面注记（T5 合流裁定：以实测真相替换 brief 冻结的 fallback 措辞）：
                 println!(
-                    "[idle-hb:{ver}] server={server_v} 5.6 面：心跳周期纯客户端 \
-                     COM_BINLOG_DUMP 载荷，SET 通道不存在（SHOW GLOBAL VARIABLES \
+                    "[idle-hb:{ver}] server={server_v} 5.6 面：SHOW 变量面为空；心跳周期 \
+                     实走会话级 SET @master_heartbeat_period 载荷（SHOW GLOBAL VARIABLES \
                      LIKE 'binlog_heartbeat%' 探测: {:?}）",
                     hbprobe.map(|o| o.trim().to_string())
                 );

@@ -57,6 +57,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"; VER="${1:-8.0}"
+# T5 合流加固（输入面先闸）：VER ∈ {5.6,5.7,8.0,8.4} 白名单在**任何 rm -rf /
+# OUT 路径插值之前**校验；不支持的版本直接 exit 2 报错退出，不让任意输入驱动
+# 破坏性清理或拼接路径（lib 的 p3e2e_container_start 同款白名单是其后的第二道）。
+case "$VER" in
+  5.6|5.7|8.0|8.4) ;;
+  *) echo "shadow-replay: unsupported VER '$VER' (allowed: 5.6|5.7|8.0|8.4)" >&2; exit 2 ;;
+esac
 BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 source tools/repl-e2e-lib.sh
 
