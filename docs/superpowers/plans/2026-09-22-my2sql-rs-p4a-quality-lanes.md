@@ -22,7 +22,7 @@
 
 ---
 
-### Task T1 (Lane A): cargo-fuzz 正式接入 — fuzz/ 独立 workspace + 两靶 + tools/fuzz-min.sh
+### Task 1 (Lane A): cargo-fuzz 正式接入 — fuzz/ 独立 workspace + 两靶 + tools/fuzz-min.sh
 
 **Files:**
 - Create: `fuzz/Cargo.toml`, `fuzz/fuzz_targets/decode_event.rs`, `fuzz/fuzz_targets/event_stream.rs`, `fuzz/src/bin/seedgen.rs`, `tools/fuzz-min.sh`
@@ -160,7 +160,7 @@ git add -A fuzz Cargo.toml tests/fuzz_seed.rs tools/fuzz-min.sh
 git commit -m "feat(p4a-fuzz): cargo-fuzz hookup — fuzz/ workspace, decode_event + event_stream targets, deterministic corpus, tools/fuzz-min.sh 300s gate"
 ```
 
-### Task T2 (Lane B): tools/shadow-replay.sh — 影子库三段闸
+### Task 2 (Lane B): tools/shadow-replay.sh — 影子库三段闸
 
 **Files:**
 - Create: `tools/shadow-replay.sh`
@@ -223,7 +223,7 @@ bash tools/shadow-replay.sh 5.7 2>&1 | tee out/shadow-replay-5.7.log
 cargo build --quiet && cargo test && git add tools/shadow-replay.sh && git commit -m "test(p4a-shadow): shadow-replay three-way gate — forward to-sql==master-after, reverse flashback==master-before, roundtrip self-consistency + negcheck self-test"
 ```
 
-### Task T3 (Lane C): run-difftest P4A 表组 — ENUM>255 / GEOMETRY / LONGBLOB>64K 真机捕获
+### Task 3 (Lane C): run-difftest P4A 表组 — ENUM>255 / GEOMETRY / LONGBLOB>64K 真机捕获
 
 **Files:**
 - Create: `tools/gen-data-p4a.sql`, `tools/p4a-roundtrip.sh`
@@ -299,7 +299,7 @@ git commit -m "test(p4a-cols): difftest P4A table-group — ENUM>255 2B packlen 
 ```
 （FINDINGS.md 若 `.gitignore` 挡 out/ → 复制入 `docs/p4a-findings.md` 提交，T5 引用。）
 
-### Task T4 (Lane D): 5.7/5.6 idle 窗心跳帧形 live 件
+### Task 4 (Lane D): 5.7/5.6 idle 窗心跳帧形 live 件
 
 **Files:**
 - Modify: `tests/repl.rs`（`Bt::new_pinned` 版本参数化 + 两新件）, `tools/repl-e2e-lib.sh`（**仅加性**）
@@ -340,7 +340,7 @@ git add tests/repl.rs tools/repl-e2e-lib.sh
 git commit -m "test(p4a-idle): 5.6/5.7 idle-window heartbeat live cases (Bt version-param, additive lib contract)"
 ```
 
-### Task T5 (Merge lane, 串行): Makefile/README/HANDOVER 收口 + 全量回归
+### Task 5 (Merge lane, 串行): Makefile/README/HANDOVER 收口 + 全量回归
 
 **Files:**
 - Modify: `Makefile`, `README.md`, `docs/HANDOVER.md`（T5 独占写权）
