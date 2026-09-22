@@ -32,3 +32,8 @@ harness = false
 [dev-dependencies]
 criterion = "0.8.2"
 proptest = "1.11.0"
+
+# P4a Lane A：fuzz/ 为独立 cargo-fuzz workspace（根构建/三门/矩阵零感知）。
+[workspace]
+members = ["."]
+exclude = ["fuzz"]

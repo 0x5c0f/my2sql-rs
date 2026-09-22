@@ -1,7 +1,7 @@
 //! Task 16 / DoD-4：畸形 binlog 事件语料（fuzz seed）→ 解码层必须返回
 //! `Err` 且**绝不 panic**。
 //!
-//! 四个种子文件落在 `tests/fuzz_seed/*.bin`，由本文件的 `builders` 从
+//! 种子文件落在 `tests/fuzz_seed/*.bin`，由本文件的 `builders` 从
 //! `tests/fixtures/events.rs` 的合法事件头常量 + 合法事件体构造器
 //! （e2e.rs Synth 同款布局）对字节流施加畸形而来：
 //!   1. `table_map_truncated_meta.bin` —— TABLE_MAP 在 metadata 段中途截断
@@ -14,6 +14,12 @@
 //!   4. `decimal_full_group_overflow.bin` —— WRITE_ROWS_V2 的 DECIMAL(19,9)
 //!      列携带终审 #1 repro 字节 `81 00 00 00 01 FF FF FF FF`（小数满组
 //!      XOR 还原为 10 位 u32，`9 − 10` 下溢点，修复前 debug/release 双 panic）。
+//!
+//! 种子 5–7（`tm_*_overflow.bin`）—— P4a T1 cargo-fuzz 首轮真发现（两靶各
+//! 1 枚 crash，tmin 后等价精简构造）：TABLE_MAP 的 n_cols / metadata 总长 /
+//! optional-metadata TLV payload 长走 0xFE 8B LNE = u64::MAX，
+//! `parse_table_map`/`read_lns`/`decode_optional_meta` 三处 usize
+//! 加溢出 panic（修复前；P4a 解码器开闸红钉）。
 //!
 //! 用途注记：**这些文件是 P4 正式 fuzz（cargo-fuzz/libfuzzer）的起始语料
 //! 种子**（spec §挂账 P4）。P4 接入时直接以 tests/fuzz_seed/ 为 corpus 目录；
@@ -41,7 +47,7 @@ const WRITE_ROWS_V2_TYPE: u8 = 30;
 /// 19B 公共头：以 fixtures 的**合法** `known_header_bytes()` 为底（TABLE_MAP、
 /// size=100），原位覆写 type/event_size 成为合法新头；log_pos 保留 fixture 常量
 /// （解码层不校验 log_pos 自洽性）。
-fn event_bytes(evtype: u8, body: &[u8]) -> Vec<u8> {
+pub fn event_bytes(evtype: u8, body: &[u8]) -> Vec<u8> {
     let size = (fixtures::EVENT_HEADER_SIZE + body.len()) as u32;
     let mut b = fixtures::known_header_bytes();
     b[4] = evtype;
@@ -52,7 +58,7 @@ fn event_bytes(evtype: u8, body: &[u8]) -> Vec<u8> {
 
 /// TABLE_MAP 事件体（对照 e2e.rs Synth::table_map 的合法布局）。
 /// `types`/`meta_len_declared` 分离声明，支持制造「声明与实给不符」畸形。
-fn tm_body(
+pub fn tm_body(
     tid: u64,
     db: &str,
     tb: &str,
@@ -79,7 +85,7 @@ fn tm_body(
 }
 
 /// WRITE_ROWS_V2 事件体头段：tid + flags + extra_info_len(=2 自含) + n_cols + bm1。
-fn rows_head(tid: u64, n_cols: usize, present_bitmap: &[u8]) -> Vec<u8> {
+pub fn rows_head(tid: u64, n_cols: usize, present_bitmap: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&tid.to_le_bytes()[..6]);
     b.extend_from_slice(&0u16.to_le_bytes()); // flags
@@ -91,7 +97,7 @@ fn rows_head(tid: u64, n_cols: usize, present_bitmap: &[u8]) -> Vec<u8> {
 
 /// JSON 二进制深度炸弹：镜像 `src/binlog/json.rs` 测试 `depth_limit::wrap`
 /// 的合法小数组逐层包装（count=1、size 自洽），depth 层 > MAX_DEPTH。
-fn jsonb_wrapped(depth: usize) -> Vec<u8> {
+pub fn jsonb_wrapped(depth: usize) -> Vec<u8> {
     const SMALL_ARRAY: u8 = 0x02;
     const LITERAL: u8 = 0x04;
     // 最内层：[count=1][size=8][entry: type=04 offset=00 00 → inline null] + 1B 填充
@@ -114,7 +120,7 @@ fn jsonb_wrapped(depth: usize) -> Vec<u8> {
 // ---------- 四个种子：合法事件流 + 一处畸形 ----------
 
 /// 种子 1：TABLE_MAP 在 metadata 中途截断（声明 4B、实给 2B、无 null_bits）。
-fn seed_table_map_truncated_meta() -> Vec<u8> {
+pub fn seed_table_map_truncated_meta() -> Vec<u8> {
     let body = tm_body(
         7,
         "fz",
@@ -128,7 +134,7 @@ fn seed_table_map_truncated_meta() -> Vec<u8> {
 }
 
 /// 种子 2：合法 TABLE_MAP（2×INT）+ WRITE_ROWS_V2 位图全 0 + 非空行区。
-fn seed_rows_cols_present_zero() -> Vec<u8> {
+pub fn seed_rows_cols_present_zero() -> Vec<u8> {
     let tm = tm_body(7, "fz", "t_zero_bm", &[0x03, 0x03], 0, &[], &[0x00]);
     let mut rows = rows_head(7, 2, &[0x00]); // present==0（活锁形态）
     rows.extend_from_slice(&[0x00, 0x01, 0x02, 0x03, 0x04]); // 行区刻意非空
@@ -139,7 +145,7 @@ fn seed_rows_cols_present_zero() -> Vec<u8> {
 
 /// 种子 3：合法 TABLE_MAP（1×JSON，meta=4 前缀宽）+ WRITE_ROWS_V2 载 151 层
 /// 嵌套数组（json.rs MAX_DEPTH=100 拒绝；各层 size 自洽，先撞的是深度闸口）。
-fn seed_json_depth_bomb() -> Vec<u8> {
+pub fn seed_json_depth_bomb() -> Vec<u8> {
     let tm = tm_body(7, "fz", "t_json_bomb", &[0xF5], 1, &[0x04], &[0x00]);
     let payload = jsonb_wrapped(150);
     let mut rows = rows_head(7, 1, &[0x01]); // present = 列 0
@@ -154,7 +160,7 @@ fn seed_json_depth_bomb() -> Vec<u8> {
 /// 种子 4：合法 TABLE_MAP（1×NEWDECIMAL(19,9)，meta=2B [19,9]）+ WRITE_ROWS_V2
 /// 载终审 #1 repro 字节——小数满组 0xFFFFFFFF 还原为 10 位值，`9 − t.len()`
 /// 下溢（修复前 debug subtract-overflow / release repeat-capacity 双 panic）。
-fn seed_decimal_full_group_overflow() -> Vec<u8> {
+pub fn seed_decimal_full_group_overflow() -> Vec<u8> {
     let tm = tm_body(7, "fz", "t_dec_bomb", &[0xF6], 2, &[19, 9], &[0x00]);
     let mut rows = rows_head(7, 1, &[0x01]); // present = 列 0
     rows.push(0x00); // 行 null 区（1 列 → 1B，非 NULL）
@@ -162,6 +168,57 @@ fn seed_decimal_full_group_overflow() -> Vec<u8> {
     let mut out = event_bytes(TABLE_MAP_TYPE, &tm);
     out.extend_from_slice(&event_bytes(WRITE_ROWS_V2_TYPE, &rows));
     out
+}
+
+// ---------- P4a T1 fuzz 首轮真发现（300s 前 smoke 20s×2 靶，2 crash → tmin/精简） ----------
+
+/// 种子 5（decode_event crash-e69d68…，tmin 51B 同型精简）：TABLE_MAP 的
+/// n_cols 走 0xFE 8B LNE = u64::MAX → `parse_table_map` 中 `pos + n_cols`
+/// usize 加溢出（fuzz/debug profile panic；release 回绕成错误切片）。
+pub fn seed_tm_ncols_overflow() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&7u64.to_le_bytes()[..6]);
+    b.extend_from_slice(&0u16.to_le_bytes()); // flags
+    b.push(2);
+    b.extend_from_slice(b"fz");
+    b.push(0);
+    b.push(7);
+    b.extend_from_slice(b"t_bignc");
+    b.push(0);
+    b.push(0xFE); // n_cols LNE = 8B 前缀
+    b.extend_from_slice(&u64::MAX.to_le_bytes()); // n_cols = u64::MAX
+    event_bytes(TABLE_MAP_TYPE, &b)
+}
+
+/// 种子 6（同源路径，read_lns 面）：TABLE_MAP metadata 总长 LNE 走
+/// 0xFE 8B = u64::MAX → `proto::read_lns` 中 `*pos + len` 加溢出 panic。
+pub fn seed_tm_meta_len_overflow() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&7u64.to_le_bytes()[..6]);
+    b.extend_from_slice(&0u16.to_le_bytes()); // flags
+    b.push(2);
+    b.extend_from_slice(b"fz");
+    b.push(0);
+    b.push(8);
+    b.extend_from_slice(b"t_bigmeta");
+    b.push(0);
+    b.push(2); // n_cols = 2
+    b.extend_from_slice(&[0x03, 0x03]); // 2×INT
+    b.push(0xFE); // metadata 总长 LNE = 8B 前缀
+    b.extend_from_slice(&u64::MAX.to_le_bytes()); // 声明总长 = u64::MAX
+    event_bytes(TABLE_MAP_TYPE, &b)
+}
+
+/// 种子 7（event_stream crash-40729c…，tmin 562B 的等价精简构造）：
+/// 8.0 optional-metadata TLV 的 payload 长走 0xFE 8B = u64::MAX →
+/// `decode_optional_meta` 中 `pos + l` 加溢出 panic（tmin 原件 JSON 炸弹
+/// 尾部只是到达同一 TLV 长度读的载体，精简为最小 tm + TLV 头）。
+pub fn seed_tm_tlv_len_overflow() -> Vec<u8> {
+    let mut body = tm_body(7, "fz", "t_bigtlv", &[0x03, 0x03], 0, &[], &[0x00]);
+    body.push(0x01); // TLV type #1 signedness（≠255 且 total+1≠len → 非 legacy，入 TLV 流）
+    body.push(0xFE); // payload 长 LNE = 8B 前缀
+    body.extend_from_slice(&u64::MAX.to_le_bytes()); // l = u64::MAX → pos + l 溢出
+    event_bytes(TABLE_MAP_TYPE, &body)
 }
 
 // ---------- 解码层走读：任一事件出错即整体 Err ----------
@@ -244,6 +301,9 @@ const SEEDS: &[(&str, SeedBuilder)] = &[
         "decimal_full_group_overflow.bin",
         seed_decimal_full_group_overflow,
     ),
+    ("tm_ncols_overflow.bin", seed_tm_ncols_overflow),
+    ("tm_meta_len_overflow.bin", seed_tm_meta_len_overflow),
+    ("tm_tlv_len_overflow.bin", seed_tm_tlv_len_overflow),
 ];
 
 #[test]
@@ -272,7 +332,11 @@ fn fuzz_seeds_return_err_and_never_panic() {
             }
         }
     }
-    assert_eq!(checked, 4, "四个种子全部检查");
+    assert_eq!(
+        checked,
+        SEEDS.len(),
+        "全部种子检查（种子 1–4 + P4a T1 溢出件 5–7）"
+    );
 }
 
 /// 非默认路径：`FUZZ_SEED_REGEN=1 cargo test --test fuzz_seed` 重生成磁盘种子。

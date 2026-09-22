@@ -1,0 +1,34 @@
+[package]
+name = "fuzz-targets"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# cargo-fuzz 0.13 清单识别闸（实测要求，见 Task 1 报告）
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "decode_event"
+path = "fuzz_targets/decode_event.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "event_stream"
+path = "fuzz_targets/event_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "seedgen"
+path = "src/bin/seedgen.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+my2sql-rs = { path = ".." }
+
+[workspace]
+members = ["."]

@@ -54,8 +54,12 @@ pub fn read_lne(buf: &[u8], pos: &mut usize) -> Result<u64, BinlogError> {
 /// 对应 go-mysql `LengthEncodedString`。
 pub fn read_lns<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], BinlogError> {
     let len = read_lne(buf, pos)? as usize;
-    let s = buf.get(*pos..*pos + len).ok_or(BinlogError::TooShort)?;
-    *pos += len;
+    // P4a T1 fuzz 红钉（种子 tm_meta_len_overflow）：0xFE 8B 前缀可声明
+    // len = u64::MAX，`*pos + len` usize 加溢出 panic——溢出 ⇒ 切片必然
+    // 越界，同 TooShort（go-mysql 侧等价的越界读在其运行时是 err）。
+    let end = pos.checked_add(len).ok_or(BinlogError::TooShort)?;
+    let s = buf.get(*pos..end).ok_or(BinlogError::TooShort)?;
+    *pos = end;
     Ok(s)
 }
 
