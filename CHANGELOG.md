@@ -13,7 +13,8 @@
   §3 D1；`Cargo.toml` version 单源，spec §3 D2）
 - CI 门禁上线：ci.yml 门 = fmt / clippy `-D warnings`（--all-targets）/
   `cargo test --no-fail-fast`（live 件 `#[ignore]` 自然跳过）/ musl release
-  编译门（只编译不运行）/ fuzz 靶编译门（runner 无 nightly 则如实降级为不门）
+  编译门（只编译不运行）/ fuzz 靶编译门（`continue-on-error` 恒非阻断：
+  cargo-fuzz 面需 nightly，stable 下失败不红）
   （出处 同上 spec §3 D3）。**有界决定**：difftest / compat / repl-test（live）/
   fuzz（真跑）/ shadow 全部**不进 CI**——本地六闸体系为权威门禁，
   「CI 绿 ≠ 六闸绿」，六闸逐字台账见 docs/HANDOVER.md「P4b 任务节点日志」T5

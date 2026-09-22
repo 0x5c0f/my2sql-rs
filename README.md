@@ -56,6 +56,9 @@ P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
 
 自构建：`cargo build --release`（glibc）；
 `cargo build --release --target x86_64-unknown-linux-musl`（需 musl-gcc）。
+注意：`repl --uri` 不提供 TLS（差异 26）；发布面 CI 门禁为
+fmt/clippy/test/musl 编译四门，difftest/compat/repl-test/fuzz/shadow 属本地
+六闸体系（「CI 绿 ≠ 六闸绿」，spec D3）。
 
 ## 快速上手
 

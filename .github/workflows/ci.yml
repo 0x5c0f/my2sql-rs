@@ -14,10 +14,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure musl target + linker
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-          rustup target add x86_64-unknown-linux-musl || true
+      # P5 终审 MAJ-1：toolchain 钉定 = 本机证据跑同款 1.96.0（防 runner
+      # 默认 stable 漂移把 clippy/fmt 搞红，而消红唯一出路是碰 src/——
+      # spec §1 硬边界零豁免，死锁）。
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy,rustfmt
+      - name: Ensure musl linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: fmt
         run: cargo fmt --check
       - name: clippy
@@ -26,6 +31,6 @@ jobs:
         run: cargo test --no-fail-fast
       - name: musl release build gate
         run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: fuzz workspace check（nightly-only，非阻断）
+      - name: fuzz workspace check（非阻断：cargo-fuzz 面需 nightly，stable 下失败不红）
         continue-on-error: true
         run: cargo check --manifest-path fuzz/Cargo.toml
