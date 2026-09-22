@@ -1,0 +1,53 @@
+# P5-T3（spec D5，R3 定稿形）：tag v* push → 本机收口链（T4）已先以
+# `gh release create --draft` 建好 v<ver> draft Release；本 workflow 构建
+# 双目标产物并 `gh release upload` 挂入；T4 回验后 undraft。
+# （为何 draft 先行而非 workflow 自建 Release：私有仓 + 控制器需在
+#  undraft 前有本机回验位——最小步骤可取原则，spec D5。）
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # C1：suffix = 完整 triple，使 cp 与 upload glob（均引 matrix.suffix）随动，
+          # 云端资产名逐字 = spec D4 模板 my2sql-rs-<ver>-x86_64-unknown-linux-{gnu,musl}，
+          # 与本机 release-build.sh 产物名同形（原 gnu/musl 短后缀偏离 D4，已修）。
+          - target: x86_64-unknown-linux-gnu
+            suffix: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            suffix: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - name: build
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          # 版本提取与 tools/release-build.sh 同源同法（控制器裁定 1 定稿：jq；
+          # ubuntu-latest 预装 jq）。workflow 内无版本字面量（spec D2）。
+          VER=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          [ -n "$VER" ] && [ "$VER" != null ]
+          cp "target/${{ matrix.target }}/release/my2sql-rs" \
+             "my2sql-rs-${VER}-${{ matrix.suffix }}"
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "my2sql-rs-"*-${{ matrix.suffix }} --clobber
+  sha:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release download "$GITHUB_REF_NAME" -p 'my2sql-rs-*' -D /tmp/rel
+          ( cd /tmp/rel && sha256sum my2sql-rs-* > SHA256SUMS )
+          gh release upload "$GITHUB_REF_NAME" /tmp/rel/SHA256SUMS --clobber

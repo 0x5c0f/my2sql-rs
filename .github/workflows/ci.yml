@@ -1,0 +1,36 @@
+# my2sql-rs CI 门禁（P5，spec §3 D3 有界决定）：
+#   门 = fmt --check / clippy -D warnings（--all-targets）/ cargo test
+#        --no-fail-fast（live/ignored 件自然跳过）/ musl release 编译门。
+#   不进 CI（逐字沿 spec D3，本地六闸体系为权威门禁，「CI 绿 ≠ 六闸绿」）：
+#   make difftest / compat / repl-test / fuzz-min 真跑 / shadow-test ——
+#   需 docker 多版本 MySQL + Go 裁判 + 长 live 时窗，CI 不承载。
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # P5 终审 MAJ-1：toolchain 钉定 = 本机证据跑同款 1.96.0（防 runner
+      # 默认 stable 漂移把 clippy/fmt 搞红，而消红唯一出路是碰 src/——
+      # spec §1 硬边界零豁免，死锁）。
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy,rustfmt
+      - name: Ensure musl linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --no-fail-fast
+      - name: musl release build gate
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: fuzz workspace check（非阻断：cargo-fuzz 面需 nightly，stable 下失败不红）
+        continue-on-error: true
+        run: cargo check --manifest-path fuzz/Cargo.toml

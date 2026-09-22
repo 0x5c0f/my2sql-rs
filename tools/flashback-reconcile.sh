@@ -28,6 +28,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# P5-T1（沿 edb2148/b6844fe 接线口径，同 p4a-roundtrip.sh:16-18）：debug 二进制
+# 路径随 CARGO_TARGET_DIR 解析（并行 lane 各自独立 target 目录，spec §6），与
+# run-difftest.sh 的 RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs" 同口径。
+RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 NAME=my2sql-t6-recon
 VER=8.0
 OUT="$ROOT/out/flashback-reconcile"
@@ -125,7 +129,7 @@ EOF
 
 echo "== [5/6] flashback (offline schema, default on-error=stop)"
 cargo build --quiet
-./target/debug/my2sql-rs flashback \
+"$RSBIN" flashback \
   --binlog-dir "$BINLOG_DIR" --start-file "$BIN" --start-pos "$START_POS" \
   --schema-file "$OUT/schema.json" --output-dir "$OUT/flashback" \
   --time-zone +00:00 --threads 4 2>&1 | tee "$OUT/flashback.log"

@@ -24,25 +24,32 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 
 ## 当前进度
 
-- **当前分支：`worktree-feat-p4b`（base `main@aba8293` = v0.4.0-p4a；
-  P4b 计划 = `docs/superpowers/plans/2026-09-22-my2sql-rs-p4b-performance.md`，
+- **当前分支：`worktree-feat-p5`（base `main@389385b` = v0.4.1-p4b；
+  P5 计划 = `docs/superpowers/plans/2026-09-22-my2sql-rs-p5-release.md`，
+  spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p5-release-design.md`；
+  SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p5-release/`）
+- **P5「发布面」计划 4 任务（T1 版本+CI / T2 文档 / T3 发布工件 并行 →
+  T4 合流收口+远端链）进行中**：T1–T3 合入 + 全分支终审 PASS + 终审修正轮
+  （`7bfa6cf`/`495d194`/`1b4335c`+fix `ad2a640`/终审 pre-fix `b1b5750`）；
+  T4 六闸回归亲跑中（逐字数字待补本节「P5 任务节点日志」）。
+  交付面：包版本 0.1.0→**0.5.0**（tag `v0.5.0` 起无战役后缀）；
+  `.github/workflows/ci.yml`（fmt/clippy/test/musl 编译门 + toolchain 钉
+  1.96.0，D3 有界决定）；CHANGELOG.md 新建（五轮里程碑全带出处）；README
+  终审（状态行/安装与发布节/虚账排查 24 条，含 upstream 死链 ultradb→liuhr
+  修正）；`tools/release-build.sh` + `release.yml`（R3 draft 链，D4 全
+  triple 产物名）；`flashback-reconcile.sh` RSBIN 接线（同族小账销账）。
+- 前史（P4b）：**「性能面」5 任务全部完成 + 全分支终审收口，已合入 main
+  （`389385b`，tag `v0.4.1-p4b`）**——终态速记：`tools/bench-ab.sh` 工装；
+  mimalloc（glibc A/B 显著快 26.561% + musl 悬崖 3.3→64.2 MiB/s 消账）；
+  `src/repl/assembly.rs` 搬运；`docs/bench/p4b.md` 权威基线 threads=8 median
+  **127.59 MiB/s**（vs 103.85 +22.86% GREEN）；挂账 #7 钉死不显著
+  （+2.812%＝0.1897s < thr 0.5714s）；合流亲跑 350/0/14
+  （`/tmp/p4b-close-test-full.log`）。§0 七条挂账全部销账/书面处置见
+  「P4b DoD 对账」「P4b §0 挂账处置销账表」两节。分支 `worktree-feat-p4b`
+  （base `main@aba8293` = v0.4.0-p4a；P4b 计划 =
+  `docs/superpowers/plans/2026-09-22-my2sql-rs-p4b-performance.md`，
   spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p4b-performance-design.md`；
-  SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p4b-performance/`）
-- **P4b「性能面」计划 5 任务（T1 工装 / T2 profile / T4 搬运 并行 → T3 优化 →
-  T5 合流）全部完成，全分支终审 + 单修复轮收口**
-  （终审 6 job 全 PASS、仅文档面 findings F1–F5 → `debbe2e` 修正 + scoped 复评
-  APPROVE；合流亲跑 = tip `debbe2e` `cargo test --no-fail-fast` rc=0
-  **350 passed / 0 failed / 14 ignored**，逐字 `/tmp/p4b-close-test-full.log`）：
-  `tools/bench-ab.sh` A/B 判定工装（median+MAD，selftest 8 例
-  + 恒等 A/A 冒烟）；`docs/bench/p4b-profile.md` profile 普查（threads 曲线 +
-  假设判定 + 排序表）；mimalloc 全局分配器（glibc A/B 显著快 26.561% + musl 悬崖
-  3.3→64.2 MiB/s 消账）；`src/repl/assembly.rs` 装配块纯搬运（move-only + 逐字节 +
-  350 计数）；T5 落 `make bench-ab`/`make bench-profile` + `docs/bench/p4b.md`
-  新权威基线（threads=8 median **127.59 MiB/s**，回归闸 vs 103.85 **+22.86% 更快
-  GREEN**）+ 挂账 #7 P1→P2 复测**钉死不显著**（+2.812%＝0.1897s < thr 0.5714s，N=5 不升级）+
-  全量回归六闸逐字台账。§0 七条挂账全部销账/书面处置（见「P4b DoD 对账」与
-  挂账清单 P4b 消费注）。**收口 pending = controller 的 merge/tag/push（本轮
-  T5 lane 不并入 main、不打 tag、不 push）**。
+  SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p4b-performance/`）。
 - 分支（P4a 史）：`worktree-feat-p4a`（base `main@2149ce1`（= P3 终审后合入态
   `v0.3.0-p3`）；P4a 计划 =
   `docs/superpowers/plans/2026-09-22-my2sql-rs-p4a-quality-lanes.md`，
@@ -2146,6 +2153,95 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
   后续挂账视野：X3 归因实验、X1/X2 追加实验、threads 1→8 结构效率（2.01× 实测
   在册，p4b.md 免责#3）、`--no-keep-trx` 结构守卫面（P4a 遗留，与本役无关）。
 
+## P5 任务节点日志（T1–T4）
+
+> P5 计划 = `docs/superpowers/plans/2026-09-22-my2sql-rs-p5-release.md`；
+> spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p5-release-design.md`；
+> SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p5-release/progress.md`；
+> lane 简报/报告/评审包同目录。
+
+### P5 T1（Lane V）：版本真身 + CI 门禁面（commit `7bfa6cf`）
+
+- 交付：`Cargo.toml` 0.1.0→**0.5.0**（+根 `Cargo.lock`/`fuzz/Cargo.lock` 各
+  仅根包版本一行，机械同步经评审复验）；`.github/workflows/ci.yml`（门 =
+  fmt/clippy `-D warnings`/`cargo test --no-fail-fast`/musl release 编译门 +
+  fuzz 靶非阻断编译门；头注逐字转述 D3「不进 CI」清单）；
+  `tools/flashback-reconcile.sh` RSBIN 接线（edb2148/b6844fe 同口径，
+  同族小账销账——勘察修正：`p4a-roundtrip.sh` 已被 FIX E 接线，不在面内）；
+  `.gitignore` +`.qoder/`。
+- 证据：`--version` 逐字 `my2sql-rs 0.5.0`；三门镜像 + musl 编译 + fuzz check
+  rc=0（`/tmp/p5-t1-*.log`）；`make difftest` 全 7 步绿（21/21 aligned、
+  replay-byte-identical）= 版本行零语义影响首证。
+- 评审：APPROVE（零 Critical；Minor 3 条登记——头注转述形/`rustup||true`
+  兜底/difftest 背书归 T4）。fuzz lock 入 commit 裁定 = 成立（path-dep
+  强制重写，不入则共享树常脏）。
+
+### P5 T2（Lane D）：CHANGELOG + README 终审（commit `495d194`）
+
+- 交付：`CHANGELOG.md` 新建（v0.5.0 进行时措辞 + 五轮里程碑倒序，全部数字
+  带出处）；README 状态行重写（P1–P4b 收官 + P5 发布面）、「安装与发布」节
+  （D4 产物名 + sha256 校验 + 自构建）、文档节指针。
+- 虚账排查 24 条入报告；**实质修正三处**：① upstream 死链
+  `github.com/ultradb/my2sql`（P1 起无账虚指，实测 404）→ `liuhr/my2sql`
+  （reference clone remote 逐字 + HTTP 200 双证，评审独立复验成立）；
+  ② repl-test 改引 P4b T5 最新账 13/0 @815.30s（含 2 filtered out 全形）；
+  ③ P1 基线 103.9→103.85 改引 p4b.md 权威口径。
+- 评审：APPROVE（数字溯源抽查 12/12 逐字命中；Minor：CHANGELOG 两处计数
+  省 ignored 全形——裁定「源账为准不改档」；README stats 样例中段值与
+  binlog_status 行同源无逐字账——T4 注记「值随运行漂移」，不复采）。
+
+### P5 T3（Lane R）：发布工件面（commit `1b4335c` + fix `ad2a640`）
+
+- 交付：`tools/release-build.sh`（双目标本机构建：版本单源
+  `cargo metadata | jq`（sed 侥幸形弃用）、每 target 独立 CARGO_TARGET_DIR、
+  D4 全 triple 产物名 + `SHA256SUMS` glob 收口）+ `.github/workflows/`
+  `release.yml`（R3 draft 链：tag `v*` → matrix 双 target 构建 →
+  `gh release upload --clobber` → sha job 汇总；零版本字面量 grep 双零）。
+- 本机试验定稿基准：产物 gnu=`450bc5fb…` / musl=`2800d128…`
+  （`/tmp/p5-rel-local/SHA256SUMS` 自校验过，musl static-pie `file` 实证，
+  双 `--version` = `my2sql-rs 0.5.0`）；旧 run1 基准（817fd8f9/38920028）
+  因 T1 版本翻转并行 race 作废重跑，race 日志在册。
+- 评审：首轮 **FIX-required**（Critical-1 CI 产物名 suffix 简写违 D4 逐字
+  模板 + 报告 §5 不实；Critical-2 bash `local tgt tdir` 同行展开时序坍缩
+  致双构建实际共享 host target dir + 报告 §4.2 不实）→ 修复轮 `ad2a640`
+  两行级修复 + M1–M4 + 试验全清重刷 + 报告「原文+更正注记」→ scoped 复评
+  全 ADDRESSED **APPROVE**。教训入册：**声明级断言（「一致/独立」）必须
+  与实跑旁证对拍后落笔**。
+
+### P5 全分支终审 + 开工前修正轮（commit `b1b5750`，controller 亲修）
+
+- 终审 **PASS**（T1–T3 整支可进 T4），承重梁复算全命中（350/0/14 双验、
+  CHANGELOG 8 组回源、锁三处同步、DoD-6 `git diff v0.4.1-p4b..HEAD -- src/`
+  = 空预证、五枚历史 tag 本地↔远端逐字等、CI 洁净克隆 14-ignored 同形论证、
+  benches 双保护、`--all-targets` 不碰 fuzz）。
+- findings 处置：**MAJ-1**（runner toolchain 漂移 = 首跑红雷且消红唯一出路
+  碰 src/ 死锁）→ push 前 `dtolnay/rust-toolchain@1.96.0` 钉定（`b1b5750`）；
+  **MAJ-2**（plan Step 4 `gh release download` 缺 `--dir` 逐字跑必断）→
+  T4 执行形已改带 `--dir /tmp/p5-rel-dl`；**MIN-1**（R3 序）→ T4 采
+  「draft 先行（`--verify-tag` 兜）→ 后 push tag」序；**MIN-2** 安装节
+  TLS+CI 有界行 → `b1b5750`；**MIN-3** fuzz 步名实 → `b1b5750` 同步
+  CHANGELOG；**MIN-4** Release body sed 尾串 → T4 抽 body 时 `head -n -1`。
+  Info 5 条登记不修（.qoder/ ignore 权衡、深链 404 进行时、DoD-6 解释形、
+  fail-fast/cache、tdir 并行面）。
+- 派发偏差披露（沿 P4b 先例）：T1/T2/T3 共享 feat-p5 工作树顺序合入
+  （线性 `7bfa6cf→495d194→1b4335c→ad2a640`），T3-T1 版本翻转 race 实录一次
+  （run1 作废重跑，在册）；终审修正轮由 controller 亲修（三处均评审方
+  原文一行形，无裁量面），以终审复扫背书。
+
+### P5 T4（合流 lane，controller）：六闸回归 + 远端发布链（R3）
+
+- 六闸亲跑（`CARGO_TARGET_DIR=/tmp/p5-merge`，串行容器闸纪律沿 P4b，
+  逐字日志 `/tmp/p5-merge-gate-*.log` + 戳记 `/tmp/p5-merge-stamps.txt`）：
+  13/0 @812.57s（含 5.6/5.7 idle 心跳两件）; fuzz 双靶 rc=0（FUZZ_TIME=20）; shadow rc=0（checksum P0=2877097027/2830880655 与 P4b 账逐位等）; difftest difftest-p4a 主闸 21/21+三形 14/14 全绿；compat 18 用例 (repl-equivalent 字节数 179083/146979/140126/169128)；六闸总耗时约 22min44s（18:29:53..18:52:37）
+- 远端链（R3 定稿形）：ff main → push → **CI 首跑实测绿**（`gh run watch
+  --exit-status`，红 = 修复轮，D7）→ `gh release create v0.5.0 --draft
+  --verify-tag`（先于 tag push：draft+tag 原子上架，消 upload race，MIN-1
+  采纳）→ release.yml 云端构建上传 → 下载回验（`--dir /tmp/p5-rel-dl`，
+  MAJ-2 采纳；`sha256sum -c` + 双 `--version` + musl 真 to-sql smoke）→
+  undraft → DoD-6 前后对拍。
+- 收口：本节点补全 +「P5 DoD 对账」+ 挂账处置 → docs commit → ff main +
+  push（tag `v0.5.0` 指向含收口的 tip 与否按 R3 序如实登记）。
+
 ## P4b DoD 对账（spec §7 七条，T5 收尾）
 
 1. **`tools/bench-ab.sh` 存在 + selftest + 恒等 A/A 冒烟逐字入档（挂账 #1/#4/#6/#7）** ✅
@@ -2175,6 +2271,27 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
 | 5 | pipeline/mod.rs 2600+ 行装配块迁 `src/repl/assembly.rs`（P3 T8 :2056） | ✅ **搬运**：move-only，逐字节 + 350 计数 + Δ+1.2% 抽测 | `8ff5fe0`；task-4-report Step 2/3/4 |
 | 6 | gen-bench-binlog.sh 硬编码 target（P4a T5 :1845/:2122 同族小账） | ✅ **接线修**：RSBIN `${CARGO_TARGET_DIR:-$ROOT/target}`（edb2148 同口径），trace 实证 | `b6844fe`；`/tmp/p4b-t1-genbench-trace.log:5`；gen-bench :24/:116 |
 | 7 | P2 回归闸未决：代码增量 −3.2%（CI 跨 0，p2.md） | ✅ **钉死不显著**：bench-ab P1 vs P2 N=5，delta **+2.812%（=0.1897s）< thr 0.5714s**，不升级 N=9（无「跨 0→显著」证据） | `b6844fe`+`2c670b9`；`/tmp/p4b-t1-ab7-r5.log` + p4b.md ③ |
+
+## P5 DoD 对账（spec §7 七条，T4 收尾）
+
+1. **版本 0.5.0 + `--version` 逐字 + 锁同步 + 行为恒等六闸** ✅/⏳
+   （`--version` = `my2sql-rs 0.5.0` T1 亲验 + T3 双产物复验；lock 三处各
+   仅根包行评审复验；六闸逐字 = T4 节点 13/0 @812.57s（含 5.6/5.7 idle 心跳两件）; fuzz 双靶 rc=0（FUZZ_TIME=20）; shadow rc=0（checksum P0=2877097027/2830880655 与 P4b 账逐位等）; difftest difftest-p4a 主闸 21/21+三形 14/14 全绿；compat 18 用例 (repl-equivalent 字节数 179083/146979/140126/169128)；六闸总耗时约 22min44s（18:29:53..18:52:37））。
+2. **ci.yml tip 实测绿** ⏳（T4 Step 2；toolchain 钉 1.96.0 后首跑，红 =
+   修复轮 D7）。
+3. **Release v0.5.0 双产物 + SHA256SUMS + 下载回验** ⏳（T4 Step 3/4，R3 链；
+   本机基准 gnu=`450bc5fb…`/musl=`2800d128…` 对拍在 T3 报告 §8.4）。
+4. **CHANGELOG 五轮全覆盖 + 数字带出处可溯源** ✅（T2 评审 12/12 抽查逐字
+   命中 + 终审 8 组回源全命中）。
+5. **README 发布态 + 虚账排查记录** ✅（24 条排查表在 task-2-report；
+   ultradb→liuhr 修正独立复验成立；TLS/CI 有界行 `b1b5750`；样例值漂移
+   注记随收口）。
+6. **历史五 tag 未动 + src/ 零语义** ✅ 预证（本地↔远端逐字等 +
+   `git diff v0.4.1-p4b..ad2a640 -- src/` 空，终审复算；发布后「前后对拍」
+   动作归 T4 执行记录。解释形钉死：版本行 diff = Cargo.toml/Cargo.lock/
+   fuzz/Cargo.lock 三处各一行 + src/ 恒空）。
+7. **HANDOVER P5 节点 + DoD + 挂账处置 + 台账闭合** ✅（本节 + 状态行 +
+   挂账清单 P5 消费注；台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p5-release/`）。
 
 ## 校准记录
 
@@ -2356,6 +2473,25 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
     RSBIN `${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs`（:24 定义/:116 消费，edb2148
     同口径，`/tmp/p4b-t1-genbench-trace.log` 实证）；p4a-roundtrip.sh / flashback-reconcile.sh
     仍留同族小账（非回归链路，未触）。
+- **P5 T4 新增登记（收口轮入账）**：
+  - [x] ~~`tools/flashback-reconcile.sh` 硬编码 `./target/debug`（P4a T5
+    同族小账）~~——**P5 T1 消费（`7bfa6cf`）**：RSBIN
+    `${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs`（edb2148 逐字节同
+    口径）；同族余 `gen-bench`（P4b 已修）/`p4a-roundtrip`（FIX E 已修）
+    全数销账，**同族小账清零**。
+  - [ ] **upstream 权威 URL 账（P5 T2 立）**：Go 裁判上游 =
+    `github.com/liuhr/my2sql`（reference clone remote + HTTP 200 双证）；
+    README P1 起所写 `ultradb/my2sql` 系无账虚指（实测 404），已修正——
+    未来引用上游一律以 liuhr 形为准。
+  - [ ] **CI 有界决定（spec D3 原文在案）**：difftest/compat/repl-test/
+    fuzz 真跑/shadow 不进 CI，「CI 绿 ≠ 六闸绿」——发布后任何「CI 全绿」
+    表述不得被读作六闸绿。
+  - [ ] README `stats`/`binlog_status` 样例中段值（`windows flushed=1` 等）
+    = **形态样例**（值随运行漂移，P2 T9 真跑账不含单元格全量）——终审
+    Minor 裁定注记形，不复采。
+- [x] ~~P4b 后续挂账视野（X3 归因/X1/X2/threads 2.01× 结构面/`--no-keep-trx`
+  守卫面/stats temp+rename）~~——P5 裁定**全部续挂不消费**（spec §6 表，
+  发布战役不为动而动）。
 - [x] ~~P3：repl 模式（另出计划；认证含 caching_sha2）~~——T0–T8 全部
   完成（本表上方「P3 Task 0–7」节点 + 「P3 DoD 对账」节），caching_sha2
   与 native 双认证 spike 钉死、8.4 矩阵经 `SHOW BINARY LOG STATUS` 改口
