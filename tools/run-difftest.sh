@@ -23,6 +23,9 @@
 #   `stats --dml insert`，比较器断言 stats 报表 inserts 总和 == to-sql
 #   `--dml insert` 的 INSERT 语句行数，且 updates/deletes 总和为 0
 #   （dml 过滤器跨通道语义一致；stats 无 Go 裁判，本维度为我方双通道自证）。
+# P4a T3 (Lane C) 扩展（环境开关，默认关＝既有行为逐字节不变）：
+#   P4A=1   捕获表组切换：GEN=tools/gen-data-p4a.sql + OUT 后缀 -p4a（ENUM>255 /
+#     GEOMETRY / LONGBLOB>64K 三形，仅 8.0 主闸）；六步流程原样继承，compat 家族不涉及。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -35,6 +38,16 @@ case "$WORK_TYPE" in
   stats)    SFX="-stats" ;;
   *) echo "WORK_TYPE must be 2sql|rollback|stats, got '$WORK_TYPE'" >&2; exit 2 ;;
 esac
+# P4a T3 (Lane C)：P4A 非空 = 捕获表组（GEN 选择见下；产物目录加 -p4a 后缀）。
+# 缺省空 = 不进入任何新分支，既有路径逐字节不变。
+# 修复轮 1（评审 Minor#3）：P4A=1 时主闸仅 8.0——非 8.0 显式拒绝而非静默
+# 按 VER 镜像跑 p4a 表组（GEOMETRY/SRID 等形在 5.x 语义不同）。仍在 P4A 门内，
+# 默认路径零变化。
+P4A="${P4A:-}"
+if [ -n "$P4A" ]; then
+  if [ "$VER" != "8.0" ]; then echo "P4A 仅 8.0 主闸" >&2; exit 2; fi
+  SFX="$SFX-p4a"
+fi
 OUT="$ROOT/out/difftest-$VER${CKSUM:+-$CKSUM}${V1ROWS:+-v1rows}$SFX"
 rm -rf "$OUT" && mkdir -p "$OUT/go" "$OUT/rs" tools/bin
 trap 'rc=$?; if [ $rc -ne 0 ] && [ -n "${KEEP:-}" ]; then echo "FAILED(rc=$rc) — container $NAME kept for debug"; else docker rm -f "$NAME" >/dev/null 2>&1 || true; fi' EXIT
@@ -61,6 +74,7 @@ docker exec "$NAME" mysql -uroot -N -e \
   || docker exec "$NAME" mysql -uroot -N -e "SELECT CONCAT('   server: ', VERSION(), ' binlog_checksum=', @@global.binlog_checksum)"
 GEN="tools/gen-data-${VER}.sql"
 [ -f "$GEN" ] || GEN=tools/gen-data.sql
+if [ -n "$P4A" ]; then GEN="tools/gen-data-p4a.sql"; fi
 echo "   data script: $GEN"
 docker exec -i "$NAME" mysql --default-character-set=utf8mb4 < "$GEN"
 docker exec "$NAME" mysql -uroot -e "FLUSH BINARY LOGS"   # 封口，保证数据文件事件完整
