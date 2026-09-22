@@ -35,7 +35,7 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   3.3→64.2 MiB/s 消账）；`src/repl/assembly.rs` 装配块纯搬运（move-only + 逐字节 +
   350 计数）；T5 落 `make bench-ab`/`make bench-profile` + `docs/bench/p4b.md`
   新权威基线（threads=8 median **127.59 MiB/s**，回归闸 vs 103.85 **+22.86% 更快
-  GREEN**）+ 挂账 #7 P1→P2 复测**钉死不显著**（+2.812% < 0.5714s，N=5 不升级）+
+  GREEN**）+ 挂账 #7 P1→P2 复测**钉死不显著**（+2.812%＝0.1897s < thr 0.5714s，N=5 不升级）+
   全量回归六闸逐字台账。§0 七条挂账全部销账/书面处置（见「P4b DoD 对账」与
   挂账清单 P4b 消费注）。**收口 pending = controller 的 merge/tag/push（本轮
   T5 lane 不并入 main、不打 tag、不 push）**。
@@ -2102,7 +2102,10 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
      `event_stream: exit=0 crashes=0` / `[fuzz-min] OK 0 new crashes`。
      （副作用注记：跑后 `fuzz/Cargo.lock` 因 T3 mimalloc 硬依赖被 cargo 就地补入
      `mimalloc`/`libmimalloc-sys` 条目——非回归路径、T5 独占面外，已 `git checkout` 还原，
-     移交 controller：fuzz 独立 workspace 锁未随 T3 传播，宜后续单独入账。）
+     移交 controller：fuzz 独立 workspace 锁未随 T3 传播，宜后续单独入账——**已落地
+     `50b90b2` chore：fuzz/Cargo.lock +19/−0 同步 mimalloc 0.1.52/libmimalloc-sys
+     0.1.49（闭包与主锁同，`cargo metadata --locked --manifest-path fuzz/Cargo.toml`
+     rc=0 复验）。**）
   3. **`make difftest` rc=0（08:06:08Z）:** `groups A=21 B=21 aligned=21 green=21 red=0` +
      `OK difftest 8.0: diff-green + replay-byte-identical`；
      **`P4A=1 make difftest` rc=0（08:07:01Z）:** `data script: tools/gen-data-p4a.sql` +
@@ -2124,7 +2127,8 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
   （T4）；本轮 compat 18 + 350 非 live + difftest 双模（21/14）+ shadow 五闸逐位 + repl live
   13 全绿 = 事后全量回归合同兑现（P4a 解码器开闸条款扩展至 pipeline 热路径）。
 - **区间记录:** `aba8293..` = spec/plan 2 件（d9f16d7/c59def0）+ 四 lane（T4 `8ff5fe0`、
-  T1 `b6844fe`、T2 `5b6a363`、T1fix `2c670b9`、T3 `281735d`）+ 本 T5 合流 commit。
+  T1 `b6844fe`、T2 `5b6a363`、T1fix `2c670b9`、T3 `281735d`）+ 本 T5 合流 commit
+  （`6ad820c`）+ 锁同步 `50b90b2`（fuzz workspace lock = T5 副作用注记的后续入账）。
   **本节点后收口（ff main → tag → push）= controller 特权，T5 lane 不执行（明确出界）。**
 
 ## P4b DoD 对账（spec §7 七条，T5 收尾）
@@ -2155,7 +2159,7 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
 | 4 | `docs/bench/p1.md` 笔误 5.903→5.093（:2025 移交一行） | ✅ **证伪入账**：p1.md 无 5.903（grep 空），:35 已是 5.093——挂账虚假/已被后手修正，零改动 | `b6844fe`；`grep 5.903 docs/bench/p1.md`（rc=1 空） |
 | 5 | pipeline/mod.rs 2600+ 行装配块迁 `src/repl/assembly.rs`（P3 T8 :2056） | ✅ **搬运**：move-only，逐字节 + 350 计数 + Δ+1.2% 抽测 | `8ff5fe0`；task-4-report Step 2/3/4 |
 | 6 | gen-bench-binlog.sh 硬编码 target（P4a T5 :1845/:2122 同族小账） | ✅ **接线修**：RSBIN `${CARGO_TARGET_DIR:-$ROOT/target}`（edb2148 同口径），trace 实证 | `b6844fe`；`/tmp/p4b-t1-genbench-trace.log:5`；gen-bench :24/:116 |
-| 7 | P2 回归闸未决：代码增量 −3.2%（CI 跨 0，p2.md） | ✅ **钉死不显著**：bench-ab P1 vs P2 N=5，delta **+2.812% < thr 0.5714s**，不升级 N=9（无「跨 0→显著」证据） | `b6844fe`+`2c670b9`；`/tmp/p4b-t1-ab7-r5.log` + p4b.md ③ |
+| 7 | P2 回归闸未决：代码增量 −3.2%（CI 跨 0，p2.md） | ✅ **钉死不显著**：bench-ab P1 vs P2 N=5，delta **+2.812%（=0.1897s）< thr 0.5714s**，不升级 N=9（无「跨 0→显著」证据） | `b6844fe`+`2c670b9`；`/tmp/p4b-t1-ab7-r5.log` + p4b.md ③ |
 
 ## 校准记录
 
@@ -2245,7 +2249,7 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
     「后续动作」节（T9 移入本条统一索引）。~~——**P4b T1/T2/T3 消费（挂账 #1/#2/#7）**：
     ① 工装 `tools/bench-ab.sh` 落地 + selftest 8 例 + 恒等 A/A 冒烟（`b6844fe`+fix
     `2c670b9`，governor 只记录/无 sudo 环境事实，taskset 钉 P 核 0-11）；② P2 −3.2%
-    代码增量**复测钉死不显著**（P1 vs P2 N=5，delta +2.812% < thr 0.5714s，不升级
+    代码增量**复测钉死不显著**（P1 vs P2 N=5，delta +2.812%（=0.1897s）< thr 0.5714s，不升级
     N=9，`/tmp/p4b-t1-ab7-r5.log`）；③ threads 并行效率：T2 端到端实测 **2.01×**
     取代 P1 账本 2.5×（`5b6a363`），T3 mimalloc 收 allocator 膨胀（glibc A/B −26.561%，
     `281735d`），但 1→8 缩放 post-mimalloc **仍开放**（无热路径结构改动、O2 不显著回滚、

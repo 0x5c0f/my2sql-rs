@@ -37,7 +37,8 @@ file_to_sql/threads=1/528 MiB
   127.59 MiB/s vs 103.85 → **+22.86%（更快）**，五% 劣化红线**未触碰 → GREEN**。
   较 P1 账本（`docs/bench/p1.md:35` threads=8 median 5.093 s / 103.85 MiB/s）与
   P2 账本（`docs/bench/p2.md:44` 88.352 MiB/s）均回正并上抬，增益方向与 mimalloc
-  glibc A/B（④）一致。DoD-3 绝对门槛（threads=8 ≥40 MB/s）以 2.4× 余量通过。
+  glibc A/B（④）一致。DoD-3 绝对门槛（threads=8 ≥40 MB/s）以 **3.3×** 余量通过
+  （127.59 MiB/s = 133.78 MB/s，直除 40 MB/s = 3.34×；比值口径同 p1.md:35「PASS（2.7×）」）。
 - threads=1 组（扩展性参考）median 10.162 s → 52.042 MiB/s；ledger 上
   t8/t1 吞吐比 = 127.59/52.042 = **2.45×**（时间口径 10.162/4.1451 = 2.45×）。
   **注记（见「裁定与免责」节）：** 该比值为 criterion 账本口径的**观测值**，
@@ -76,7 +77,10 @@ A/A 恒等冒烟同日实测 not-significant（`/tmp/p4b-t1-aa.log` delta=+0.847
 ### glibc A/B（mimalloc vs BASE_T3 `2c670b9`）
 
 两侧二进制 `sha256` 逐字 DIFFER（base `9970ffb9…323f755` / tip `fda6465a…cbf5af03`，
-`/tmp/p4b-t3-base-sha.txt` 在册）。`bench-ab --rounds 5` 逐字（`/tmp/p4b-t3-ab.log`）：
+全值在册 = lane 报告 task-3-report §二进制哈希，现存二进制可就地复算
+（`/tmp/p4b-t3-tbase/release/my2sql-rs`、`/tmp/p4b-t3-tgt/release/my2sql-rs`）；注：
+`/tmp/p4b-t3-base-sha.txt` 为 BASE_T3
+**commit** 哈希非二进制）。`bench-ab --rounds 5` 逐字（`/tmp/p4b-t3-ab.log`）：
 
 ```text
 # bench-ab: rounds=5 threads=8 taskset=0-11 input=mysql-bin.000003(554555214 B)
@@ -106,6 +110,9 @@ MUSL r=3 base=168.4141s mimalloc=8.2347s
 base-musl     median=158.0084s  MiB/s=3.3
 mimalloc-musl median=8.2347s    MiB/s=64.2   (SZ=554555214)
 ```
+
+注：`MUSL r=1/2/3` 配对行系 lane 报告归档形（`/tmp/p4b-t3-musl-{base,tip}.txt` 各仅
+三个无标头秒值，逐轮配对见 task-3-report；中位与 MiB/s 均可由两 .txt 独立复推）。
 
 **裁定：** base-musl **3.3 MiB/s** ≈ 精确复现 P1 在册 3.4 MiB/s 悬崖
 （`docs/bench/p1.md:88`）；mimalloc-musl **64.2 MiB/s ≥ 50** 门 → **悬崖消账（挂账 #3 = 已解决）**，
@@ -188,7 +195,7 @@ round3 base  6358ms   round3 new  6517ms
 | 回归闸 +22.86% / 103.85 基线 | 本役算料（127.59 vs 103.85）+ `docs/bench/p1.md:35,46` |
 | ab7 delta +2.812% / thr 0.5714s / A=78.4 B=76.3 | `/tmp/p4b-t1-ab7-r5.log` + 全文 `/tmp/p4b-t1-ab7.md` |
 | A/A +0.847% / thr 0.2902s | `/tmp/p4b-t1-aa.log` |
-| mimalloc glibc -26.561% / A=88.7 B=120.8 / sha DIFFER | `/tmp/p4b-t3-ab.log` + `/tmp/p4b-t3-base-sha.txt` |
+| mimalloc glibc -26.561% / A=88.7 B=120.8 / sha DIFFER | `/tmp/p4b-t3-ab.log` + task-3-report §二进制哈希（二进制在档可复算）|
 | musl base 3.3 / tip 64.2 MiB/s | `/tmp/p4b-t3-musl-base.txt` + `/tmp/p4b-t3-musl-tip.txt` |
 | O2 +0.282% / thr 0.1614s（回滚） | `/tmp/p4b-t3-o2-ab.log` |
 | T4 抽测 Δ+1.2% / sha1 恒等 | `/tmp/p4b-t4-out` 抽测（task-4-report Step 3/4） |

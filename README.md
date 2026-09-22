@@ -40,7 +40,7 @@ flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）
 （[docs/bench/p1.md](docs/bench/p1.md)）；P2 回归闸（spec §6.4）原始读数 −14.9%，
 同机 A/B 归因为环境漂移 −8.3% + 代码增量 −3.2%（95% CI 跨 0，未达 5% 判定线）
 ——P4b 用 `tools/bench-ab.sh` 工装复测将该 −3.2% 弱信号**钉死为端到端不显著**
-（delta +2.812% < 阈值 0.5714s，N=5，不升级 N=9），证据与测量陷阱见
+（delta +2.812%＝0.1897s < 阈值 0.5714s，N=5，不升级 N=9），证据与测量陷阱见
 [docs/bench/p2.md](docs/bench/p2.md) + [docs/bench/p4b.md](docs/bench/p4b.md) ③。
 
 ## 快速上手
