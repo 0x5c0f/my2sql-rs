@@ -84,17 +84,23 @@ for t in $TABLES; do
 done
 # -a 必带（P4A 实踩）：GEOMETRY/LONGBLOB dump 含未转义的非 NUL 控制字节
 # （0x01/0xC0 等），GNU grep 二进制探测会把 .rows 置空 → 行级 diff 假绿。
-dump_rows() { grep -a -E "^[(]|^INSERT|^--$" "$1" | grep -av '^-- Dump completed' | sed 's/[[:space:]]*$//'; }
+# 修复轮 1：不再保留 `^--$` 注释行——mysqldump 恒带裸 `--` 样板行，留着会让
+# 「非空硬闸」在 0 数据行时也假绿。.rows = 纯 INSERT 数据线（main/clone 同构）。
+dump_rows() { grep -a -E "^[(]|^INSERT" "$1" | sed 's/[[:space:]]*$//'; }
 for t in $TABLES; do
   dump_rows "$OUT/$t.main.sql" > "$OUT/$t.main.rows"
   dump_rows "$OUT/$t.clone.sql" > "$OUT/$t.clone.rows"
-  [ -s "$OUT/$t.main.rows" ] || { echo "ROUNDTRIP RED: empty main rows for $t" >&2; exit 1; }
+  # 数据线硬闸（grep -c 无匹配时退 1 且打印 0，|| true 规避 set -e）：
+  # 两侧 .rows 必须含 >=1 条 INSERT 数据行，否则（全空/只剩样板/抽行失败）即红。
+  NINS="$(grep -ac '^INSERT' "$OUT/$t.main.rows" || true)"
+  NINS_C="$(grep -ac '^INSERT' "$OUT/$t.clone.rows" || true)"
+  { [ "$NINS" -gt 0 ] && [ "$NINS_C" -gt 0 ]; } \
+    || { echo "ROUNDTRIP RED: $t no INSERT data lines (main=$NINS clone=$NINS_C — 空表/抽行失败即红)" >&2; exit 1; }
   if ! diff -u "$OUT/$t.main.rows" "$OUT/$t.clone.rows" > "$OUT/$t.rowdiff.txt"; then
     echo "ROUNDTRIP RED: checksum green but row content differs in $t" >&2
     head -40 "$OUT/$t.rowdiff.txt" >&2
     exit 1
   fi
-  NROW="$(wc -l < "$OUT/$t.main.rows")"
-  echo "   $t: row-data identical ($NROW dump 数据行)"
+  echo "   $t: row-data identical ($NINS INSERT 数据行)"
 done
 echo "OK p4a-roundtrip: 3 表 CHECKSUM TABLE clone==main + row-data identical (binlog=$BIN, ${SECONDS}s elapsed)"

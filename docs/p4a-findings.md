@@ -77,8 +77,13 @@ md5 相同（`7be7a1a149b8ace7285ed8c1bd22739f` 双方）；19 个 hex payload
   + 行级 mysqldump diff 空（`.rows` 非空核验入脚本硬闸）。用时 24s。
 - 本件实踩并已修复的脚本缺陷：mysqldump 对 GEOMETRY/LONGBLOB 输出含未转义的
   非 NUL 控制字节（0x01/0xC0…），GNU grep 二进制探测将 dump_rows 置空 →
-  行级 diff 假绿；修复 = `grep -a` + 空 `.rows` 即红。修复后 GREEN transcript
-  即 out/p4a-roundtrip-run.log 现状（7/5/4 数据行，非空）。
+  行级 diff 假绿；修复 = `grep -a` + 空 `.rows` 即红。
+- 修复轮 1（外审 Important#1/#2）：`^--$` 样板行从 dump_rows 剔除（mysqldump
+  恒发裸 `--` 行，旧「非空」闸对 0 数据行也假绿）→ `.rows` 为纯 INSERT 数据线；
+  硬闸改为 main/clone 双侧 `grep -ac '^INSERT'` > 0（合法空结果亦必须红）。
+  本节数字为修复后真跑重生成（全录 `out/p4a-roundtrip-fix1.log`，21s）：
+  逐表真实数据行 4/2/1（初版报告「7/5/4」系含 3 行 `--` 样板的计数笔误，
+  按修复后 grep 重跑核正；CHECKSUM 三值与初版逐字相同）。
 
 ## 回归与独立性登记
 

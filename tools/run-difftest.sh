@@ -40,8 +40,14 @@ case "$WORK_TYPE" in
 esac
 # P4a T3 (Lane C)：P4A 非空 = 捕获表组（GEN 选择见下；产物目录加 -p4a 后缀）。
 # 缺省空 = 不进入任何新分支，既有路径逐字节不变。
+# 修复轮 1（评审 Minor#3）：P4A=1 时主闸仅 8.0——非 8.0 显式拒绝而非静默
+# 按 VER 镜像跑 p4a 表组（GEOMETRY/SRID 等形在 5.x 语义不同）。仍在 P4A 门内，
+# 默认路径零变化。
 P4A="${P4A:-}"
-if [ -n "$P4A" ]; then SFX="$SFX-p4a"; fi
+if [ -n "$P4A" ]; then
+  if [ "$VER" != "8.0" ]; then echo "P4A 仅 8.0 主闸" >&2; exit 2; fi
+  SFX="$SFX-p4a"
+fi
 OUT="$ROOT/out/difftest-$VER${CKSUM:+-$CKSUM}${V1ROWS:+-v1rows}$SFX"
 rm -rf "$OUT" && mkdir -p "$OUT/go" "$OUT/rs" tools/bin
 trap 'rc=$?; if [ $rc -ne 0 ] && [ -n "${KEEP:-}" ]; then echo "FAILED(rc=$rc) — container $NAME kept for debug"; else docker rm -f "$NAME" >/dev/null 2>&1 || true; fi' EXIT
