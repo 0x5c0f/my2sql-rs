@@ -35,7 +35,9 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   验钞机）、difftest P4A 三列形真机捕获（三形全 Go 支持，测试债销账）、
   5.6/5.7 idle 心跳 live 件（repl live 家族 11→13，帧形实测钉死）；
   T5 落 `make fuzz-min`/`make shadow-test` 直通行 + 全量回归逐字台账，
-  DoD 对账见「P4a DoD 对账」节。待全分支终审（ff main + tag v0.4.0-p4a）。
+  DoD 对账见「P4a DoD 对账」节。全分支终审已做（With-fixes → FIX A–F
+  单修复轮落地 `8130c6b`）+ 合流亲跑三闸全绿（见 T5 节点尾「合流亲跑
+  节点」）；收口 = ff main + tag `v0.4.0-p4a` + push（本轮）。
 - 前史（P3）：`worktree-feat+p3`（worktree `.qoder/worktrees/feat+p3`，base
   `main@0905368`（= feat/p2 终审后合入态 v0.2.0-p2）；
   P3 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`，
@@ -1908,6 +1910,29 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   `cargo test` **350 passed / 0 failed** + clippy `--all-targets -D warnings` rc=0 +
   `fmt --check` rc=0（`CARGO_TARGET_DIR=/tmp/p4a-fixr1`）；`bash -n` 两脚本 +
   `make -n fuzz-min` 通过。
+- **合流亲跑节点（终审修复后，controller 亲跑于 tip `8130c6b`，
+  `CARGO_TARGET_DIR=/tmp/p4a-merge`，DoD-7 同型；逐字日志
+  `/tmp/p4a-e2e-{test,fuzzmin,difftest-p4a}.log`）**：
+  1. `cargo test --no-fail-fast`：**350 passed / 0 failed / 14 ignored**
+     （非 live 全量口径 = 349 + read_lns 常驻红钉 1 件）。
+  2. `FUZZ_TIME=20 make fuzz-min`：rc=0，双靶（decode_event / event_stream）
+     各自 `exit=0 crashes=0` + `OK 0 new crashes`，跑后 `git status
+     --porcelain` 仅本 HANDOVER 编辑（scratch corpus 在 out/fuzz/，不污染
+     仓内语料）。终审者已独立重放 seedgen：`src/bin/seedgen.rs` 产出
+     2×20 件与仓内 `fuzz/corpus/*` **逐字节等**（语料确定性背书，DoD-4 的
+     「P4 corpus 同源可再生」成立）。
+  3. `P4A=1 make difftest`（VER=8.0）：三列形捕获
+     `groups A=14 B=14 aligned=14 green=14 red=0` + 末行
+     `OK difftest 8.0: diff-green + replay-byte-identical`。
+  - **compat repl 字节基线口径裁定（本轮入账）**：repl 族绝对字节数
+    `175335/146979/143582/164487 → 173206/140559/140336/164489` 漂移，
+    归因 = 窗口轮次事件数差（506/411/410 vs 510/429/419；8.4 同 events 下
+    +2B 为注记位数差），且每-run 内 repl≡file `diff -r` 全等恒成立。裁定：
+    **绝对字节数不再作跨 run 基线**，等价性以每-run repl==file 逐字节为准。
+  - 区间记录：`2149ce1..8130c6b` = spec/plan 2 件 + 四 lane `--no-ff` 合入
+    （52058c7/1bee320/7774558/b4ba03c）+ T5 合流链（92a62ea/edb2148/1d519ac）
+    + 终审修复轮 8130c6b。本节点后收口 = ff main → `cargo test` 快验 →
+    tag `v0.4.0-p4a` → push（总授权内，P3 先例径）。
 
 ## P4a DoD 对账（spec §1–§5 + §6，T5 收尾）
 
