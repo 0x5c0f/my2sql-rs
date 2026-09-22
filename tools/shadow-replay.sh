@@ -6,7 +6,10 @@
 # 用法:  bash tools/shadow-replay.sh [VER]                 # VER ∈ {8.0, 5.7, ...}
 #        SHADOW_NEGCHECK=1 bash tools/shadow-replay.sh [VER]  # 负自检（成功=FAIL）
 #        KEEP=1 …                                          # 失败保留容器排障
-# 退出码 0 = 三向全过（negcheck 模式 = 漂移被闸抓到）。证据目录 out/shadow-replay/。
+# 退出码 0 = 三向全过（negcheck 模式 = 漂移被闸抓到）；INT/TERM → 130。
+# 证据目录 out/shadow-replay/<VER>/（fix-round-1 Minor #5：按版本命名空间，
+# 5.7 不再覆写 8.0 证据；negcheck 日志 = 该 VER 目录内 negcheck.log。
+# T5 接线按本头注取路径）。
 #
 # 设计裁定（沿 P2 flashback-reconcile.sh 母本纪律，升格三向）：
 #  - 影子库起点恢复：影子 = CREATE DATABASE <db>_fwd/<db>_rev + 直接回灌本脚本
@@ -38,6 +41,16 @@
 #    豁免（其值仍逐字打印入证据），无 JSON 表照常全强等值（t_ord 实测跨五轮
 #    恒为 2830880655）；行级 diff 闸无任何豁免、逐表逐字。8.0 面 a/b 均不启用，
 #    维持 spec 原形态（live 锚 + 全表 checksum 等值 + 行级 diff）。
+#  - 静绿保险丝（fix-round-1 Important #1）：a) snap 逐表断言 CHECKSUM TABLE
+#    值非空且纯数字（NULL 值直接红，杀 NULL==NULL 假等式）；b) gate 硬断言
+#    表清单 n>=1、两侧 .checksum 逐行形如 "<table> <digits>"、行级比对输入
+#    $a.rows/$e.rows 非空（空集 diff 恒绿即闸空转）；c) assert_stmts 把
+#    to-sql/flashback `done:` 摘要的 statements= 与产物 DML 行数钉成硬闸
+#    （原 115/115 人工互核升格为机闸）。
+#  - trap 窗口（fix-round-1 Important #2 + Minor #4）：EXIT trap 先于
+#    p3e2e_container_start 安装（lib 于 docker run 前置 P3E2E_CTR、
+#    p3e2e_container_stop 容忍空值——均已按 lib 源码核验），容器起在等待
+#    健康期被 Ctrl-C/被杀也不泄漏；INT/TERM 臂统一 exit 130。
 #  - 单档窗口假设沿用 lib 头注：灌流窗口内不跨 binlog 档；本件 [f0..f1] 取段
 #    天然支持 f0≠f1（docker cp 区段），但 to-sql 不给 stop-pos——p1 之后主库
 #    再无写入（snap/闸全只读），窗口尾界由 P1last 在场 + P0* 缺席双向钉住。
@@ -47,12 +60,19 @@ ROOT="$PWD"; VER="${1:-8.0}"
 BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 source tools/repl-e2e-lib.sh
 
-OUT="$ROOT/out/shadow-replay"; rm -rf "$OUT" && mkdir -p "$OUT"
+OUT="$ROOT/out/shadow-replay/$VER"; rm -rf "$OUT" && mkdir -p "$OUT"
 [ "${SHADOW_NEGCHECK:-0}" = "1" ] && exec > >(tee "$OUT/negcheck.log") 2>&1
 
-SFX="p4ash$$"; p3e2e_container_start "$VER" "$SFX" >/dev/null
+SFX="p4ash$$"
+# Important #2：trap 先于容器启动安装——start 内部（等健康 180s）被 INT/TERM
+# 或中途失败即成泄漏窗口。lib 契约已核验：P3E2E_CTR 在 docker run 前赋值
+# （lib:59），p3e2e_container_stop 对空值直接 return 0（lib:100-101），故
+# trap 体统一用 ${P3E2E_CTR:-} 守卫。Minor #4：INT/TERM → exit 130，经 EXIT
+# 臂完成清理（与 src repl 的 130 口径一致）。
+trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -n "${KEEP:-}" ]; then echo "FAILED(rc=$rc) — container ${P3E2E_CTR:-<none-started>} kept for debug (KEEP=$KEEP)"; else p3e2e_container_stop "${P3E2E_CTR:-}"; fi' EXIT
+trap 'exit 130' INT TERM
+p3e2e_container_start "$VER" "$SFX" >/dev/null
 CTR="$P3E2E_CTR"; PORT="$P3E2E_PORT"
-trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -n "${KEEP:-}" ]; then echo "FAILED(rc=$rc) — container $CTR kept for debug (KEEP=$KEEP)"; else p3e2e_container_stop "$CTR"; fi' EXIT INT TERM
 DB=p4ashadow
 # 期望侧锚点：默认 live（8.0 实证可保真）；5.7 见头注裁定 → dump 回灌 clone
 ANCHOR=live
@@ -73,6 +93,9 @@ snap() { # <tag> <db>
   while IFS= read -r t; do
     [ -n "$t" ] || continue
     ck=$(docker exec "$CTR" mysql -uroot -N -e "CHECKSUM TABLE \`$db\`.\`$t\`" | awk '{print $2}')
+    # Important #1a：NULL（awk 取空）/非纯数字值一律红——否则两行 "t " 假等式
+    # 通过 checksum 腿，闸静绿。
+    case "$ck" in ''|*[!0-9]*) echo "snap[$tag]: bad CHECKSUM TABLE value '$ck' for $db.$t (NULL/non-numeric)" >&2; return 1 ;; esac
     printf '%s %s\n' "$t" "$ck" >> "$OUT/$tag.checksum"
     echo "   ck[$tag] $db.$t=$ck"
   done < <(p3e2e_sql "$CTR" -N -e "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db' ORDER BY 1")
@@ -85,15 +108,28 @@ dump_rows() { grep -a -E "^[(]|^INSERT|^--$" "$1" | grep -a -v '^-- Dump complet
 # gate <actual-tag> <expected-tag> —— 行级 diff 必须空（无豁免）+ 逐表 checksum
 # 等值（EXEMPT 中的 JSON 表仅当 ANCHOR=clone 的 5.7 面列入，值仍逐字入证据）；
 # 打 tables=<n> checksum-equal=<m>/<需等值数> exempt-json=<x>；任一不符返回 1
-# （negcheck 依赖该返回码）。
+# （negcheck 依赖该返回码）。前置静绿保险丝（Important #1）：表清单 n>=1、
+# 两侧 checksum 行形状 "<table> <digits>"、a.rows/e.rows 非空——任一不满足
+# 即红，不允许空集恒绿。
 gate() { # <actual> <expected>
   local a=$1 e=$2 n eq nex
+  # Important #1a/b 静绿保险丝：表清单非空 + 两侧 checksum 逐行 "<table> <digits>"
+  # + 行级比对输入非空（空集 diff 恒绿 = 闸空转）。
   n=$(wc -l < "$OUT/$e.checksum")
+  { [ "$n" -ge 1 ] && [ -s "$OUT/$a.checksum" ]; } || {
+    echo "GATE RED[$a vs $e]: empty table list (expected lines=$n, actual $(wc -l < "$OUT/$a.checksum")) — gate would silently pass" >&2; return 1; }
+  if grep -qvE '^[^[:space:]]+[[:space:]]+[0-9]+$' "$OUT/$a.checksum" "$OUT/$e.checksum"; then
+    echo "GATE RED[$a vs $e]: malformed/NULL checksum field (want '<table> <nonempty digits>'):" >&2
+    grep -nvE '^[^[:space:]]+[[:space:]]+[0-9]+$' "$OUT/$a.checksum" "$OUT/$e.checksum" >&2 || true
+    return 1
+  fi
   nex=$(awk -v ex="$EXEMPT" 'BEGIN{split(ex,x," ");for(i in x)E[x[i]]=1} {if($1 in E)c++} END{print c+0}' "$OUT/$e.checksum")
   eq=$(paste -d'|' "$OUT/$a.checksum" "$OUT/$e.checksum" \
        | awk -F'|' -v ex="$EXEMPT" 'BEGIN{split(ex,x," ");for(i in x)E[x[i]]=1}
            {split($1,p," ");t=p[1]} !(t in E) && $1==$2 {c++} END{print c+0}')
   dump_rows "$OUT/$a.sql" > "$OUT/$a.rows"; dump_rows "$OUT/$e.sql" > "$OUT/$e.rows"
+  [ -s "$OUT/$a.rows" ] && [ -s "$OUT/$e.rows" ] || {
+    echo "GATE RED[$a vs $e]: normalized row set empty (a.rows=$(wc -c < "$OUT/$a.rows")B, e.rows=$(wc -c < "$OUT/$e.rows")B) — row diff would silently pass" >&2; return 1; }
   if ! diff -u "$OUT/$e.rows" "$OUT/$a.rows" > "$OUT/$a.vs.$e.rowdiff.txt"; then
     echo "GATE RED[$a vs $e]: tables=$n checksum-equal=$eq/$((n-nex)) exempt-json=$nex; rowdiff (head 40):" >&2
     head -40 "$OUT/$a.vs.$e.rowdiff.txt" >&2 || true
@@ -114,6 +150,8 @@ gate() { # <actual> <expected>
 gate_rows() { # <actual> <expected>
   local a=$1 e=$2
   dump_rows "$OUT/$a.sql" > "$OUT/$a.rows"; dump_rows "$OUT/$e.sql" > "$OUT/$e.rows"
+  [ -s "$OUT/$a.rows" ] && [ -s "$OUT/$e.rows" ] || {
+    echo "GATE RED[$a vs $e]: anchor row-set empty (a.rows=$(wc -c < "$OUT/$a.rows")B, e.rows=$(wc -c < "$OUT/$e.rows")B) — REF anchor unprovable" >&2; return 1; }
   if diff -u "$OUT/$e.rows" "$OUT/$a.rows" > "$OUT/$a.vs.$e.rowdiff.txt"; then
     echo "   GATE GREEN(rows): $a vs $e (rows=$(wc -l < "$OUT/$a.rows") lines, rowdiff bytes=$(wc -c < "$OUT/$a.vs.$e.rowdiff.txt"))"
     return 0
@@ -142,6 +180,18 @@ apply_product() { # <dir> <shadowdb>
 
 # dml_count <dir> —— 产物 DML 行数（简报口径逐字 grep，逐字打印）
 dml_count() { cat "$1"/*.sql | grep -a -c '^INSERT \|^UPDATE \|^DELETE ' || true; }
+
+# assert_stmts <log> <done前缀> <产物目录> —— Important #1c：`done:` 摘要行的
+# statements= 值必须等于产物 DML 行数（人工 115/115 互核升格为硬闸）；同时
+# 隐含断言 statements= 字段在场（缺字段=红）。
+assert_stmts() { # <log> <prefix> <dir>
+  local log=$1 pfx=$2 dir=$3 st dml
+  st=$(sed -n "s/^$pfx done:.*statements=\([0-9]\{1,\}\).*/\1/p" "$log" | tail -1)
+  [ -n "$st" ] || { echo "assert FAILED: '$pfx done:' lacks statements=<digits> in $log" >&2; return 1; }
+  dml=$(dml_count "$dir")
+  [ "$st" = "$dml" ] || { echo "assert FAILED: $pfx statements=$st != applied DML lines=$dml ($dir)" >&2; return 1; }
+  echo "   ASSERT OK: $pfx statements=$st == DML lines=$dml in $(basename "$dir")/"
+}
 
 # ── [1/6] 基线前态 ───────────────────────────────────────────────────────────
 echo "== [1/6] seed $DB + feed 3xP0 (pre-state baseline)"
@@ -186,6 +236,7 @@ grep -a -q "P1doc1" "$OUT"/fwd/*.sql || { echo "window FAILED: P1doc1 absent fro
 grep -a -q "P1last" "$OUT"/fwd/*.sql || { echo "window FAILED: P1last (window-tail boundary row) absent" >&2; exit 1; }
 if grep -a -q "P0" "$OUT"/fwd/*.sql; then echo "window FAILED: P0-tagged rows leaked into product" >&2; exit 1; fi
 echo "   fwd product: DML lines=$(dml_count "$OUT/fwd") (grep -c '^INSERT \|^UPDATE \|^DELETE ' verbatim)"
+assert_stmts "$OUT/to-sql.log" to-sql "$OUT/fwd" || exit 1
 create_shadow "${DB}_fwd" "$OUT/P0.sql"
 snap SETUP_FWD "${DB}_fwd"
 if ! gate SETUP_FWD "$EXP_PRE"; then echo "shadow setup FAILED: ${DB}_fwd != pre-state ($EXP_PRE)" >&2; exit 1; fi
@@ -219,6 +270,7 @@ if ! gate SETUP_REV "$EXP_POST"; then echo "shadow setup FAILED: ${DB}_rev != po
   --output-dir "$OUT/rev" 2>&1 | tee "$OUT/flashback.log"
 grep -q "^flashback done:" "$OUT/flashback.log" || { echo "flashback produced no summary line" >&2; exit 1; }
 echo "   rev product: DML lines=$(dml_count "$OUT/rev") (grep -c '^INSERT \|^UPDATE \|^DELETE ' verbatim)"
+assert_stmts "$OUT/flashback.log" flashback "$OUT/rev" || exit 1
 apply_product "$OUT/rev" "${DB}_rev"
 snap REV_SHADOW "${DB}_rev"
 if ! gate REV_SHADOW "$EXP_PRE"; then exit 1; fi
