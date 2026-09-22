@@ -4,6 +4,7 @@
 //! final `flashback.{N}.sql` / file-per-table `flashback.{db}.{table}.{N}.sql`;
 //! tmp 为隐藏文件 `.flashback.tmp.{N}[.db.table]` 收尾删除。
 
+pub mod report;
 pub mod reverse;
 
 use std::path::{Path, PathBuf};

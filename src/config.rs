@@ -180,6 +180,9 @@ pub struct FlashbackArgs {
     /// 逐事件错误策略（flashback 默认 stop：回滚脚本宁缺毋漏）
     #[arg(long, value_enum, default_value_t = OnError::Stop)]
     pub on_error: OnError,
+    /// DDL skip events 报告文件路径（JSONL 格式，P6 T1）
+    #[arg(long)]
+    pub report_file: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -281,6 +284,8 @@ pub struct Config {
     pub resume_file: Option<PathBuf>,
     /// repl 心跳探活秒（P3 T1；0=禁用，默认 30，非 repl 恒取默认无消费）。
     pub heartbeat_secs: u32,
+    /// P6 T1：DDL skip events 报告文件路径（JSONL format）
+    pub report_file: Option<String>,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -365,6 +370,7 @@ impl Config {
         cfg.work_type = WorkType::Flashback;
         cfg.keep_trx = !args.no_keep_trx;
         cfg.on_error = args.on_error;
+        cfg.report_file = args.report_file.clone();
         Ok(cfg)
     }
 
@@ -661,6 +667,9 @@ mod tests {
         assert!(!c.keep_trx);
         let c = Config::validate_flashback(fargs(&["--on-error", "skip-bad-event"])).unwrap();
         assert_eq!(c.on_error, OnError::SkipBadEvent);
+        // P6 T1: --report-file flag
+        let c = Config::validate_flashback(fargs(&["--report-file", "/tmp/report.jsonl"])).unwrap();
+        assert_eq!(c.report_file, Some("/tmp/report.jsonl".to_string()));
         // --to-stdout 不存在于 flashback：try_parse 必失败（逆序回写需要盘上文件）
         assert!(
             Cli::try_parse_from([

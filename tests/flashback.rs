@@ -147,6 +147,28 @@ fn flashback_e2e_multi_trx_bytes() {
     );
 
     // threads=1 直通与并行逐字节等价（P1 契约在 flashback 形态同样成立）
+}
+
+// P6 T1: Report format validation
+#[test]
+fn test_report_jsonl_format() {
+    use my2sql_rs::flashback::report::{JsonlReporter, SkipEvent};
+
+    let event = SkipEvent {
+        timestamp: "2026-09-22T14:30:15Z".to_string(),
+        binlog: "mysql-bin.000150".to_string(),
+        position: 12345,
+        type_: "Query".to_string(),
+        sql: Some("ALTER TABLE t_users ADD COLUMN new_field VARCHAR(100)".to_string()),
+    };
+
+    let json = serde_json::to_string(&event).expect("should serialize");
+
+    assert!(json.contains("\"timestamp\":\"2026-09-22T14:30:15Z\""));
+    assert!(json.contains("\"binlog\":\"mysql-bin.000150\""));
+    assert!(json.contains("\"position\":12345"));
+    assert!(json.contains("\"type\":\"Query\""));
+}
     let out1 = f.dir().join("out1");
     let mut cfg1 = cfg_for(f.dir(), &out1, true, OnError::SkipBadEvent);
     cfg1.threads = 1;

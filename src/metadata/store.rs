@@ -616,7 +616,7 @@ mod tests {
         let uri = std::env::var("MYSQL_TEST_URI").expect("MYSQL_TEST_URI must be set");
         let mut admin = Conn::new(uri.as_str()).unwrap();
         let version: String = admin.query_first("SELECT VERSION()").unwrap().unwrap();
-        println!("server version: {version}");
+        tracing::debug!("server version: {version}");
 
         admin
             .query_drop("DROP DATABASE IF EXISTS my2sql_t11")
@@ -648,7 +648,7 @@ mod tests {
         let has_invis = admin
             .query_drop("ALTER TABLE my2sql_t11.t1 ADD COLUMN hid int INVISIBLE DEFAULT 3")
             .is_ok();
-        println!("generated col added: {has_gen}, invisible col added: {has_invis}");
+        tracing::debug!("generated col added: {has_gen}, invisible col added: {has_invis}");
         // 「primary」子串判定实测：无真主键、唯一键名含 primary
         admin
             .query_drop(

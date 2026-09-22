@@ -18,6 +18,7 @@ use crate::binlog::file_reader::FileReader;
 use crate::binlog::table_map::TableMapEvent;
 use crate::config::{Config, OnError};
 use crate::flashback::final_for_tmp;
+use crate::flashback::report::JsonlReporter;
 use crate::flashback::reverse::{self, Block};
 use crate::metadata::schema::{Align, TableSchema, align_cols};
 use crate::metadata::store::{MetaError, SchemaStore};
@@ -147,6 +148,10 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
         ".flashback.tmp".into(),
         true,
     );
+    // P6 T1: Initialize report writer if configured
+    let mut reporter = cfg.report_file.as_ref()
+        .map(|path| JsonlReporter::new(path))
+        .transpose()?;
     let mut st = Runner::new(
         cfg,
         Filters::from_config(cfg),
@@ -154,9 +159,17 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
         DmlBuilder::flashback(SqlOpts::from_config(cfg)),
         Emitter::Flash { tmp: writer },
     );
+    // Wire reporter into runner if created
+    if let Some(report_writer) = reporter.take() {
+        st.report_writer = Some(report_writer);
+    }
     match st.run_flash() {
         Ok((mut summary, files)) => {
             summary.files = files;
+            // P6 T1: Close report writer on success
+            if let Some(ref mut rw) = st.report_writer {
+                let _ = rw.close();
+            }
             // --schema-dump：与 run_to_sql 同款装配层收口（P2 T7 补消费——
             // flashback 参数面与 to-sql 同构，旗标不得挂空）
             if let Some(p) = &cfg.schema_dump {
@@ -164,7 +177,13 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
             }
             Ok(summary)
         }
-        Err(e) => Err(e), // run_flash 内部已清 tmp/final（见 cleanup_flash_files）
+        Err(e) => {
+            // P6 T1: Ensure reporter is closed on error path
+            if let Some(ref mut rw) = st.report_writer {
+                let _ = rw.close();
+            }
+            Err(e)
+        }
     }
 }
 
@@ -262,6 +281,8 @@ pub(crate) struct Runner<'a> {
     /// flashback 形态收集的被排除 DDL/非事务 QUERY（(timestamp, binlog,
     /// start_pos, sql)），run 收尾统一 warn 汇总（简报 Step 4）。
     ddl: Vec<(u32, String, u32, String)>,
+    /// P6 T1: JSONL reporter for DDL skip events
+    report_writer: Option<JsonlReporter>,
     /// P3 T4 repl 形态提交边界水位队列：`(seq 水位, binlog, pos, ts)`——
     /// 水位 = 提交/回滚事件派发时刻的 `self.seq`（该事务全部 job 的 seq
     /// 均 < 水位）；仅 `run_live` 且给定 ckpt 路径时启用，file 模式恒空。
@@ -292,6 +313,7 @@ impl<'a> Runner<'a> {
             tmap: HashMap::new(),
             threads: cfg.threads.clamp(1, 64),
             ddl: Vec::new(),
+            report_writer: None,
             ckpt_q: VecDeque::new(),
             ckpt_out: None,
         }
@@ -620,13 +642,26 @@ impl<'a> Runner<'a> {
             // 非行事件只喂事务机（上游 file 模式 DDL/Query 不出 SQL）。
             // flashback 形态：非事务性 QUERY（DDL 等）登记排除清单，run 收尾
             // 汇总告警（begin/commit/rollback/空文本 = 事务脚手架，不登记）。
+            // P6 T1: Write to JSONL reporter if configured
             if self.is_flash()
                 && let RawKind::Query(sql) = &ev.kind
             {
                 let kw = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
                 if !kw.is_empty() && kw != "begin" && kw != "commit" && kw != "rollback" {
+                    // Record to ddl list (existing behavior)
                     self.ddl
                         .push((ev.timestamp, ev.binlog.clone(), ev.start_pos, sql.clone()));
+                    // P6 T1: Also write to JSONL report file if reporter is active
+                    if let Some(ref mut writer) = self.report_writer {
+                        let skip_event = crate::flashback::report::SkipEvent {
+                            timestamp: datetime_str(ev.timestamp, self.cfg.time_zone),
+                            binlog: ev.binlog.clone(),
+                            position: ev.start_pos as u64,
+                            type_: "Query".to_string(),
+                            sql: Some(sql.clone()),
+                        };
+                        let _ = writer.write(&skip_event); // Best effort - don't fail pipeline
+                    }
                 }
             }
             // P2 T4 stats 形态（Ruling：Status 标记由 dispatcher 顺序直推
