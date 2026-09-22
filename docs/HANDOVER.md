@@ -29,7 +29,11 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p4b-performance-design.md`；
   SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p4b-performance/`）
 - **P4b「性能面」计划 5 任务（T1 工装 / T2 profile / T4 搬运 并行 → T3 优化 →
-  T5 合流）全部完成**：`tools/bench-ab.sh` A/B 判定工装（median+MAD，selftest 8 例
+  T5 合流）全部完成，全分支终审 + 单修复轮收口**
+  （终审 6 job 全 PASS、仅文档面 findings F1–F5 → `debbe2e` 修正 + scoped 复评
+  APPROVE；合流亲跑 = tip `debbe2e` `cargo test --no-fail-fast` rc=0
+  **350 passed / 0 failed / 14 ignored**，逐字 `/tmp/p4b-close-test-full.log`）：
+  `tools/bench-ab.sh` A/B 判定工装（median+MAD，selftest 8 例
   + 恒等 A/A 冒烟）；`docs/bench/p4b-profile.md` profile 普查（threads 曲线 +
   假设判定 + 排序表）；mimalloc 全局分配器（glibc A/B 显著快 26.561% + musl 悬崖
   3.3→64.2 MiB/s 消账）；`src/repl/assembly.rs` 装配块纯搬运（move-only + 逐字节 +
@@ -2130,6 +2134,17 @@ mimalloc 全局分配器**（机动项 O2 尝试后不显著回滚、不在历�
   T1 `b6844fe`、T2 `5b6a363`、T1fix `2c670b9`、T3 `281735d`）+ 本 T5 合流 commit
   （`6ad820c`）+ 锁同步 `50b90b2`（fuzz workspace lock = T5 副作用注记的后续入账）。
   **本节点后收口（ff main → tag → push）= controller 特权，T5 lane 不执行（明确出界）。**
+- **收口节点（controller，本轮执行）**：分支 `worktree-feat-p4b` tip 含终审修正
+  `debbe2e` + 本收口 commit；**ff main**（aba8293 → P4b tip，线性无分叉）→
+  **tag `v0.4.1-p4b`**（annotated，指向 ff 后 main = P4b tip）→ **push origin
+  main + tag**。合流亲跑证据 = **`debbe2e` 树实测** `cargo test --no-fail-fast`
+  **350/0/14** rc=0（`/tmp/p4b-close-test-full.log`；其后仅本 docs-only 收口
+  commit，P4a 同型先例）；终审链 = 全分支评审
+  （6 job PASS + docs-only F1–F5）→ `debbe2e` → scoped 复评 APPROVE（独立复算
+  3.3×/sha/musl 中位/单位四形/50b90b2 断言全真）。P4b 区间 `aba8293..P4b-tip`
+  共 9 commit（spec/plan 2 + lane 5 + T5 + 锁 chore + 终审修 + 本收口）。
+  后续挂账视野：X3 归因实验、X1/X2 追加实验、threads 1→8 结构效率（2.01× 实测
+  在册，p4b.md 免责#3）、`--no-keep-trx` 结构守卫面（P4a 遗留，与本役无关）。
 
 ## P4b DoD 对账（spec §7 七条，T5 收尾）
 
