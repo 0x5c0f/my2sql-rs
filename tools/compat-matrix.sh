@@ -19,6 +19,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# P4a T5 合流接线：debug 二进制路径随 CARGO_TARGET_DIR 解析（并行 lane/合流
+# 役各自独立 target 目录是 spec §6 纪律；本脚本此前硬编码 ./target/debug，
+# 只在「worktree 恰好有本地 target」时碰巧成立）。与 shadow-replay.sh 的
+# BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs" 同口径。
+RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 VERSIONS="${VERSIONS:-5.6 5.7 8.0 8.4}"
 RESULTS="$ROOT/out/compat-results.tsv"
 mkdir -p out
@@ -85,7 +90,7 @@ SQL
       "SELECT CONCAT('plugin proof: ', user, '@', host, ' -> ', plugin) FROM mysql.user WHERE user IN ('root','probe')"
     docker exec "$PROBE_NAME" mysql -uroot -N -e \
       "SELECT CONCAT('probe plugin=', plugin) FROM mysql.user WHERE user='probe'" | grep -q "plugin=caching_sha2_password"
-    ./target/debug/my2sql-rs to-sql \
+    "$RSBIN" to-sql \
       --binlog-dir data/8.4 --start-file "$BIN" \
       --uri "mysql://probe:ProbePass123@127.0.0.1:$PORT" --time-zone +00:00 \
       --add-extra-info --threads 4 --output-dir "$outd/rs-sha2"
@@ -145,7 +150,7 @@ repl_body() { # <ver> <sid>；全部 stdout/stderr 由 repl_run 汇入用例日�
   REPL_FEEDER=$!
   sleep 3
   p3e2e_sql "$ctr" -e "FLUSH LOGS" || return 1   # 跨档：灌流中段轮转
-  timeout 300 ./target/debug/my2sql-rs repl \
+  timeout 300 "$RSBIN" repl \
     --binlog-dir /nonused --start-file "$f0" --start-pos "$p0" \
     --stop-datetime "$dtext" --time-zone +00:00 \
     --uri "$uri" --db "$db" --add-extra-info \
@@ -167,7 +172,7 @@ repl_body() { # <ver> <sid>；全部 stdout/stderr 由 repl_run 汇入用例日�
   local f1
   read -r f1 _ <<<"$(p3e2e_master_pos "$ctr")" || return 1
   p3e2e_capture_binlogs "$ctr" "$f0" "$f1" "$bd" || return 1
-  timeout 300 ./target/debug/my2sql-rs to-sql \
+  timeout 300 "$RSBIN" to-sql \
     --binlog-dir "$bd" --start-file "$f0" --start-pos "$p0" \
     --stop-datetime "$dtext" --time-zone +00:00 \
     --uri "$uri" --db "$db" --add-extra-info \

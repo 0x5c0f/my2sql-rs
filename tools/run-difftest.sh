@@ -29,6 +29,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# P4a T5 合流接线：debug 二进制路径随 CARGO_TARGET_DIR 解析（并行 lane/合流
+# 役各自独立 target 目录是 spec §6 纪律；本脚本此前硬编码 ./target/debug，
+# 只在「worktree 恰好有本地 target」时碰巧成立）。与 shadow-replay.sh 的
+# BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs" 同口径。
+RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 VER="${VER:-8.0}"
 NAME="my2sql-dt-${VER}"
 WORK_TYPE="${WORK_TYPE:-2sql}"
@@ -119,7 +124,7 @@ fi
 # 我方子命令映射：2sql→to-sql / rollback→flashback（flashback 无 --to-stdout，其余参数同）
 if [ "$WORK_TYPE" = rollback ]; then RSUB=flashback; else RSUB=to-sql; fi
 echo "== [5/7] rust $RSUB (online schema + dump)"
-./target/debug/my2sql-rs $RSUB \
+"$RSBIN" $RSUB \
   --binlog-dir "data/$VER" --start-file "$BIN" \
   --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
   --add-extra-info --threads 4 --output-dir "$OUT/rs" \
@@ -128,7 +133,7 @@ echo "== [5/7] rust $RSUB (online schema + dump)"
 
 if [ "$WORK_TYPE" = stats ]; then
   echo "== [5.5/7] rust stats + 冒烟断言（两报表存在 + DML 总和配平）"
-  ./target/debug/my2sql-rs stats \
+  "$RSBIN" stats \
     --binlog-dir "data/$VER" --start-file "$BIN" \
     --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
     --threads 4 --output-dir "$OUT/rs-stats" > "$OUT/rs-stats.log" 2>&1 \
@@ -153,12 +158,12 @@ print(f"stats smoke: report total={tot} to-sql DML lines={dml}")
 assert tot == dml, f"stats total {tot} != to-sql DML {dml}"
 PYEOF
   echo "== [5.6/7] rust --dml insert × stats 一致性冒烟（P3-T8 挂账 B，同形态增量）"
-  ./target/debug/my2sql-rs to-sql \
+  "$RSBIN" to-sql \
     --binlog-dir "data/$VER" --start-file "$BIN" \
     --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
     --dml insert --threads 4 --output-dir "$OUT/rs-dml-insert" > "$OUT/rs-dml-insert.log" 2>&1 \
     || { tail -20 "$OUT/rs-dml-insert.log"; echo "rust to-sql --dml insert FAILED"; exit 1; }
-  ./target/debug/my2sql-rs stats \
+  "$RSBIN" stats \
     --binlog-dir "data/$VER" --start-file "$BIN" \
     --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
     --dml insert --threads 4 --output-dir "$OUT/rs-stats-dml-insert" > "$OUT/rs-stats-dml-insert.log" 2>&1 \
@@ -201,7 +206,7 @@ if [ "$WORK_TYPE" = stats ]; then
   exit 0
 fi
 echo "== [7/7] offline schema replay (--schema-file, 与在线输出逐字节对差)"
-./target/debug/my2sql-rs $RSUB \
+"$RSBIN" $RSUB \
   --binlog-dir "data/$VER" --start-file "$BIN" \
   --schema-file "$OUT/schema.json" --time-zone +00:00 \
   --add-extra-info --threads 4 --output-dir "$OUT/rs-offline" > "$OUT/rs-offline.log" 2>&1 \
