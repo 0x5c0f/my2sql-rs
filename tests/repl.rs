@@ -805,10 +805,20 @@ impl Bt {
     /// 映射口（2026-09-21 实踩 1123→1124），重启件的 repl 子进程 URI 必须
     /// 跨重启稳定才谈得上「重连恢复」。
     fn new_pinned(slug: &str, hostport: Option<u16>) -> Bt {
+        Bt::new_ver_pinned(slug, "8.0", hostport)
+    }
+    /// P4a Lane D（加性）：版本参构造——5.6/5.7 idle 心跳件用。容器名
+    /// `p3e2e-{ver_with_dashes}-{sfx}`、起容器走 `p3e2e_container_start {ver}`
+    /// （lib 原生支持 5.6|5.7|8.0|8.4，seed 的 5.6 LONGTEXT 降级等版本探测
+    /// 全在 lib 既有分支内）。`new`/`new_pinned` 原签名 = ver="8.0" 委托。
+    fn new_ver(slug: &str, ver: &str) -> Bt {
+        Bt::new_ver_pinned(slug, ver, None)
+    }
+    fn new_ver_pinned(slug: &str, ver: &str, hostport: Option<u16>) -> Bt {
         let sfx = format!("p3t6b{slug}-{}", std::process::id());
-        let ctr = format!("p3e2e-8-0-{sfx}");
+        let ctr = format!("p3e2e-{}-{sfx}", ver.replace('.', "-"));
         let port_arg = hostport.map(|p| format!(" {p}")).unwrap_or_default();
-        let call = format!("p3e2e_container_start 8.0 {sfx}{port_arg}");
+        let call = format!("p3e2e_container_start {ver} {sfx}{port_arg}");
         // docker run 成功但后续步骤（如 wait_healthy 超时）失败时 Bt 尚未构造、
         // 析构 rm -f 不会跑——失败路径显式清容器再上抛 panic（不泄漏容器）。
         let out = libf_try(&call).unwrap_or_else(|(rc, err)| {
@@ -2575,4 +2585,275 @@ fn repl_sigint_idle_master_exits_130() {
     );
     assert!(cp.written_files.is_empty(), "零事件不得有产物名单: {cp:?}");
     checkpoint::read_verify(&run.join("resume.json"), &run).expect("终档自洽");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// P4a Lane D：5.6/5.7 idle 窗心跳帧形 live 件（spec §4，T0 挂账残余半面）。
+//
+// 形状 = repl_idle_60s_no_false_drop 全形态逐段移植（60s 静默逐秒验活、
+// 零 `repl: reconnect #`、静默后 F 段捕获、`repl done errors=0`、终档 =
+// Flast 提交界、read_verify、双段指纹 + PULSE 排除），外加**追平判据升格**
+// （spec §4）：静默窗 binlog 经 p3e2e_capture_binlogs 取档 → file 模式同窗
+// to-sql 基准 → blocks_text 序列对账（T6a 切片段同款比较纪律；此处不逐字
+// 节钉文件——版本 server 端注释/DDL 噪音容差按既有切片件口径）。
+//
+// 帧形观测（真实跑逐字转录，见各件 doc 注记 + task-4 报告）：
+//   ① `SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%'` 变量面探测（sql_soft
+//      容忍失败/空集）；② 心跳帧在场证据 = 60s 静默零假断链（负断言）+
+//      同构造 raw 帧流探针（examples/ 一次性观测件，跑后即删不入仓）记录
+//      的帧型字节。ReplSource 对 0x1b 无 trace 面（src/repl/source.rs:319
+//      静默 continue），按红线**不新增生产日志**。
+// ────────────────────────────────────────────────────────────────────────────
+
+/// 两件共享体：`ver` = 容器版本、`db` = 专属库名（p4aidl57/p4aidl56）。
+/// server_id 基数 `sidbase` 各件独用（81/91）防并发邻居撞线。
+fn idle_heartbeat_case(ver: &str, slug: &str, db: &str, sidbase: u32) {
+    live_gate();
+    let bt = Bt::new_ver(slug, ver);
+    bt.seed(db);
+    let server_v = libf(&format!("p3e2e_sql {} -N -e \"SELECT VERSION()\"", bt.ctr))
+        .trim()
+        .to_string();
+    // ── 心跳变量面探测（brief Step 2）：sql_soft 容忍（5.6 无此变量 =
+    // 空集/失败均不红，注记走 fallback 文本）──
+    let hbprobe = libf_soft(&format!(
+        "p3e2e_sql {} -N -e \"SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%'\"",
+        bt.ctr
+    ));
+    match &hbprobe {
+        Ok(o) if !o.trim().is_empty() => {
+            println!(
+                "[idle-hb:{ver}] server={server_v} binlog_heartbeat% = {}",
+                o.trim()
+            );
+        }
+        _ => {
+            if ver == "5.6" {
+                // brief 冻结的 fallback 注记（5.6 面逐字口径）：
+                println!(
+                    "[idle-hb:{ver}] server={server_v} 5.6 面：心跳周期纯客户端 \
+                     COM_BINLOG_DUMP 载荷，SET 通道不存在（SHOW GLOBAL VARIABLES \
+                     LIKE 'binlog_heartbeat%' 探测: {:?}）",
+                    hbprobe.map(|o| o.trim().to_string())
+                );
+            } else {
+                println!(
+                    "[idle-hb:{ver}] server={server_v} binlog_heartbeat% 变量面为空 \
+                     （SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%' 探测: {:?}；\
+                     心跳周期实走会话级 SET @master_heartbeat_period 通道，帧形见件注）",
+                    hbprobe.map(|o| o.trim().to_string())
+                );
+            }
+        }
+    }
+    let (f0, p0) = bt.master_pos();
+    let run = bt.sub("run");
+    let ro = run.to_str().unwrap().to_string();
+    let stop_unix = chrono::Utc::now().timestamp() + 100;
+    let stop = chrono::DateTime::from_timestamp(stop_unix, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let p0s = p0.to_string();
+    let mut child = spawn_bin(&[
+        "repl",
+        "--binlog-dir",
+        "/nonused",
+        "--uri",
+        &bt.uri,
+        "--start-file",
+        &f0,
+        "--start-pos",
+        &p0s,
+        "--db",
+        db,
+        "--add-extra-info",
+        "--output-dir",
+        &ro,
+        "--server-id",
+        &sid(sidbase),
+        "--heartbeat-secs",
+        "20",
+        "--threads",
+        "1",
+        "--stop-datetime",
+        &stop,
+    ]);
+    bt.feed(db, 2, "E");
+    // ── 静默 60s：每秒验活（无心跳续命的假断链会在 ~21/41s 附近爆）──
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) {
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "[idle-hb:{ver}] 静默 {}s 时进程退出 = 心跳未续命（假断链）",
+            t0.elapsed().as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    println!(
+        "[idle-hb:{ver}] 60s 静默验活通过（{}s 全程存活）",
+        t0.elapsed().as_secs()
+    );
+    // ── 静默后流量必须照常抓住（流仍是活的）──
+    bt.feed(db, 2, "F");
+    let tw = Instant::now();
+    while !raw_has(&run, b"'Fdoc1") {
+        assert!(
+            tw.elapsed() < Duration::from_secs(30),
+            "[idle-hb:{ver}] 静默后 30s 内 F 段落盘？"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "[idle-hb:{ver}] F 段等待期进程须存活"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (fp, pp) = bt.master_pos(); // = Xid('Flast') end（脉冲前最后一提交界）
+    assert_eq!(fp, f0, "本件单档");
+    let remain = stop_unix + 2 - chrono::Utc::now().timestamp();
+    if remain > 0 {
+        std::thread::sleep(Duration::from_secs(remain as u64));
+    }
+    bt.sql(&format!(
+        "INSERT INTO {db}.t_ord (sku, qty, note) VALUES ('IDLPULSE', 0, 'stop')"
+    ));
+    let out = wait_bounded(child, &format!("idle-hb-{ver}"), Duration::from_secs(120));
+    let esum = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "[idle-hb:{ver}] run 须 exit 0\n日志:\n{esum}"
+    );
+    let sum = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        sum.contains("repl done") && sum.contains("errors=0"),
+        "{sum}"
+    );
+    let rlines: Vec<&str> = esum
+        .lines()
+        .filter(|l| l.contains("repl: reconnect #"))
+        .collect();
+    assert!(
+        rlines.is_empty(),
+        "[idle-hb:{ver}] 60s 静默期不得出任何重连行（心跳续命失效）\n日志:\n{esum}"
+    );
+    let cp = read_cp(&run.join("resume.json")).expect("终档在场");
+    assert_eq!(
+        (cp.file.as_str(), cp.pos),
+        (f0.as_str(), pp),
+        "终档 = Flast 提交界（脉冲排除）"
+    );
+    checkpoint::read_verify(&run.join("resume.json"), &run).expect("read_verify");
+    let rb = dir_blocks(&run);
+    let text = blocks_text(&rb);
+    for tok in ["'Edoc1中文'", "'Elast'", "'Fdoc1中文'", "'Flast'"] {
+        assert!(text.contains(tok), "静默前后指纹缺 {tok}");
+    }
+    assert!(!text.contains("IDLPULSE"), "PULSE 不得入产");
+
+    // ── 追平判据升格（spec §4）：窗 binlog → file 模式同窗 to-sql 基准 →
+    // blocks_text 序列对账（T6a 切片比较纪律，双侧非空反假绿）──
+    let bins = bt.sub("bins-cmp");
+    let fout = bt.sub("file-cmp");
+    libf(&format!(
+        "p3e2e_capture_binlogs {} {f0} {f0} {}",
+        bt.ctr,
+        bins.display()
+    ));
+    let window: Vec<String> = vec![
+        "--uri".into(),
+        bt.uri.clone(),
+        "--start-file".into(),
+        f0.clone(),
+        "--start-pos".into(),
+        p0s.clone(),
+        "--stop-datetime".into(),
+        stop.clone(),
+        "--db".into(),
+        db.to_string(),
+        "--add-extra-info".into(),
+    ];
+    let mut args: Vec<&str> = vec!["to-sql", "--binlog-dir", bins.to_str().unwrap()];
+    args.extend(window.iter().map(String::as_str));
+    args.extend(["--output-dir", fout.to_str().unwrap()]);
+    let r = run_bin(&args, "idle-hb-file-cmp", Duration::from_secs(180));
+    assert!(r.status.success(), "file 模式同窗基准须 exit 0");
+    let fs = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        fs.contains("to-sql done") && fs.contains("errors=0"),
+        "file 基准摘要: {fs}"
+    );
+    let fbs = dir_blocks(&fout);
+    assert!(!rb.is_empty() && !fbs.is_empty(), "双侧空对账 = 假绿禁止");
+    assert_eq!(
+        rb.len(),
+        fbs.len(),
+        "repl {} 块 vs file {} 块（静默窗追平块数分歧）",
+        rb.len(),
+        fbs.len()
+    );
+    assert_eq!(
+        blocks_text(&rb),
+        blocks_text(&fbs),
+        "repl 产物 vs file 模式同窗 blocks_text 序列分歧（静默窗后未追平？）"
+    );
+    println!(
+        "[idle-hb:{ver}] 60s 静默零重连；E+F 双段在场；终档 {f0}:{pp} ∈ 事务界；\
+         追平对账 repl {} 块 ≡ file {} 块（{}B 语句流）",
+        rb.len(),
+        fbs.len(),
+        text.len()
+    );
+}
+
+/// 5.7 件帧形注记（2026-09-22 真机首跑逐字，探针 = 生产 transport 同构造
+/// 一次性观测件，跑后即删；报告 task-4 留档）：
+/// `SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%'` = **空集**（5.7.44 无该
+/// 全局变量面），心跳周期实走会话级 `SET @master_heartbeat_period`（T7 已证
+/// SET 被接受，本件补「帧实际到场」半面）。60s 静默窗探针逐字：
+/// ```text
+/// [probe] version=5.7.44-log master=mysql-bin.000003:154 heartbeat=20s
+/// [probe] t=020.0s kind=0x1b ts=0 log_pos=154 size=39 body=[109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 51, 147, 93, 75, 38]
+/// [probe] t=040.0s kind=0x1b ts=0 log_pos=154 size=39 body=[…同上逐帧全等…]
+/// [probe] t=060.0s kind=0x1b ts=0 log_pos=154 size=39 …
+/// [probe] t=080.0s kind=0x1b ts=0 log_pos=154 size=39 …
+/// ```
+/// 即 v1 心跳（0x1b）、ts=0、header log_pos=静默期主库活写位点、体 = 16B
+/// 日志文件名 + 4B 尾（帧间恒等内容尾 4B 恒定 = CRC32 口径，同 8.0 件
+/// spec §2 勘误-4），**非** fake rotate（流首 0x04 合成帧另算）。本件实测：
+/// 60s 静默零 `repl: reconnect #`；终档 mysql-bin.000003:14777 = Flast 提交
+/// 界；追平对账 repl 38 块 ≡ file 38 块（9795B 语句流）。
+#[test]
+#[ignore = "requires live mysql 5.7 container (make repl-test 门: MY2SQL_TEST_URI+CTR)"]
+fn repl_idle_heartbeat_5_7() {
+    live_gate();
+    idle_heartbeat_case("5.7", "hb57", "p4aidl57", 81);
+}
+
+/// 5.6 件帧形注记（2026-09-22 真机首跑逐字，同 5.7 件探针构造）：
+/// `SHOW GLOBAL VARIABLES LIKE 'binlog_heartbeat%'` = **空集**（5.6.51 无该
+/// 变量；brief fallback 口径「5.6 面：心跳周期纯客户端 COM_BINLOG_DUMP 载荷，
+/// SET 通道不存在」由件内 println 转录——**实测修正**：会话级
+/// `SET @master_heartbeat_period` 通道在 5.6.51 真实生效，见下帧流）。60s
+/// 静默窗探针逐字：
+/// ```text
+/// [probe] version=5.6.51-log master=mysql-bin.000004:120 heartbeat=20s
+/// [probe] t=020.0s kind=0x1b ts=0 log_pos=120 size=39 body=[109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 52, 123, 241, 67, 155]
+/// [probe] t=040.0s kind=0x1b ts=0 log_pos=120 size=39 body=[…逐帧全等…]
+/// [probe] t=060.0s kind=0x1b ts=0 log_pos=120 size=39 …
+/// [probe] t=080.0s kind=0x1b ts=0 log_pos=120 size=39 …
+/// ```
+/// 即 5.6 与 5.7 **同帧形**（v1 0x1b、ts=0、活写位点、16B 名 + 4B 尾），
+/// 无需 fake-rotate 续命退路；断言面按 brief 冻结 = 零 reconnect + 追平（帧
+/// 形只注记不钉）。本件实测：60s 静默零 `repl: reconnect #`；终档
+/// mysql-bin.000004:12437 = Flast 提交界；追平对账 repl 38 块 ≡ file 38 块
+/// （9847B 语句流）。seed 走 lib 既有 5.6 LONGTEXT 降级（JSON 列探测）。
+#[test]
+#[ignore = "requires live mysql 5.6 container (make repl-test 门: MY2SQL_TEST_URI+CTR)"]
+fn repl_idle_heartbeat_5_6() {
+    live_gate();
+    idle_heartbeat_case("5.6", "hb56", "p4aidl56", 91);
 }
