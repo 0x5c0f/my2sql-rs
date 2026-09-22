@@ -19,6 +19,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# 挂账#6（P4b T1）: 冒烟二进制走 CARGO_TARGET_DIR 口径（同 edb2148 RSBIN 约定），
+# 不再硬编码 ./target/debug（外部 TARGET_DIR 下会指向旧/不存在产物）。
+RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"
 VER=8.0
 NAME=my2sql-bench-80
 DATADIR="$ROOT/data/bench"
@@ -110,7 +113,7 @@ docker run --rm -u 0 -v "$DATADIR:/d" --entrypoint sh mysql:"$VER" \
   -c "find /d -maxdepth 1 -name 'mysql-bin*' -exec chmod a+r {} + && chmod a+rX /d && chmod 777 /d" >/dev/null
 
 echo "== [3/3] debug 构建在线 --uri 全量冒烟 + schema dump → data/bench/schema.json"
-./target/debug/my2sql-rs to-sql \
+"$RSBIN" to-sql \
   --binlog-dir "$DATADIR" --start-file "$BIN" \
   --uri "mysql://root@127.0.0.1:$PORT" --time-zone +00:00 \
   --to-stdout --schema-dump "$DATADIR/schema.json" \
