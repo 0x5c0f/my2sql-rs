@@ -1,15 +1,17 @@
 # my2sql-rs
 
 MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / stats / repl），
-能力对齐 Go 版 [my2sql](https://github.com/ultradb/my2sql)（本仓库内
-`reference/my2sql-go/` 作为行为参考与差分裁判），但 CLI 全新设计、无 async
-（std::thread + crossbeam-channel）。当前处于 **P3：file 模式 to-sql /
-flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）已达发布
-标准**（flashback/stats × repl 明确不做，见 spec §0）。P3 之后 **P4a
-质量并行面已合入**：cargo-fuzz 正式闸（`make fuzz-min`）、影子库三段回放
-（`make shadow-test`）、difftest 三列形捕获（`P4A=1 make difftest`）、
-5.6/5.7 idle 心跳 live 件（`make repl-test` 家族 13 件）——逐字回归台账见
-[docs/HANDOVER.md](docs/HANDOVER.md)「P4a 任务节点日志」与「P4a DoD 对账」节。
+能力对齐 Go 版 [my2sql](https://github.com/liuhr/my2sql)（本仓库内
+`reference/my2sql-go/` 作为行为参考与差分裁判——该目录不入库，跑
+`make difftest`/`make compat` 需本地真实副本，见 docs/HANDOVER.md「环境事实」
+运维注），但 CLI 全新设计、无 async（std::thread + crossbeam-channel）。
+**P1–P4b 五轮收官**（v0.1.0-p1 to-sql file 模式 → v0.2.0-p2 flashback + stats →
+v0.3.0-p3 repl → v0.4.0-p4a 质量并行面 → v0.4.1-p4b 性能面），里程碑账见
+[CHANGELOG.md](CHANGELOG.md)；**P5 发布面**：CI 门禁 + `v0.5.0` GitHub Release
+（双目标预编译产物，见下文「安装与发布」节）。范围边界不变：repl 仅
+to-sql 实时流形态（flashback/stats×repl、repl×Go 裁判差分明确不做，见
+P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
+全量回归六闸日志、白名单全文）见 [docs/HANDOVER.md](docs/HANDOVER.md)。
 
 ## 功能矩阵
 
@@ -36,12 +38,24 @@ flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）
 （P4b mimalloc 落地后终态跑，≥40 MB/s 通过，回归闸 vs P1 真值 103.85 MiB/s
 **+22.86% 更快 → GREEN**）——逐字基线、三套口径（criterion 账本 / `make bench-ab`
 端到端 A/B / `make bench-profile` 曲线）与挂账 #7「P1→P2 代码增量复测钉死不显著」
-见 [docs/bench/p4b.md](docs/bench/p4b.md)。历史账本：P1 基线 **103.9 MiB/s**
+见 [docs/bench/p4b.md](docs/bench/p4b.md)。历史账本：P1 基线 **103.85 MiB/s**
 （[docs/bench/p1.md](docs/bench/p1.md)）；P2 回归闸（spec §6.4）原始读数 −14.9%，
 同机 A/B 归因为环境漂移 −8.3% + 代码增量 −3.2%（95% CI 跨 0，未达 5% 判定线）
 ——P4b 用 `tools/bench-ab.sh` 工装复测将该 −3.2% 弱信号**钉死为端到端不显著**
 （delta +2.812%＝0.1897s < 阈值 0.5714s，N=5，不升级 N=9），证据与测量陷阱见
 [docs/bench/p2.md](docs/bench/p2.md) + [docs/bench/p4b.md](docs/bench/p4b.md) ③。
+
+## 安装与发布
+
+预编译二进制见 [GitHub Releases](https://github.com/0x5c0f/my2sql-rs/releases/tag/v0.5.0)：
+`my2sql-rs-0.5.0-x86_64-unknown-linux-gnu`（glibc 动态）与
+`my2sql-rs-0.5.0-x86_64-unknown-linux-musl`（musl 静态单二进制，
+吞吐 64.2 MiB/s@threads=8，见 [docs/bench/p4b.md](docs/bench/p4b.md) ④）+ `SHA256SUMS`。
+
+    sha256sum -c SHA256SUMS   # 下载后校验
+
+自构建：`cargo build --release`（glibc）；
+`cargo build --release --target x86_64-unknown-linux-musl`（需 musl-gcc）。
 
 ## 快速上手
 
@@ -156,8 +170,11 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   resume 启动对账只对「名单承诺而盘上缺失」硬错；盘上多出的未登记残骸
   （撕裂事务半块等）告警放行，不死锁恢复。
 - 一键回归：`make repl-test`（起一次性 mysql:8.0 容器跑 tests/repl.rs 全部
-  live 件，`VER=5.7 make repl-test` 换版本；P4a 合流轮全家族实测
-  13 passed / 0 failed / 823.02s，含 5.6/5.7 idle 心跳两件）。
+  live 件，`VER=5.7 make repl-test` 换版本；**最新逐字账 = P4b T5 合流轮**
+  实测 13 passed / 0 failed / 0 ignored / 2 filtered out / 815.30s，上账
+  P4a 合流轮 13 passed / 0 failed / 823.02s 亦全绿，均含 5.6/5.7 idle
+  心跳两件；逐字出处 [docs/HANDOVER.md](docs/HANDOVER.md)
+  「P4b 任务节点日志」T5 节点）。
 
 收尾清理：`docker rm -f my2sql-dt-8.0`。
 
@@ -333,6 +350,9 @@ P4a（质量面）追加：
   `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`
 - P3 repl 设计/计划：`docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`、
   `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`
+- P5 发布面设计/计划：`docs/superpowers/specs/2026-09-22-my2sql-rs-p5-release-design.md`、
+  `docs/superpowers/plans/2026-09-22-my2sql-rs-p5-release.md`
+- 里程碑更新日志（结论级数字、全带出处）：[CHANGELOG.md](CHANGELOG.md)
 - 进度/决策/白名单台账：[docs/HANDOVER.md](docs/HANDOVER.md)
 - 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)（P1 基线）、
   [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）、
