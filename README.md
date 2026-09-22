@@ -5,7 +5,11 @@ MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / st
 `reference/my2sql-go/` 作为行为参考与差分裁判），但 CLI 全新设计、无 async
 （std::thread + crossbeam-channel）。当前处于 **P3：file 模式 to-sql /
 flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）已达发布
-标准**（flashback/stats × repl 明确不做，见 spec §0）。
+标准**（flashback/stats × repl 明确不做，见 spec §0）。P3 之后 **P4a
+质量并行面已合入**：cargo-fuzz 正式闸（`make fuzz-min`）、影子库三段回放
+（`make shadow-test`）、difftest 三列形捕获（`P4A=1 make difftest`）、
+5.6/5.7 idle 心跳 live 件（`make repl-test` 家族 13 件）——逐字回归台账见
+[docs/HANDOVER.md](docs/HANDOVER.md)「P4a 任务节点日志」与「P4a DoD 对账」节。
 
 ## 功能矩阵
 
@@ -20,9 +24,12 @@ flashback / stats 与复制协议拉流模式 `repl`（× to-sql 流式形态）
 | 输出形态（`--output-dir/--to-stdout/--file-per-table/--add-extra-info/--no-db-prefix/--full-columns` 等） | ✅ | |
 | `flashback`（反向/回滚 SQL，记录原子逆序 + keep-trx 事务脚手架） | ✅ | Go `-work-type rollback` 裁判差分 4 版本全绿（`flashback-{5.6,5.7,8.0,8.4}`）+ `WORK_TYPE=rollback make difftest` + 活库正逆对账（`tools/flashback-reconcile.sh`）；DDL 反向明确不做（D5） |
 | `stats`（窗口×表 DML 行数 + 大/长事务识别，两报表 + JSONL） | ✅ | `stats-{5.6,8.0}` 冒烟绿（报表 DML 总和 == 同流 to-sql 行数）；上游报表字节面复刻，**不做**裁判差分（spec §3.6，理由见差异 22） |
-| repl 模式（伪装 replica 拉流，to-sql 流式形态） | ✅ | 事务边界 checkpoint + `--resume-file` 接续 + 指数退避自动重连 + 心跳探活（超集四件，见差异 23）；**等价性总闸**：repl 与 file 模式同 binlog 段产出逐字节一致；`make repl-test` live 件 10 项全绿、`make compat` 18 用例（既有 14 + repl×4 版本，逐字见 matrix.md）；**不做**与 Go 裁判差分（上游 repl 不可作裁判，理由见差异 25）；TLS 不提供（差异 26） |
+| repl 模式（伪装 replica 拉流，to-sql 流式形态） | ✅ | 事务边界 checkpoint + `--resume-file` 接续 + 指数退避自动重连 + 心跳探活（超集四件，见差异 23）；**等价性总闸**：repl 与 file 模式同 binlog 段产出逐字节一致；`make repl-test` live 件 13 项全绿（P4a +5.6/5.7 idle 心跳两件）、`make compat` 18 用例（既有 14 + repl×4 版本，逐字见 matrix.md）；**不做**与 Go 裁判差分（上游 repl 不可作裁判，理由见差异 25）；TLS 不提供（差异 26） |
 | DDL 回滚 / `--apply` 直写库 / MariaDB / 8.0.1 default_metadata | ❌ | 明确不做（设计决策 D5） |
-| fuzz 正式接入 / 影子库端到端回放 / musl 静态性能 | ❌ | P4（musl 构建本身已可用，见 docs/bench/p1.md） |
+| fuzz 正式接入（cargo-fuzz 两靶 + 确定性语料 + 300s 闸） | ✅ | `make fuzz-min`：`fuzz/` 独立 workspace，靶 decode_event/event_stream 各 300s（`FUZZ_TIME=<秒>` 缩窗），0 新 crash 判据；起点语料 = `tests/fuzz_seed/` 同源 seedgen 确定性 40 件（禁随机入仓）；两靶 300s×2 真跑 0 crash 证据（2026-09-22，T5 合流轮逐字）见 HANDOVER P4a 节 |
+| 影子库端到端回放（前向/逆向/往返三段） | ✅ | `make shadow-test [VER=…]`：to-sql 产物灌影子库==主库后态、flashback 产物==前态、往返回前态，逐表 CHECKSUM + 行级 diff 双腿无假绿；8.0 spec 原形态（live 锚），5.7 REF-clone 锚（JSON checksum 上游不可定值，豁免仅 checksum 腿——裁定见 HANDOVER）；`SHADOW_NEGCHECK=1` 负自检验钞机 |
+| P4A 列形捕获（ENUM>255 / GEOMETRY / LONGBLOB>64K） | ✅ | `P4A=1 make difftest`（仅 8.0 主闸）：三形 Go 裁判差分 14/14 组全绿 + 自 roundtrip checksum/行级双门；三形均裁判支持、无新增行为差异（登记见差异 28），明细 docs/p4a-findings.md |
+| musl 静态性能 | ❌ | 挂账续留（musl 构建本身已可用，实测崩塌归 musl malloc arena 竞争，见 docs/bench/p1.md） |
 
 吞吐基线（DoD-3，发布态，528 MiB 合成 binlog）：**threads=8 ≈ 103.9 MiB/s**
 （≥ 40 MB/s 通过），明细见 [docs/bench/p1.md](docs/bench/p1.md)。P2 回归闸
@@ -143,7 +150,8 @@ DELETE FROM `dt`.`t_nokey` WHERE `a`=2 AND `b` IS NULL AND `c` IS NULL;
   resume 启动对账只对「名单承诺而盘上缺失」硬错；盘上多出的未登记残骸
   （撕裂事务半块等）告警放行，不死锁恢复。
 - 一键回归：`make repl-test`（起一次性 mysql:8.0 容器跑 tests/repl.rs 全部
-  live 件，`VER=5.7 make repl-test` 换版本；单轮实测 10 passed / 0 failed / 476.76s）。
+  live 件，`VER=5.7 make repl-test` 换版本；P4a 合流轮全家族实测
+  13 passed / 0 failed / 823.02s，含 5.6/5.7 idle 心跳两件）。
 
 收尾清理：`docker rm -f my2sql-dt-8.0`。
 
@@ -156,13 +164,20 @@ make difftest   # 7 步：comparator 自检 → 构建 Go 裁判+Rust → mysql:
                 # → 双方各自 to-sql → 语义比较（白名单闸口）→ 离线回放逐字节对差
                 # WORK_TYPE=rollback|stats make difftest → flashback 裁判差分 /
                 #   stats 冒烟配平（同 7 步骨架，产物目录加 -rb/-stats 后缀）
+                # P4A=1 make difftest → 追加 P4a 三列表组（ENUM>255 / GEOMETRY /
+                #   LONGBLOB>64K；仅 8.0 主闸，默认关零影响）
 make compat     # 全版本矩阵 18 用例：5.6/5.7/8.0/8.4 × {差分, checksum 双态,
                 # V1 rows 探针, 8.4 caching_sha2} + flashback×4 + stats 冒烟×2
                 # + repl 族×4（repl==file 逐字节等价，无 Go 裁判，见差异 25），
                 # 结果表 docs/compat/matrix.md
 make repl-test  # repl live e2e 套件（一次性 mysql:8.0 容器：等价性总闸、kill-9
-                # 接续、容器重启自动重连、位点三态/stop/心跳、threads>1 水位；
-                # VER=<版本> 换镜像，--test-threads=1 串行）
+                # 接续、容器重启自动重连、位点三态/stop/心跳、threads>1 水位、
+                # P4a 5.6/5.7 idle 心跳两件；VER=<版本> 换镜像，
+                # --test-threads=1 串行）
+make fuzz-min   # P4a fuzz 正式闸：两靶各 300s 真跑（FUZZ_TIME=<秒> 缩窗），
+                # crash artifact 落 out/fuzz/<靶>/，新 crash 或运行失败即红
+make shadow-test  # P4a 影子库三段闸（VER=<版本> 换版本；SHADOW_NEGCHECK=1
+                  # 负自检验钞机；KEEP=1 失败保留容器排障）
 make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustfmt
 ```
 
@@ -207,7 +222,9 @@ make test && make lint && make fmt   # 单元测试 / clippy -D warnings / rustf
    判等）。防恶意 binlog 的实际口径：解码器对**已知**敌意输入做了 panic
    加固 + 回归闸（JSON 深度闸 100、DECIMAL 满组越界闸、截断/位图/charset
    畸形面，`tests/fuzz_seed/` 4 件种子逐字节钉死）；连续探索式 fuzz
-   （cargo-fuzz 正式 campaign）归 P4，本工具不宣称穷尽防恶意 binlog。
+   （cargo-fuzz 正式 campaign）P4a 已接入为常态闸（`make fuzz-min` 两靶 300s
+   0 新 crash + `tests/fuzz_seed/` 病理语料回归钉），但本工具不宣称穷尽防恶意
+   binlog。
 10. **TIMESTAMP 零值渲染 `1970-01-01 00:00:00`**（MySQL 合法零值语义）；上游
     go-mysql 走 `formatZeroTime` 输出 `0000-00-00`（ALW-ZERO-TIMESTAMP）。
 11. **UPDATE 仅输出变化列**（before/after 逐列对比后省略等值列）；上游 SET 段
@@ -286,6 +303,20 @@ P3（repl）追加：
     同源的解码权威唯一性：repl 事件经 `Event::write` 重建为与磁盘文件
     逐字节同构的帧后喂同一解码器，零第二解码路径）。
 
+P4a（质量面）追加：
+
+28. **P4a 三列形真机捕获登记（差异清单续号；无新增行为差异）**（spec §3，
+    逐字台账 docs/p4a-findings.md）：ENUM >255 成员（2B packlen，边界序号
+    255/256/300 行级实证）、GEOMETRY POINT/LINESTRING/POLYGON（SRID 4326
+    字节保真首次实抓）、LONGBLOB >64KB（4B 长前缀 + 跨页 280,000B 单事件）
+    三形**全部 Go 裁判支持**：`P4A=1 make difftest` 14/14 组全绿（8.0），
+    双方语句在既有三类打印差异（JSON `null`/`NULL`、hex 字面量
+    `X'小写'`/`0x大写`、UPDATE 多列 `, `/`,`——均为既有白名单成员
+    ALW-JSON-*/ALW-BLOB-HEX/ALW-WHERE-PARENS 同族口径，非新增差异）归一后
+    md5 相同；两家 ENUM 均输出
+    **1-based 序号**（裁决 D4 现状），非成员名字符串保真。挂账清单
+    「测试债三列形覆盖缺口」由本件销账。
+
 ## 文档
 
 - 设计权威：`docs/superpowers/specs/2026-09-20-my2sql-rust-design.md`
@@ -297,4 +328,6 @@ P3（repl）追加：
 - 吞吐基线明细：[docs/bench/p1.md](docs/bench/p1.md)（P1 基线）、
   [docs/bench/p2.md](docs/bench/p2.md)（P2 回归闸与未判定 finding）
 - 版本兼容矩阵：[docs/compat/matrix.md](docs/compat/matrix.md)
-- 模糊测试种子语料：`tests/fuzz_seed/`（P4 fuzz 正式接入的起点语料）
+- 模糊测试：种子语料 `tests/fuzz_seed/`（回归闸 `tests/fuzz_seed.rs`）+ P4a 起
+  `fuzz/` cargo-fuzz workspace 正式接入（seedgen 单源确定性语料，
+  `make fuzz-min` 直通），不再是「起点语料待接入」形态

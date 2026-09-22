@@ -1,5 +1,5 @@
 # my2sql-rs —— P1 任务绑定入口（Task 15 起；其余目标直通 cargo）
-.PHONY: test lint fmt difftest compat repl-test
+.PHONY: test lint fmt difftest compat repl-test fuzz-min shadow-test
 
 test:
 	cargo test
@@ -28,3 +28,10 @@ repl-test:
 		p3e2e_container_start "$${VER:-8.0}"; \
 		export MY2SQL_TEST_URI="$$P3E2E_URI" MY2SQL_TEST_CTR="$$P3E2E_CTR"; \
 		cargo test --test repl -- --ignored --nocapture --test-threads=1'
+
+## P4a T1/T2 入口（脚本本体归各 lane；env 透传：FUZZ_TIME/SHADOW_NEGCHECK/VER）
+fuzz-min:
+	bash tools/fuzz-min.sh
+
+shadow-test:
+	bash tools/shadow-replay.sh $${VER:-8.0}

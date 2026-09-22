@@ -24,7 +24,19 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 
 ## 当前进度
 
-- 分支：`worktree-feat+p3`（worktree `.qoder/worktrees/feat+p3`，base
+- 分支：`worktree-feat-p4a`（base `main@2149ce1`（= P3 终审后合入态
+  `v0.3.0-p3`）；P4a 计划 =
+  `docs/superpowers/plans/2026-09-22-my2sql-rs-p4a-quality-lanes.md`，
+  spec = `docs/superpowers/specs/2026-09-22-my2sql-rs-p4a-quality-lanes-design.md`；
+  SDD 台账 `.superpowers/sdd/2026-09-22-my2sql-rs-p4a-quality-lanes/progress.md`）
+- **P4a 计划 5 任务（T1–T4 并行 + T5 串行合流）全部完成**：fuzz 正式接入
+  （两靶 300s 闸 + 实抓 2 发解码器 panic，开闸条款 3 处 `checked_add` 闸）、
+  影子库三段闸（8.0 spec 原形态全绿 + 5.7 REF-clone 锚裁定入册 + negcheck
+  验钞机）、difftest P4A 三列形真机捕获（三形全 Go 支持，测试债销账）、
+  5.6/5.7 idle 心跳 live 件（repl live 家族 11→13，帧形实测钉死）；
+  T5 落 `make fuzz-min`/`make shadow-test` 直通行 + 全量回归逐字台账，
+  DoD 对账见「P4a DoD 对账」节。待全分支终审（ff main + tag v0.4.0-p4a）。
+- 前史（P3）：`worktree-feat+p3`（worktree `.qoder/worktrees/feat+p3`，base
   `main@0905368`（= feat/p2 终审后合入态 v0.2.0-p2）；
   P3 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p3-repl.md`，
   spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p3-repl-design.md`；
@@ -34,7 +46,7 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   自动重连、心跳探活、resume 防覆盖闸）+ 等价性总闸（repl==file 逐字节）；
   live 套件 10/10、compat 矩阵 18/18，DoD 对账见「P3 DoD 对账」节。
   全分支终审已做（六件 A–F，两轮终审修复 + 合流亲跑 11/11·349 绿，
-  见该节第 7 条），正合入 main。
+  见该节第 7 条），已合入 main（`2149ce1`，tag `v0.3.0-p3`）。
 - 前史（P2）：`feat/p2`（worktree `.qoder/worktrees/feat+p2`，base
   `main@205512b`；P2 计划 = `docs/superpowers/plans/2026-09-21-my2sql-rs-p2-flashback-stats.md`，
   spec = `docs/superpowers/specs/2026-09-21-my2sql-rs-p2-flashback-stats-design.md`；
@@ -1688,6 +1700,224 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 | P2 挂账：`--dml`×stats 裁判维度（P2 T9 挂账） | ✅ 消费（`60a9019`） | DoD-6；挂账清单原条勾销 |
 | P3 新挂账 7 条（T5/T6/T7 终审视野转正） | ⏳ 入册 | 「遗留/挂账清单」节 P3 块 |
 
+## P4a 任务节点日志（T1–T5）
+
+> spec `docs/superpowers/specs/2026-09-22-my2sql-rs-p4a-quality-lanes-design.md`，
+> plan `docs/superpowers/plans/2026-09-22-my2sql-rs-p4a-quality-lanes.md`。四 lane
+> 并行（T1–T4，各自 worktree + 独立 CARGO_TARGET_DIR，评审+修复轮后 ff 合入
+> worktree-feat-p4a）+ T5 合流串行。合入序：T1 `52058c7` → T2 `1bee320` →
+> T3 `7774558` → T4 `b4ba03c`。节点事实逐字引各 lane 报告
+> （`.superpowers/sdd/2026-09-22-my2sql-rs-p4a-quality-lanes/task-<n>-report.md`）。
+
+### P4a T1（Lane A）：cargo-fuzz 正式接入 + 解码器 3 处溢出闸（开闸条款首启用）
+
+- 提交 `48e5134`（本体）+ 评审修复轮 1 `cae7319` + 轮 2 `df515d0`/`8dcdc7f`；
+  合入 `52058c7`。
+- 形态：`fuzz/` 独立 workspace（根 Cargo.toml `exclude = ["fuzz"]`，主构建/三门/
+  矩阵零感知）；靶 `decode_event`（单事件字节→header→strip→type 路由）+
+  `event_stream`（多事件流 + TrxStateMachine 语义面，钉 trx_id 不回退）；seedgen
+  确定性产 **40 件语料**（7 畸形 + 3 合法基线 × crc0/crc1 × 两靶目录各 20，禁随机
+  入仓、构建期 `self_check_legal` 断言 legal 件 crc1 腿可解）；`tools/fuzz-min.sh`
+  闸 = 每靶 300s 并行 + 语料隔离（副本跑 `out/fuzz/<t>/corpus/`，仓库语料只读）+
+  禁假绿（逐靶取退出码，非 0 且无 crash 件判 FAIL）。
+- **2 发真 panic 实抓（本役核心发现）**：
+  ① `panicked at src/binlog/table_map.rs:79:19: attempt to add with overflow`
+  （parse_table_map `pos + n_cols`，0xFE LNE 声明 u64::MAX；tmin 51B）；
+  ② `panicked at src/binlog/table_map.rs:299:31: attempt to add with overflow`
+  （decode_optional_meta TLV `pos + l` 同源；tmin 562B）。TDD 红钉先行
+  （`cargo test --test fuzz_seed` FAILED：`tm_ncols_overflow.bin: 解码层 panic
+  （DoD-4 违例）`）→ `checked_add` 修复 → 绿；12 件历史 crash/minimized 输入逐件
+  重跑不再崩。
+- 第 3 处闸（`proto.rs::read_lns`）= **preventive**：评审轮 2 审计链实测——闸回退态
+  下 seed6 磁盘件因表名声明长漂移（声明 8 实给 9）解析拐进 parse_charset
+  （`InvalidData("... TLV type 254: truncated length prefix")`），**够不到 read_lns
+  加法**。登记为已知事实（fuzz 语料面），seed6 不修；该闸红钉改由定向单测
+  `read_lns_u64max_declared_len_is_too_short_not_panic` 独扛（回退态逐字红
+  `panicked at src/binlog/proto.rs:57:27: attempt to add with overflow`，带闸绿）。
+- 靶面勘误（评审轮 1）：简报「XID_EVENT (15,16)」笔误——15=FORMAT_DESC、16=Xid、
+  33/34=Gtid，按 `src/binlog/event.rs` 权威表路由；event_stream 的 query_text
+  `sv_len` 错读 err_code（body[9..11]→body[11..13]）同轮修复（此前 QUERY 喂状态机
+  半面形同未跑）。
+- 规模/计数：lane 修复轮 1 正式 300s×2 逐字 `Done 21569979 runs in 301 second(s)`
+  （decode_event，exec/s 71661，cov 672）/ `Done 5190208 runs in 301 second(s)`
+  （event_stream，exec/s 17243，cov 1805）；crash **0/2**。三门 350 passed/0 failed
+  （=349 + read_lns 新钉）；`cargo +nightly fuzz build` Finished；动 src/binlog/
+  强制的 difftest 8.0 `groups A=21 B=21 aligned=21 green=21 red=0` + replay
+  byte-identical；compat 18 件移交本役 T5 亲跑（见 T5 节点）。
+
+### P4a T2（Lane B）：tools/shadow-replay.sh 影子库三段闸
+
+- 提交 `4edbea9` + 评审修复轮 1 `df76581`（唯一入库文件即脚本）；合入 `1bee320`。
+- 闸形：前向（活库混合 DML→同窗 to-sql 产物灌影子库 == 主库后态 P1）/ 逆向
+  （后态影子灌 flashback 产物 == 前态 P0）/ 往返（前向影子再逆灌 == P0），
+  逐表 CHECKSUM TABLE 等值 + 行级 mysqldump diff **双腿独立**；另有 setup 起点
+  自证闸（SETUP_* == P0/P1）、窗口边界钉（P1doc1/P1last 在场、P0 指纹缺席）、
+  `assert_stmts` 硬闸（`statements=115 == DML 行=115` 升格为机闸）、静绿保险丝
+  （NULL checksum/空表清单/空行集一律红）、`SHADOW_NEGCHECK=1` 验钞机（注入
+  单行漂移，前向闸必须红）。容器 p3e2e-*-p4ash* 自建自清，trap 先于容器启动，
+  INT/TERM→130 无泄漏；证据目录 `out/shadow-replay/<VER>/` 版本命名空间。
+- 8.0 主件（anchor=live，spec 原形态，exempt-json=0）逐字：P0
+  `t_doc=2877097027 t_ord=2830880655`、P1 `t_doc=2572327458 t_ord=2651036437`；
+  FWD_SHADOW==P1、REV_SHADOW/RT_SHADOW==P0 与主库 live 值**逐位互换相等**，
+  五闸全 `GATE GREEN ... checksum-equal=2/2 exempt-json=0 (rowdiff bytes=0)`，
+  窗口 `mysql-bin.000003:12814..24356`。
+- negcheck：漂移被双腿独立抓到（checksum 腿 `1/2` t_ord 2651036437→2408576875；
+  行级腿唯一漂移行 `(1,'P0sku1',1,NULL)`→`(1,'P0sku1',2,NULL)`）→
+  `NEGCHECK: expected mismatch observed` 反转 exit 0。
+- **5.7 裁定（控制器背书，本役确认推广口径）**：5.7 `CHECKSUM TABLE` 对含 JSON 列
+  的表**不可定值**（同表零写入连读四次 3642844648/3642844648/3876613648/3843993102；
+  live/dump 回灌/ALTER 重建三态互异而逻辑内容逐字相同）——上游物理 JSON 未初始化
+  填充进 checksum，等式无任何合法构造方式。处置：期望侧 = **REF clone**（快照回灌
+  `p4ashadow_ref`）+ `gate_rows` 硬锚（REF↔live 行级逐字相等，锚不住整轮红）；
+  豁免**仅限 checksum 腿的含 JSON 列表**（本 seed=t_doc），t_ord 与 live 直接互等
+  （FWD 2651036437==P1、REV/RT 2830880655==P0）；**行级腿零豁免**。5.7 冒烟
+  anchor=clone 全绿（19s）。8.0 面 a/b 均不启用，spec 原形态。
+- T5 合流加固（`92a62ea`）：VER 白名单 `5.6|5.7|8.0|8.4` 在**任何 rm -rf / OUT
+  路径插值之前**校验，非白名单直接 exit 2 报错退出（实测 `9.9` 与注入串
+  `8.0; rm -rf /` 均拒于任何目录操作与容器启动之前，零残留）。
+
+### P4a T3（Lane C）：difftest P4A 三列形真机捕获（测试债列形缺口销账）
+
+- 提交 `3bf7fc1`（+in-lane 修复轮）；合入 `7774558`。文件面：新增
+  `tools/gen-data-p4a.sql`、`tools/p4a-roundtrip.sh`、`docs/p4a-findings.md`；
+  `tools/run-difftest.sh` 仅 +P4A env 门（默认关；P4A=1 且 VER≠8.0 → 拒 exit 2）。
+  **src/ 零改动**。
+- `P4A=1 VER=8.0 make difftest` 逐字：`groups A=14 B=14 aligned=14 green=14 red=0`、
+  `to-sql done: events=14, statements=20, files=1, errors=0`、步骤 7 离线回放
+  `diff -r` 空。三形**全部 Go 支持、无违例形**：ENUM 300 成员（2B packlen，
+  meta 直证 `f702 f702`，序号 255/256/300 在场）、GEOMETRY POINT/LINESTRING/
+  POLYGON + SRID 4326（`E610` LE 前缀字节保真首实抓，裁决 7 路径）、LONGBLOB
+  70,000/280,000 B（`WRITE_ROWSv2 event len=280044` 4B prefix 跨页）。
+- 机械核验（比较器之外）：两侧 20 条 DML 在既有三类打印差异归一后 md5 相同
+  （`7be7a1a149b8ace7285ed8c1bd22739f` 双方）；19 个 hex payload token 序列全等。
+  自 roundtrip（`tools/p4a-roundtrip.sh`）三表 CHECKSUM clone==main：
+  2619814406 / 4084198807 / 1767911749 + 行级 diff 空（逐表真实数据行 4/2/1）。
+- **ENUM 保真措辞（本役钉死）**：两侧输出均为 **1-based 序号**（既有裁决 D4 现状），
+  不是成员名字符串保真——README/FINDINGS 引用口径以此为准。
+- seed 实踩勘误：8.0 对 SRID 4326 按「纬,经」轴序解释首坐标（`POINT(179.9 -89.9)`
+  报 ERROR 3617），改 `POINT(-89.9 179.9)` 保边界极值；简报「210,000B」为乘数
+  笔误（实 280,000B）。首版 FINDINGS「7/5/4 数据行」系 mysqldump 裸 `--` 样板行
+  计入的计数笔误，修复轮以双侧 `grep -ac '^INSERT'`>0 硬闸重生成 4/2/1
+  （checksum 三值不变）。
+- 回归：plain `make difftest` 21/21 不回归（P4A 默认关零字节变化）；compat 矩阵
+  本件不触发重跑（独立于 compat 家族，spec §3；src/binlog 零改动）。
+
+### P4a T4（Lane D）：5.6/5.7 idle 窗心跳 live 件（repl 家族 11→13）
+
+- 提交 `24865ab`；合入 `b4ba03c`。`tests/repl.rs` +两 `#[ignore]` live 件
+  （`repl_idle_heartbeat_5_7` / `_5_6`），`Bt::new_ver` 版本参数化为加性扩展；
+  `tools/repl-e2e-lib.sh` **零改动**（所需版本门/降级探测/capture 均既有面，
+  「仅加性」合同以改 0 处满足）。非 live 面 `cargo test --test repl` →
+  2 passed / **13 ignored**（家族基数 11→13 就位）。
+- 定向真跑（共享 8.0 门容器）：**2 passed / 0 failed / 228.89s**，跑后零泄漏容器；
+  5.6 件追平对账 `repl 38 块 ≡ file 38 块（9847B 语句流）`、5.7 件
+  `38 ≡ 38（9795B）`；两件 60s 静默零 `repl: reconnect #`、终档 ∈ 提交界。
+- **帧形实测（spec §4 待证面钉死）**：5.6.51 与 5.7.44 idle 窗心跳帧形完全同型
+  = **HEARTBEAT_LOG_EVENT v1（0x1b）**，ts=0、size=39（19B 头 + 16B 日志文件名 +
+  4B 尾）、20s 节奏、header log_pos = 静默期主库**活写位点**（5.7=154、5.6=120，
+  与连入时 SHOW MASTER STATUS 等值）；流首 0x04 fake-rotate 为合成帧、内部消化。
+  **spec §4 的 fake-rotate 续命回退分支 = 死枝**（两版本均真发心跳帧，60s 静默
+  过零假断链是帧在场的直接结果）。
+- **SHOW 面事实**：`binlog_heartbeat%` 全局变量面在 5.6.51/5.7.44 均为**空集**
+  （变量族属 8.0 面）；心跳周期实走会话级 `SET @master_heartbeat_period` 载荷
+  （5.6.51 不止 SET 被接受，且真产帧——T7 事实的帧级补证）。T5 本轮已把
+  件内 5.6 println 的 brief 冻结 fallback 措辞替换为该实测真相
+  （`92a62ea`，仅字符串，断言零触碰）。
+
+### P4a T5（合流 lane，本轮）：make 入口 + 接线修复 + 全量回归 + 文档收口
+
+- 独占面履约：Makefile/README/HANDOVER 单写者；carry-over B 独立小 commit
+  `92a62ea`（shadow-replay.sh VER 白名单 `5.6|5.7|8.0|8.4` 先于**任何** rm -rf /
+  OUT 插值校验、非白名单 exit 2，实测 `9.9` 与注入串均零触碰拒入；
+  repl.rs 5.6 println 换实测真相，仅字符串、断言零触碰）。
+  Makefile：`.PHONY` + 两目标行 `fuzz-min`（`bash tools/fuzz-min.sh`，
+  FUZZ_TIME 透传）/ `shadow-test`（`bash tools/shadow-replay.sh ${VER:-8.0}`）。
+- **接线修复（回归唯一红，合流特权内）**：GATE 4 `make difftest` 首跑 rc=2——
+  `tools/run-difftest.sh: 行 122: ./target/debug/my2sql-rs: 没有那个文件或目录`。
+  归因 = **遗留接线 bug 而非任何 lane 回归**：spec §6 要求各 lane 独立
+  `CARGO_TARGET_DIR=/tmp/p4a-*`，而 run-difftest.sh / compat-matrix.sh 硬编码
+  `./target/debug/my2sql-rs`（四 lane 恰因本地默认 target/ 有产物而未踩）。
+  修复：两脚本头部 `RSBIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"`，
+  8 处引用全接 RSBIN（同一口径，判据零变化）；修后 difftest 双模 + compat 18 绿
+  （接线修复独立 commit `edb2148`）。
+  `gen-bench-binlog.sh` / `p4a-roundtrip.sh` / `flashback-reconcile.sh` 同类
+  硬编码**不在回归路径**，挂小账不修（见挂账清单）。
+- **全量回归六闸（串行，CARGO_TARGET_DIR=/tmp/p4a-merge，逐字日志
+  `/tmp/p4a-merge-gate*.log` + 戳记 `/tmp/p4a-merge-stamps.txt`，stop-on-red；
+  difftest/P4A/compat 因 my2sql-dt-8.0 共享全程零重叠）**：
+  1. 三门（03:54:19Z→03:54:35Z）：`cargo test` = **350 passed / 0 failed**
+     （lib 314 / cli 8 / e2e 9 / flashback 7 / fuzz_seed 2 / repl 2+13 ignored /
+     stats 8 / doc 0）；`clippy --all-targets -D warnings` rc=0；`fmt --check` rc=0。
+  2. `make fuzz-min` rc=0（→04:01:09Z）：decode_event
+     `#22296408 DONE cov: 670 ft: 1747 corp: 439/56Kb exec/s: 74074` /
+     `Done 22296408 runs in 301 second(s)`；event_stream
+     `#6456918 DONE cov: 1842 ft: 9067 corp: 2023/1009Kb exec/s: 21451` /
+     `Done 6456918 runs in 301 second(s)`；`[fuzz-min] OK 0 new crashes`；
+     仓库语料 `fuzz/corpus/` 跑后 git 零变化（隔离合同成立）。
+  3. `make shadow-test` 三态全绿：8.0（37s）五闸 `GATE GREEN ...
+     checksum-equal=2/2 exempt-json=0 (rowdiff bytes=0)` +
+     `ASSERT OK: to-sql statements=115 == DML lines=115`×2，ck 与 lane 真跑**逐位
+     等**（P0 t_doc=2877097027 / t_ord=2830880655；P1 t_doc=2572327458 /
+     t_ord=2651036437；窗口 12814..24356）；negcheck 注入漂移 t_ord
+     2651036437→2408576875 → `GATE RED[FWD_SHADOW vs P1] ... checksum-equal=1/2`
+     + `NEGCHECK: expected mismatch observed`（禁假绿闸成立）；5.7（19s）
+     anchor=clone、exempt-json 仅 [t_doc] 且只在 checksum 腿、行级腿零豁免
+     （REF rows=11 lines / rowdiff bytes=0），live 侧 t_doc ck 与 lane 轮互异
+     ——**5.7 CHECKSUM TABLE 非定值事实再次实证**，t_ord 两值仍逐位稳。
+  4. `make difftest`（修后重跑）：`groups A=21 B=21 aligned=21 green=21 red=0` +
+     `OK difftest 8.0: diff-green + replay-byte-identical`；
+     `P4A=1 make difftest`：`data script: tools/gen-data-p4a.sql`、
+     `groups A=14 B=14 aligned=14 green=14 red=0` + 同 OK 行。
+  5. `make compat`（04:06:42Z→04:11:34Z）：**18/18 PASS** `COMPAT MATRIX: ALL GREEN`。
+     非 repl 14 件与 P3 完全同值（groups 19/21 体系、stats total=32/36、
+     v1rows/caching_sha2 在场）。repl 族字节数对 P3 基线漂移：
+     **173206/140559/140336/164489** vs 基线 175335/146979/143582/164487——
+     **裁定为合法窗口差异、非回归**，证据链：①该 4 件 = stop-datetime（服务器钟
+     +12s）墙钟窗口 × 后台灌流器（≤200 轮，内容纯 f(tag,round)），本轮捕获
+     events=506/411/410 vs P3 的 510/429/419（少 1–3 轮）；②8.4 本轮 events=480
+     **与 P3 完全同**，+2B 全部来自 `--add-extra-info` 每语句注记
+     `# datetime=... startpos=... stoppos=...` 的位数漂移（实拆
+     out/compat-repl-work-8.4/file/to_sql.3.sql 129 条注记行确认）；
+     ③每 run 内 repl≡file 总闸 `diff -r` 逐字节等全 PASS（双侧 events/statements
+     互等 506/1457、411/1190、410/1189、480/1392；files=2、跨档 span 在场、
+     heartbeat_set_degrades=0）；④T1 三处 checked_add 闸在合法事件面不可达，
+     非 repl 14 件零漂移即反证。
+  6. `make repl-test`（04:11:35Z→04:25:36Z）：**13 passed / 0 failed /
+     0 ignored / 823.02s**（P3 11 件轮 585.90s + 5.6/5.7 idle 两件 ≈ +237s，
+     与预期 ≈+230s 相符）；跑后零泄漏容器。5.6 新措辞在本轮 --nocapture
+     面完整实证打印（`92a62ea` 未单独重跑 5.6 件即由此覆盖）。
+- 开闸条款台账（本轮复核）：src/binlog/ 全役改动 = T1 三处溢出闸
+  （table_map.rs:79/:299 红钉真 panic 先行 + proto.rs::read_lns 预防闸独立单测），
+  本轮 compat 18 + 350 非 live + difftest 双模 + repl 13 全绿 = 事后全量回归
+  合同兑现；T2/T3/T4 src/ 零改动。
+
+## P4a DoD 对账（spec §1–§5 + §6，T5 收尾）
+
+- **§1 Lane A**：① `cargo +nightly fuzz build` 过 ✅；② 300s×2 真跑 0 新
+  crash ✅（本轮 GATE 2 `Done 22296408` / `Done 6456918`、`OK 0 new crashes`）；
+  `make fuzz-min` 常态闸 ✅（T5 落）；③ crash→红钉修复 ✅（2 真 panic 全收；
+  read_lns 预防闸以定向单测独扛）；seed6 漂移入 known-not-fix 登记 ✅。
+- **§2 Lane B**：三段（前向/逆向/往返）+ 逐表 CHECKSUM + 行级 diff 双腿 +
+  SHADOW_NEGCHECK 禁假绿 ✅（本轮 GATE 3 三态）；主件 8.0 + 5.7 冒烟 ✅；
+  证据逐字入档 ✅；`make shadow-test` 落 + VER 白名单加固（92a62ea）✅。
+- **§3 Lane C**：三列形（ENUM>255 / GEOMETRY / LONGBLOB>64KB）真机捕获
+  14/14 全绿 ✅；Go 裁判三形全支持、无违例形 → 零新增行为差异，差异清单
+  续号 28 登记三形等口径（ENUM 保真 = 1-based 序号，非成员名）✅；
+  测试债「列形缺口」销账 ✅。
+- **§4 Lane D**：5.6/5.7 idle live 两件 ✅（本轮 GATE 6 全家 13/13 真跑）；
+  帧形（HEARTBEAT v1 0x1b / ts=0 / size=39 / 20s / 活写位点）入注记 ✅；
+  spec fake-rotate 回退分支判死枝登记 ✅；5.6 SHOW 面空 + 会话 SET 实通道
+  入注记且件内措辞已换实测真相 ✅。
+- **§5 T5**：Makefile 两目标行 ✅ / README 矩阵行 + 差异续号 ✅ /
+  HANDOVER T1–T4 节点 + 本 T5 节点 ✅ / DoD 对账（本节）✅ /
+  全量回归六闸全绿逐字入档 ✅。spec §5 书「repl-test 11」为规划时点数，
+  实际家族 = **13**（T4 +2），按 §6「live 件增者如实计数」以 13 记。
+- **§6 纪律**：解码器开闸条款台账见 T5 节点尾条 ✅；`reference/` 只读 ✅；
+  禁虚账——上文全部计数/时长逐字出自 `/tmp/p4a-merge-gate*.log` ✅；
+  每 lane 三门 ✅；独立 `CARGO_TARGET_DIR` ✅（本轮 /tmp/p4a-merge，且
+  run-difftest.sh/compat-matrix.sh 接线已改按同口径）；测试基线滚动：
+  非 live = **350**（≥349 达成），live repl = **13**。
+
 ## 校准记录
 
 - **T9 后校准补丁**（review 驱动，fixture `tests/fixtures/capture_8.0_minimal/` 为
@@ -1710,6 +1940,15 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
 - SDD 台账（P3）：`.superpowers/sdd/2026-09-21-my2sql-rs-p3-repl/progress.md`
   （git-ignored；任务简报/评审 diff/各任务报告同目录；live 套件证据
   `/tmp/p3-t6b-live-run.log`）
+- SDD 台账（P4a）：`.superpowers/sdd/2026-09-22-my2sql-rs-p4a-quality-lanes/progress.md`
+  （git-ignored；各 lane 简报/报告/评审同目录；T5 全量回归逐字日志
+  `/tmp/p4a-merge-gate*.log` + 戳记 `/tmp/p4a-merge-stamps.txt`）
+- **运维注（P4a T1/T3 实踩，T5 入册）：worktree 跑 difftest/compat 需 `reference/`
+  本地真实副本（`cp -a` 主仓 `reference/`），严禁 symlink** ——`go build -o
+  ../../tools/bin/my2sql-go` 走**物理路径**解析，symlink 会把裁判二进制漏写进
+  主仓 `tools/bin/`（产物同源 gitignored，无功能影响但污染主树、掩盖并行隔离）。
+  各 lane 并行跑 8.0 差分件时容器名 `my2sql-dt-8.0` 全 worktree 共享，
+  **difftest/compat/P4A 必须串行**（T5 回归轮即因此全程单线）。
 
 ## 遗留/挂账清单
 
@@ -1781,9 +2020,14 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
   - [ ] `parse_blocks` 对**首行 `SET NAMES` 残缺**静默丢弃而非报 torn
     （T6 fix 轮观察，backlog：语义上是「丢一个必然无 SQL 的头行」，
     与真 torn 帧的报错口径存在窄缝隙）。
-  - [ ] **心跳帧线形 5.6/5.7 仅验过「SET 被接受」**（T7 收口），**静默
+  - [x] ~~**心跳帧线形 5.6/5.7 仅验过「SET 被接受」**（T7 收口），**静默
     窗（idle 真发心跳帧）形态仍 8.0-only**——矩阵窗口皆流量驱动、无
-    idle 段（T0 挂账的残余半面，留 P4 多版本 idle 件）。
+    idle 段（T0 挂账的残余半面，留 P4 多版本 idle 件）。~~——**P4a T4
+    消费（`24865ab`）**：5.6/5.7 idle 心跳两件 live 真跑绿（228.89s），
+    帧形实测 = 两版本均真发 HEARTBEAT v1（0x1b、ts=0、size=39、20s 节奏、
+    活写位点），`binlog_heartbeat%` SHOW 面 5.6/5.7 空集、会话级
+    `SET @master_heartbeat_period` 为实通道；spec §4 fake-rotate 回退分支
+    判定为死枝（保留不删，见 P4a T4 节点与 DoD 对账）。
   - [ ] **compat repl 族两口径**（T7 评审 Minor）：跨档 ROTATE 产物差异
     仅 warn 不判红（files=2 计数闸兜底）；DML 指纹只钉 round-1 前置批
     （若 1213 类死锁杀在 round1 前置批，会**严格向误红**而非漏红——
@@ -1811,21 +2055,52 @@ README 差异 25），以 repl==file 逐字节等价性为正确性总闸。
     崩溃恢复主场景会死锁续跑，属 overstate 纠正而非门弱化；`CpError::Stale`
     变体随之删除（不可达）。「多实物绝不静默」由告警日志 + §5 防覆盖闸
     （新目录永不与残骸同名冲突）双兜底，清场核验责任转向运维读告警。
+- **P4a T5 新增登记（合流轮入账，均不修）**：
+  - [ ] **fuzz 语料 seed6 漂移（known，评审轮 2 字节级证实）**：
+    `seed6_tm_meta_len_overflow` 因表名声明长漂移（声明 8 实给 9）解析拐进
+    parse_charset 报错面（`TLV type 254: truncated length prefix`），**够不到**
+    `read_lns` 的加法闸——该闸红钉由定向单测
+    `read_lns_u64max_declared_len_is_too_short_not_panic` 独扛（永久），seed6
+    本体不改（修它 = 改畸形输入语义，超出裁决范围；Err-不-panic 性质不受影响）。
+  - [ ] **event_stream 靶的 trx_id 不回退断言在当前实现下恒真**：防未来回归的
+    钉，非主动发现器；两靶真实发现力在 panic/UB 面（本役已证 2 发）。
+  - [ ] **溢出类 panic 残点**：rows/json 更深路径理论可能存在同族越界，历轮
+    300s×2（lane 两轮 + T5 一轮，共 >55M exec/靶-轮）未命中——靠
+    `make fuzz-min` 常态化观察，非挂死账。
+  - [ ] **spec §4 fake-rotate 回退口径 = 死枝**：5.6.51/5.7.44 实测均真发
+    HEARTBEAT v1 帧（P4a T4 节点），任何「5.6 不支持心跳需 fake-rotate 续命」
+    的后续文本不应接此口径；SHOW `binlog_heartbeat%` 面 <8.0 为空集，
+    实通道 = 会话级 `SET @master_heartbeat_period`。
+  - [x] ~~difftest/compat 脚本硬编码 `./target/debug/my2sql-rs`，与 spec §6
+    「独立 CARGO_TARGET_DIR」纪律冲突（仅在 worktree 恰好有本地 target 时碰巧
+    成立——P4a 各 lane 即碰巧绿）~~——**T5 合流轮接线修复**：run-difftest.sh +
+    compat-matrix.sh 改 `"${CARGO_TARGET_DIR:-$ROOT/target}/debug/my2sql-rs"`
+    （与 shadow-replay.sh 同口径，判据零变化；T5 回归轮实测暴露后当场修 `edb2148`，
+    见 T5 节点）；`tools/gen-bench-binlog.sh`、`tools/p4a-roundtrip.sh`、
+    `tools/flashback-reconcile.sh` 同款硬编码留同族小账（非回归链路）。
 - [x] ~~P3：repl 模式（另出计划；认证含 caching_sha2）~~——T0–T8 全部
   完成（本表上方「P3 Task 0–7」节点 + 「P3 DoD 对账」节），caching_sha2
   与 native 双认证 spike 钉死、8.4 矩阵经 `SHOW BINARY LOG STATUS` 改口
   通过；待全分支终审合入。
-- [ ] P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 4 件——终审 #1
+- [x] ~~P4：fuzz 正式接入（起点语料已备：`tests/fuzz_seed/` 4 件——终审 #1
   补第 4 件 `decimal_full_group_overflow.bin`，DECIMAL 满组溢出 repro +
-  `tests/fuzz_seed.rs` 构造器/再生通道 FUZZ_SEED_REGEN=1）、影子库端到端回放、
-  **musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
+  `tests/fuzz_seed.rs` 构造器/再生通道 FUZZ_SEED_REGEN=1）、影子库端到端回放~~
+  ——**P4a 落地（T1/T2）**：`make fuzz-min`（`fuzz/` workspace 两靶 300s 闸，
+  接入首轮即实抓 2 发解码器 panic 走开闸条款，起点 4 件扩至 7 畸形 + 3 合法
+  × 双 crc 态 = seedgen 确定性 40 件）；`make shadow-test`（三段 checksum
+  等 + 行级 diff 零 + negcheck 验钞机，8.0 spec 原形态、5.7 REF-clone 锚裁定，
+  见「P4a 任务节点日志」）。
+- [ ] P4：**musl 吞吐**（构建已销账：x86_64-unknown-linux-musl debug+release 绿、
   static-pie 可运行；实测崩塌至 ~3.4 MiB/s——musl malloc arena 竞争，
   候选 mimalloc / glibc-static，证据 docs/bench/p1.md）
-- [ ] 测试债（P2 邻近，终审登记）——矩阵覆盖缺口：① ENUM >255 成员
+- [x] ~~测试债（P2 邻近，终审登记）——矩阵覆盖缺口：① ENUM >255 成员
   （2B packlen 形态仅 `value.rs::enum_set_ordinals_to_uint` 合成单测，
   真机捕获与差分矩阵均无该列）；② GEOMETRY 真机捕获（裁决 7 字节保真
   路径无实抓 fixture）；③ LONGBLOB >64K 前缀行（packlen 4B 档 + 跨页
-  payload 未进矩阵）。补捕获即补差分用例，不改解码器。
+  payload 未进矩阵）。补捕获即补差分用例，不改解码器。~~——**P4a T3 销账
+  （`3bf7fc1`，spec §3）**：三形真机捕获全走（`P4A=1 make difftest` 14/14
+  组绿 + 自 roundtrip checksum/行级双门），**三形全部 Go 裁判支持、无违例
+  形**；逐字证据 docs/p4a-findings.md + README 差异 28。
 - [ ] 已文档化行为（终审核对，**不修**）：`tests/e2e.rs::parse_stmt`
   （~:463-465）对字面量含 `,`/`(`/`)`/` AND `/` WHERE ` 的敌意输入会
   panic（`unwrap`/切片越界）——**设计内**：该 helper 仅解析本仓 fixture
