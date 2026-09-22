@@ -183,6 +183,9 @@ pub struct FlashbackArgs {
     /// DDL skip events 报告文件路径（JSONL 格式，P6 T1）
     #[arg(long)]
     pub report_file: Option<String>,
+    /// 干跑模式：只统计不生成 SQL 文件（P6 T2）
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -286,6 +289,8 @@ pub struct Config {
     pub heartbeat_secs: u32,
     /// P6 T1：DDL skip events 报告文件路径（JSONL format）
     pub report_file: Option<String>,
+    /// P6 T2：干跑模式（只统计不生成 SQL）
+    pub dry_run: bool,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -371,6 +376,7 @@ impl Config {
         cfg.keep_trx = !args.no_keep_trx;
         cfg.on_error = args.on_error;
         cfg.report_file = args.report_file.clone();
+        cfg.dry_run = args.dry_run;  // P6 T2
         Ok(cfg)
     }
 
@@ -567,6 +573,9 @@ fn build_common(args: &CommonArgs) -> Result<Config, String> {
         schema_file: args.schema_file.clone(),
         schema_dump: args.schema_dump.clone(),
         output_dir: args.output_dir.clone(),
+        // P6 T1/T2 flashback exclusive fields
+        report_file: None,
+        dry_run: false,
         // 输出目标/文本形态中性默认：validate_* 各自覆写（stats 恒 false）
         to_stdout: false,
         file_per_table: args.file_per_table,
