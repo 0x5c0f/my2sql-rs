@@ -4,7 +4,9 @@
 //! 主 crate tests/，本文件为同构重写，口径漂移以彼为准并回改此处注释）：
 //! 逐事件 `parse_header` → 尺寸闸 → `strip_checksum(body, with_crc)` →
 //! `parse_table_map`/`decode_rows`；`with_crc` 取首字节选择器（语料两态都跑，
-//! 见 seedgen 的 crc0/crc1 双件）。
+//! 见 seedgen 的 crc0/crc1 双件）。**strip 之后的 parse 一律传 `false`**
+//! （生产口径 `file_reader.rs:308-314` strip-once-then-false；评审修复轮 2
+//! 勘正本文件曾把 `with_crc` 透传给 `parse_table_map` 致 CRC 双重剥离）。
 //!
 //! 流级不变量：遇 QUERY(2)/XID(16)/GTID(33,34) 语义体构造 `RawEvent` 喂
 //! `TrxStateMachine::feed`，断言 `trx_id` 不回退（assert 触发即 crash 报告）。
@@ -93,7 +95,8 @@ fuzz_target!(|data: &[u8]| {
         strip_checksum(&mut body, with_crc);
         match h.event_type.0 {
             19 => {
-                if let Ok(t) = parse_table_map(&body, with_crc) {
+                // body 已剥过 CRC：再传 with_crc=true = 二次剥离（评审轮 2）
+                if let Ok(t) = parse_table_map(&body, false) {
                     tm = Some(t);
                 }
             }

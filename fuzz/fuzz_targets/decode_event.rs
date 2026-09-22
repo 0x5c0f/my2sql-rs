@@ -3,7 +3,10 @@
 //! 输入格式：`data[0] & 1` = with_crc 选择器，剥掉首字节后余下当**单事件**流：
 //! `parse_header` → 尺寸自洽闸（`size < EVENT_HEADER_SIZE || size > buf.len()`
 //! → return）→ `strip_checksum` → 按 `h.event_type.0` 路由：
-//!   - 19（TABLE_MAP）→ `parse_table_map`；
+//!   - 19（TABLE_MAP）→ `parse_table_map`；**body 已剥过 CRC，恒传
+//!     `with_crc=false`**（生产口径 `file_reader.rs:308-314`：strip-once →
+//!     parse(false)；评审修复轮 2 勘正本行曾传 `with_crc` 致双重剥离，
+//!     合法 TABLE_MAP 在 crc1 腿被多吃 4B）；
 //!   - 20/21/22/23/24/25/30/31/32（rows 家族）→ `decode_rows`，配**固定合成
 //!     tm**（先 `parse_table_map(合法 tm 字节)` 得 `TableMapEvent`，schema
 //!     固定 2×INT）；
@@ -83,7 +86,9 @@ fuzz_target!(|data: &[u8]| {
     strip_checksum(&mut body, with_crc);
     match h.event_type.0 {
         19 => {
-            let _ = parse_table_map(&body, with_crc);
+            // body 已在上面剥过 CRC——再传 with_crc=true 就是二次剥离
+            // （strip-once-then-false，同 file_reader.rs:308-314）。
+            let _ = parse_table_map(&body, false);
         }
         20 | 21 | 22 | 23 | 24 | 25 | 30 | 31 | 32 => {
             // 固定合成 tm：合法字节必解成功；理论不可达的 Err 也走 return，
