@@ -13,6 +13,9 @@
 #  3) 字段解析仍用 rindex(")") 锚定（comm 可含空格/括号），utime/stime 为
 #     post-comm remainder 0-based idx 11/12（= 全行 field 14/15），与任务书
 #     一致，自证通过。
+#  4) [fix-T1 round] one() 的 taskset 失败原被静默吞成有效样本（脚本 `set -uo pipefail`
+#     无 -e）；现显式 `|| rc=$?` 捕获 + FAILED 消息 + return，[1/3] 曲线与 [3/3] runner
+#     两个调用点失败即中止，不留半截曲线（对齐 bench-ab.sh 评审 finding 1/6 同型修）。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${RSBIN:-target/release/my2sql-rs}"
@@ -24,13 +27,15 @@ SECS="${SECS:-32}"     # 采样窗口秒数
 BIN_F="$(cat "$BENCH_DIR/.bench-ready")"
 SZ="$(stat -c %s "$BENCH_DIR/$BIN_F")"
 
-one() { # $1=threads $2=outdir → 打印秒数
+one() { # $1=threads $2=outdir → 打印秒数（to-sql 失败则 return≠0，调用点负责中止）
   rm -rf "$2" && mkdir -p "$2"
-  local t0 t1; t0="$(date +%s.%N)"
+  local t0 t1 rc=0; t0="$(date +%s.%N)"
   taskset -c "$CPUS" "$BIN" to-sql --binlog-dir "$BENCH_DIR" --start-file "$BIN_F" \
     --schema-file "$BENCH_DIR/schema.json" --time-zone +00:00 --threads "$1" \
-    --output-dir "$2" >/dev/null
-  t1="$(date +%s.%N)"; awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f\n", b-a}'
+    --output-dir "$2" >/dev/null || rc=$?
+  t1="$(date +%s.%N)"
+  [ "$rc" -eq 0 ] || { echo "to-sql FAILED rc=$rc (threads=$1, bin=$BIN)" >&2; return "$rc"; }
+  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f\n", b-a}'
 }
 
 echo "== [0/3] 环境事实登记（paranoid/governor/频率域/输入）"
@@ -47,7 +52,7 @@ echo "== [0/3] 环境事实登记（paranoid/governor/频率域/输入）"
 
 echo "== [1/3] threads 曲线（每档 3 轮，中位数）"
 for t in 1 2 4 8; do
-  : > "/tmp/p4b-t2-thr$t"; for r in 1 2 3; do one "$t" "/tmp/p4b-t2-out" >> "/tmp/p4b-t2-thr$t"; done
+  : > "/tmp/p4b-t2-thr$t"; for r in 1 2 3; do one "$t" "/tmp/p4b-t2-out" >> "/tmp/p4b-t2-thr$t" || { echo "[1/3] curve aborted at threads=$t round=$r" >&2; exit 1; }; done
   med="$(sort -n "/tmp/p4b-t2-thr$t" | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')"
   awk -v s="$SZ" -v m="$med" -v t="$t" 'BEGIN{printf "threads=%d median=%.3fs MiB/s=%.1f\n", t, m, s/m/1048576}'
 done
@@ -72,7 +77,7 @@ if [ "${PERF_OK:-0}" = 1 ]; then
 fi
 
 echo "== [3/3] /proc 线程采样（threads=8 稳态连跑 ${RUNS} 轮 ≥30s，R/S/D 占比 + busy 等效）"
-( for i in $(seq "$RUNS"); do one 8 /tmp/p4b-t2-out >> /tmp/p4b-t2-thr8-sample.log; done ) &
+( for i in $(seq "$RUNS"); do one 8 /tmp/p4b-t2-out >> /tmp/p4b-t2-thr8-sample.log || { echo "[3/3] runner aborted at i=$i" >&2; exit 1; }; done ) &
 runner=$!
 python3 - "$PROC" "$SECS" <<'PY' > /tmp/p4b-t2-proc.txt
 import sys, time, os, glob
