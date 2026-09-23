@@ -37,4 +37,3 @@ mod report_integration_tests {
         assert!(json.contains("\"sql\":\"ALTER TABLE t_users ADD COLUMN new_field VARCHAR(100\""));
     }
 }
-

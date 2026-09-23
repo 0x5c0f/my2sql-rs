@@ -3,7 +3,6 @@ pub mod filter;
 pub mod order;
 pub mod source;
 pub mod worker;
-pub mod counter;  // P6 T2: Transaction counting for dry-run mode
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -30,7 +29,6 @@ use crate::pipeline::source::{EventSource, RawEvent, RawKind, TrxStateMachine, T
 use crate::pipeline::worker::{Job, Out, OutMode, build_out, worker_loop};
 pub use crate::repl::assembly::run_repl;
 use crate::repl::checkpoint::{self, Checkpoint};
-use crate::pipeline::counter::TransactionCounter;
 use crate::sqlopen::dml::{DmlBuilder, SqlOpts};
 
 /// 装配层错误（管道终止级：源文件级损坏/IO、schema 源不可用、写盘失败；
@@ -45,12 +43,6 @@ pub enum PipelineError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Config(String),
-}
-
-impl From<serde_json::Error> for PipelineError {
-    fn from(err: serde_json::Error) -> Self {
-        PipelineError::Io(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
-    }
 }
 
 /// `run_to_sql` 摘要（最终行由 main 打印，错误计数在此 surfaced）。
@@ -136,65 +128,11 @@ pub fn run_to_sql(cfg: &Config) -> Result<RunSummary, PipelineError> {
     Ok(sum)
 }
 
-/// P6 T2: Dry-run mode implementation - counts transactions without generating SQL
-fn run_dry_run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
-    // Count transactions during scan (same iteration as normal path)
-    let mut counter = TransactionCounter::new();
-    
-    // Read binlogs file by file using FileReader (EventSource impl)
-    use crate::binlog::file_reader::FileReader;
-    use crate::pipeline::Filters;
-    let mut name = cfg.start_file.clone();
-    let filters = Filters::default();
-    
-    loop {
-        let path = cfg.binlog_dir.join(&name);
-        if !path.is_file() {
-            tracing::info!("{} not exists nor a file, stop", path.display());
-            break;
-        }
-        
-        let mut reader = FileReader::open(&cfg.binlog_dir, &name, filters.clone())?;
-        
-        // Pump events from this file
-        loop {
-            if let Some(event) = reader.next()? {
-                counter.count_event(event);
-            } else {
-                break;  // EOF for this file
-            }
-        }
-        
-        // Move to next binlog file (if multiple files)
-        match FileReader::<std::fs::File>::next_binlog_name(&name) {
-            Some(next) => name = next,
-            None => break,
-        }
-    }
-    
-    // Build summary JSON per spec D2 format
-    let events = counter.total_events();
-    let summary = counter.build_summary();
-    
-    // Output JSON to stdout
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-    
-    Ok(RunSummary {
-        events,
-        ..Default::default()
-    })
-}
-
 /// P2 T3 flashback 装配：正向泵 → 隐藏 tmp（逐事件块索引）→ 逆序回写
 /// `flashback.*.sql`（reverse::run_files，T2 已测上游字节口径）。
 /// 任何 Err（stop 哨兵/源级/写盘/逆序 IO）返回前清光 tmp 与半成品 final
 /// （宁缺毋漏，spec §3.2）。
 pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
-    // P6 T2: Dry-run mode - only count transactions, no SQL generation
-    if cfg.dry_run {
-        return run_dry_run_flashback(cfg);
-    }
-    
     if cfg.output_dir.is_none() {
         return Err(PipelineError::Config(
             "flashback requires --output-dir (reverse pass needs files on disk)".into(),
@@ -211,7 +149,9 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
         true,
     );
     // P6 T1: Initialize report writer if configured
-    let mut reporter = cfg.report_file.as_ref()
+    let mut reporter = cfg
+        .report_file
+        .as_ref()
         .map(|path| JsonlReporter::new(path))
         .transpose()?;
     let mut st = Runner::new(
