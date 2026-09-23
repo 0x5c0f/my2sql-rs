@@ -778,7 +778,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             r.next(),
-            Err(BinlogError::InvalidData(m)) if m.contains("cap")
+            Err(BinlogError::InvalidData(m)) if m.contains("valid range")
         ));
     }
 

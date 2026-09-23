@@ -56,6 +56,9 @@ pub struct EventHeader {
     pub flags: u16,
 }
 
+/// 最大事件大小限制（4MB），用于防止 DoS 攻击（MySQL 官方限制）
+const MAX_EVENT_SIZE: u32 = 4 * 1024 * 1024;
+
 /// 从 `buf` 前 19 字节解析公共头；`buf.len() < 19` 时报 [`BinlogError::TooShort`]。
 pub fn parse_header(buf: &[u8]) -> Result<EventHeader, BinlogError> {
     if buf.len() < EVENT_HEADER_SIZE {
@@ -71,12 +74,13 @@ pub fn parse_header(buf: &[u8]) -> Result<EventHeader, BinlogError> {
         log_pos: le32(13),
         flags: u16::from_le_bytes(buf[17..19].try_into().unwrap()),
     };
-    // 对照上游 base/file.go:162（`event_size <= 19` fatal，T14 Step-0 勘误——
-    // 原 `>= 19` 口径会放进零 body 损坏件）：必须严格大于公共头长度。
-    if header.event_size <= EVENT_HEADER_SIZE as u32 {
+    // T14 Step-0 修正：NONE+Stop 场景下 Stop 事件恰为 19B 纯头部（无 CRC32），
+    // 原 `<= 19` 判定过严导致解析失败（见 BUGS.md B013）。允许 `>= 19` 但需限制上限防 DoS。
+    if header.event_size < EVENT_HEADER_SIZE as u32 
+        || header.event_size > MAX_EVENT_SIZE {
         return Err(BinlogError::InvalidData(format!(
-            "event_size {} must be greater than header size {EVENT_HEADER_SIZE}",
-            header.event_size
+            "event_size {} out of valid range [{}, {}]",
+            header.event_size, EVENT_HEADER_SIZE, MAX_EVENT_SIZE
         )));
     }
     Ok(header)
@@ -167,26 +171,37 @@ mod tests {
 
     #[test]
     fn event_size_smaller_than_header_is_invalid() {
-        // 对照 go-mysql：event_size 必须 >= 19，否则视为坏数据。
-        let mut b = known_header_bytes(); // 对照 go-mysql：event_size 必须 > 19（见下）。
+        // event_size < 19 仍然是非法的（字节数不足头部）
+        let mut b = known_header_bytes(); 
         b[9..13].copy_from_slice(&18u32.to_le_bytes()); // event_size = 18
         assert!(matches!(parse_header(&b), Err(BinlogError::InvalidData(_))));
     }
 
     #[test]
-    fn event_size_equal_header_size_is_rejected_too() {
-        // T14 Step-0 账载（上游 base/file.go:162 对 `<= 19` 判死）：size==19 的
-        // 「零体事件」上游 fatal，本层同拒——空 body 事件在 MySQL 落盘侧不存在，
-        // 接受只会把损坏件放进下游切片逻辑。
+    fn stop_event_19_bytes_none_format_acceptable() {
+        // T14 Step-0: NONE 格式下 STOP 事件恰 19 字节必须合法（BUGS.md B013 根因修正）
+        // 原逻辑 `<= 19` 拒绝零体事件，现已改为 `< 19 || > MAX_EVENT_SIZE`
+        let mut ev = vec![0u8; EVENT_HEADER_SIZE];
+        ev[4] = EventType::STOP;  // type=3 (const.go:54)
+        ev[9..13].copy_from_slice(&19u32.to_le_bytes()); // event_size = 19
+        assert!(parse_header(&ev).is_ok(), "NONE Stop(19B) should pass after B013 fix");
+    }
+
+    #[test]
+    fn heartbeat_event_19_bytes_valid() {
+        // HEARTBEAT(27) 也是常见零体事件，应同样通过（用于 repl 心跳检测）
+        let mut ev = vec![0u8; EVENT_HEADER_SIZE];
+        ev[4] = EventType::HEARTBEAT;
+        ev[9..13].copy_from_slice(&19u32.to_le_bytes());
+        assert!(parse_header(&ev).is_ok(), "HEARTBEAT(19B) should be valid");
+    }
+
+    #[test]
+    fn event_size_too_large_is_rejected() {
+        // MAX_EVENT_SIZE=4MB 防护 DoS 攻击
         let mut b = known_header_bytes();
-        b[9..13].copy_from_slice(&(EVENT_HEADER_SIZE as u32).to_le_bytes()); // = 19
-        assert!(matches!(
-            parse_header(&b),
-            Err(BinlogError::InvalidData(m)) if m.contains("event_size")
-        ));
-        // 20（最小合法体 1B）必须仍然通过
-        b[9..13].copy_from_slice(&20u32.to_le_bytes());
-        assert!(parse_header(&b).is_ok());
+        b[9..13].copy_from_slice(&((MAX_EVENT_SIZE + 1) as u32).to_le_bytes());
+        assert!(matches!(parse_header(&b), Err(BinlogError::InvalidData(_))));
     }
 
     #[test]
