@@ -162,6 +162,297 @@ my2sql-rs repl \
 
 详细性能数据见 [docs/bench/p4b.md](docs/bench/p4b.md)。
 
+---
+
+## 🔧 核心概念说明
+
+### `--binlog-dir` - Binlog 文件目录
+
+指定 MySQL binlog 二进制日志所在的**本地文件系统目录**，而非数据库连接。
+
+**为什么需要本地目录？**  
+MySQL 的 binlog 是文件形式的日志（类似手机相册），存储在服务器的数据目录下：
+- MySQL 5.6: `/var/lib/mysql/binlog.*`
+- MySQL 5.7+: `/var/lib/mysql/mysql-bin.*`
+
+工具需要从磁盘读取这些二进制文件才能解析出 SQL 语句。
+
+**获取 binlog 路径的方法：**
+```bash
+# 方法 1: 查看 MySQL 配置（所有环境通用）
+mysql -uroot -p -e "SHOW VARIABLES LIKE 'datadir';"
+
+# 方法 2: 直接在宿主机查看（物理机或虚拟机）
+ls -la /var/lib/mysql/mysql-bin.*
+
+# 方法 3: 通过 SHOW BINARY LOGS 查看所有可用文件
+mysql -uroot -p -e "SHOW BINARY LOGS;"
+```
+
+**如何复制 binlog 到本地进行分析？**
+
+**Docker 容器环境：**
+```bash
+# 从容器复制到工作目录
+docker cp my-mysql:/var/lib/mysql/mysql-bin.000100 ./data/
+docker cp my-mysql:/var/lib/mysql/mysql-bin.index ./data/
+
+# 或进入容器批量复制
+docker exec -it my-mysql bash
+root@container # chmod -R a+r /var/lib/mysql/mysql-bin.*
+exit
+cp /var/lib/mysql/mysql-bin.* ./data/
+```
+
+**物理机/虚拟机环境：**
+```bash
+# 直接复制到本地分析目录
+sudo cp /var/lib/mysql/mysql-bin.* ~/analysis/binlogs/
+
+# 或直接使用（需确保工具对文件有读权限）
+sudo chown -R your_user:your_group /var/lib/mysql/mysql-bin.*
+```
+
+**云数据库环境（如 RDS、PolarDB）：**
+```bash
+# 通常需要通过控制台下载或使用内网 IP 连接
+# 阿里云 RDS: 登录控制台 → 实例详情 → 备份恢复 → 下载 Binlog
+# PolarDB: 可通过 DataWorks 或其他工具导出
+```
+
+### `--uri` - 数据库连接字符串
+
+用于**在线拉取 schema 信息**（表结构定义），格式为 `mysql://[user]:[password]@[host]:[port]`。
+
+**为什么需要数据库连接？**  
+Binlog 中只记录数据的变动（INSERT/UPDATE/DELETE 的值），不包含表的定义。工具需要连接数据库查询：
+- 表有多少列？
+- 每列的数据类型是什么？
+- 主键/索引结构？
+
+**常用格式示例：**
+```bash
+# 基础格式
+--uri "mysql://root:@127.0.0.1:3306"           # root 用户，无密码
+--uri "mysql://root:password@127.0.0.1:3306"   # root 用户，带密码
+--uri "mysql://app_user:secret@db.example.com:3306/mydb"  # 指定库
+
+# URI 编码（密码含特殊字符时）
+--uri "mysql://root:P%40ssw0rd@127.0.0.1:3306"  # P@ssw0rd 需要编码
+```
+
+**权限要求：**
+- 最小权限：`REPLICATION SLAVE, REPLICATION CLIENT`
+- 推荐：新建专用账号
+  ```sql
+  CREATE USER 'repl'@'%' IDENTIFIED BY 'password';
+  GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+  FLUSH PRIVILEGES;
+  ```
+
+### `--schema-dump` / `--schema-file` - 离线模式神器
+
+**无需连接数据库即可解码 binlog！**
+
+**工作流程：**
+```bash
+# Step 1: 首次运行时导出表结构（需 --uri 连接数据库）
+./my2sql-rs to-sql \
+  --binlog-dir data/8.0 \
+  --uri "mysql://root@127.0.0.1:3306" \
+  --schema-dump schema.json  # ← 导出表结构到 JSON
+
+# Step 2: 断网/远程环境仅用 schema 文件解码
+./my2sql-rs to-sql \
+  --binlog-dir data/8.0 \
+  --schema-file schema.json \
+  --to-stdout
+```
+
+**适用场景：**
+- ✅ 生产环境无法直连（网络隔离）
+- ✅ 多环境复用（同一份 schema 可用于 dev/staging/prod）
+- ✅ 安全审计（不暴露数据库连接）
+
+---
+
+## 💡 典型使用场景
+
+### 场景 1：恢复误删除的数据 🚑
+
+**问题：** 刚执行了 `DELETE FROM users WHERE id = 5;`，立刻发现删错了！
+
+**解决方案：**
+```bash
+# 1. 找到删除操作发生的 binlog 文件
+mysql -uroot -p -e "SHOW BINARY LOGS;"
+# 输出：mysql-bin.000100  123456
+#       mysql-bin.000101  789012  ← 删除发生在这个文件
+
+# 2. 生成回滚 SQL（flashback 模式）
+./my2sql-rs flashback \
+  --binlog-dir ./binlogs \
+  --start-file mysql-bin.000101 \
+  --uri "mysql://root@127.0.0.1:3306" \
+  --threads 8 \
+  --output-dir ./recovery
+
+# 3. 预览要恢复的数据（dry-run 模式）
+./my2sql-rs flashback \
+  --binlog-dir ./binlogs \
+  --start-file mysql-bin.000101 \
+  --uri "mysql://root@127.0.0.1:3306" \
+  --dry-run
+
+# 输出：{"summary":{"recovery_rate":95.5,"total_transactions":20,"skipped_events":1},...}
+
+# 4. 检查恢复的 SQL 文件
+cat ./recovery/flashback.1.sql
+# 包含：INSERT INTO users (...) VALUES (...);  ← 被删的那条记录
+
+# 5. 执行恢复
+mysql -uroot -p mydb < ./recovery/flashback.1.sql
+```
+
+---
+
+### 场景 2：审计某段时间的操作 📝
+
+**问题：** 想知道昨天下午 2 点到 4 点之间对订单做了什么修改？
+
+**解决方案：**
+```bash
+# 提取特定时间窗口的 DML
+./my2sql-rs to-sql \
+  --binlog-dir ./binlogs \
+  --start-time "2026-09-22 14:00:00" \
+  --end-time "2026-09-22 16:00:00" \
+  --db orders \
+  --table order_items \
+  --dml update,delete \
+  --to-stdout > audit_report.sql
+
+# 统计报表（行数汇总）
+./my2sql-rs stats \
+  --binlog-dir ./binlogs \
+  --start-time "2026-09-22 14:00:00" \
+  --end-time "2026-09-22 16:00:00" \
+  --output-dir ./stats_report
+
+# 查看结果
+cat ./stats_report/binlog_status.txt
+# 格式：文件名  开始时间  结束时间  DML 行数  Update 数  Delete 数  Insert 数  大事务 长事务 库名  表名
+```
+
+---
+
+### 场景 3：迁移数据到另一张表 🔄
+
+**问题：** 需要将历史数据从旧表结构迁移到新表结构。
+
+**解决方案：**
+```bash
+# 1. 导出所有历史数据的 INSERT 语句
+./my2sql-rs to-sql \
+  --binlog-dir ./old_logs \
+  --db old_schema \
+  --table products \
+  --start-file mysql-bin.000001 \
+  --stop-file mysql-bin.000500 \
+  --dml insert \
+  --to-stdout > product_inserts.sql
+
+# 2. 在新库导入（可先调整字段顺序）
+mysql -uroot -p new_schema < product_inserts.sql
+```
+
+---
+
+### 场景 4：实时监控数据库变更 👀
+
+**问题：** 想实时监控某个库的数据变更（替代部分 canal 功能）。
+
+**解决方案：**
+```bash
+# repl 模式持续拉流（伪装成 MySQL replica）
+./my2sql-rs repl \
+  --binlog-dir /nonused \
+  --start-file "" \
+  --uri "mysql://root@127.0.0.1:3306" \
+  --server-id 9527 \
+  --time-zone +00:00 \
+  --output-dir ./realtime \
+  --heartbeat-secs 30
+
+# 后台运行并定期清理
+nohup ./my2sql-rs repl ... > /dev/null 2>&1 &
+
+# 查看进度（checkpoint 自动记录）
+cat ./realtime/resume.json
+```
+
+**特性：**
+- ✅ 断线自动重连（指数退避策略）
+- ✅ 心跳探活（检测死链）
+- ✅ 崩溃后无缝接续（resume.json checkpoint）
+
+---
+
+### 场景 5：离线分析服务器上的 binlog 🧪
+
+**问题：** 把生产环境的 binlog 拷到开发机做分析，但开发机没有数据库连接。
+
+**解决方案：**
+```bash
+# Step 1: 在可连接数据库的环境导出表结构
+./my2sql-rs to-sql \
+  --binlog-dir /prod_binlogs \
+  --uri "mysql://prod_user:password@prod_db:3306" \
+  --schema-dump schema.json
+
+# Step 2: 将 schema.json 拷贝到无库环境
+scp schema.json dev@dev-server:/home/dev/project/
+
+# Step 3: 仅用 schema 文件解码 binlog（无需数据库连接）
+./my2sql-rs to-sql \
+  --binlog-dir /dev_binlogs \
+  --schema-file schema.json \
+  --to-stdout | head
+```
+
+> 💡 **关于 Schema 来源的说明**  
+> 
+> Binlog 中只记录数据变更（如 `UPDATE users SET name='A' WHERE id=1`），但不包含表的定义（如 `CREATE TABLE users (id INT, name VARCHAR(100))`）。工具需要知道表的**列名、类型、主键结构**才能正确生成 SQL。因此必须提供 schema 信息，可通过以下方式之一获取：
+> 
+> - **直连数据库**：`--uri`参数自动拉取实时 schema（最简单）
+> - **预先导出 schema.json**：`--schema-dump` 一次导出，后续可多次复用（推荐用于离线/测试环境）
+> - **从 mysqldump 提取**：通过 grep 或临时 MySQL 实例恢复表结构后，再用`--schema-dump`导出为 JSON 格式
+> 
+> **参考上游**：[my2sql-go](https://github.com/liuhr/my2sql) 同样要求提供 schema 或直连数据库，这是 binlog 解析工具的通用设计模式。
+
+---
+
+## ⚠️ 常见问题 FAQ
+
+### Q: `--start-file` 应该填什么？
+A: 填写 binlog 文件名，如 `mysql-bin.000100`，不是完整路径。完整路径由 `--binlog-dir` 指定。
+
+### Q: 如何知道删除操作在哪个 binlog 文件里？
+A: 
+```bash
+# 方法 1: 查看 MySQL 的二进制日志列表
+mysql -uroot -p -e "SHOW BINARY LOGS;"
+
+# 方法 2: 查看每个文件的时间范围
+./my2sql-rs to-sql --binlog-dir ./data --list-files
+```
+
+### Q: `--threads` 设置多少合适？
+A: 默认 8 线程适合大多数场景。SSD 环境下可以尝试 16+ 线程提升吞吐；机械硬盘建议保持 8 以内避免 IO 瓶颈。
+
+### Q: Flashback 能否恢复 DDL（如 DROP TABLE）？
+A: ❌ **不支持**。DDL 反向 SQL 需要业务理解（如 DROP 后重建表需已知结构），目前只支持 DML（INSERT/UPDATE/DELETE）的反向恢复。
+
 ## ⚙️ 配置参数
 
 ### 常用命令行选项
@@ -193,13 +484,9 @@ Repl 专项:
   --stop-datetime <DATETIME>  停止时间边界
 ```
 
-完整参数列表：
-```bash
-./my2sql-rs to-sql --help
-./my2sql-rs flashback --help
-./my2sql-rs stats --help
-./my2sql-rs repl --help
-```
+完整命令行参数说明请参考 [COMMAND_LINE_OPTIONS.md](docs/COMMAND_LINE_OPTIONS.md)。
+
+常见使用场景和案例请参考 [USE_CASES.md](docs/USE_CASES.md)。
 
 ## 🔍 与 Go my2sql 的差异
 
@@ -288,7 +575,6 @@ limitations under the License.
 
 - **Go my2sql**: [liuhr/my2sql](https://github.com/liuhr/my2sql) — 原始参考实现
 - **mysql-rs**: [blackfin/node_mysql2](https://github.com/blackfin/node_mysql2) — Rust MySQL 生态
-- **社区贡献者**: 感谢所有提交 PR 和反馈 Issue 的用户
 
 ---
 
