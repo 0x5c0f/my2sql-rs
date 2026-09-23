@@ -5,9 +5,9 @@ MySQL binlog → SQL 还原工具的 Rust 独立实现（to-sql / flashback / st
 `reference/my2sql-go/` 作为行为参考与差分裁判——该目录不入库，跑
 `make difftest`/`make compat` 需本地真实副本，见 docs/HANDOVER.md「环境事实」
 运维注），但 CLI 全新设计、无 async（std::thread + crossbeam-channel）。
-**P1–P4b 五轮收官**（v0.1.0-p1 to-sql file 模式 → v0.2.0-p2 flashback + stats →
-v0.3.0-p3 repl → v0.4.0-p4a 质量并行面 → v0.4.1-p4b 性能面），里程碑账见
-[CHANGELOG.md](CHANGELOG.md)；**P5 发布面**：CI 门禁 + `v0.5.0` GitHub Release
+**P1–P6 六轮收官**（v0.1.0-p1 to-sql file 模式 → v0.2.0-p2 flashback + stats →
+v0.3.0-p3 repl → v0.4.0-p4a 质量并行面 → v0.4.1-p4b 性能面 → **v0.5.1-P6 数据恢复面**），里程碑账见
+[CHANGELOG.md](CHANGELOG.md)；**P5 发布面 + P6 交付面统一打包为 v0.5.1**：CI 门禁 + `v0.5.1` GitHub Release
 （双目标预编译产物，见下文「安装与发布」节）。范围边界不变：repl 仅
 to-sql 实时流形态（flashback/stats×repl、repl×Go 裁判差分明确不做，见
 P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
@@ -50,9 +50,9 @@ P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
 
 ## 安装与发布
 
-预编译二进制见 [GitHub Releases](https://github.com/0x5c0f/my2sql-rs/releases/tag/v0.5.0)：
-`my2sql-rs-0.5.0-x86_64-unknown-linux-gnu`（glibc 动态）与
-`my2sql-rs-0.5.0-x86_64-unknown-linux-musl`（musl 静态单二进制，
+预编译二进制见 [GitHub Releases](https://github.com/0x5c0f/my2sql-rs/releases/tag/v0.5.1)：
+`my2sql-rs-0.5.1-x86_64-unknown-linux-gnu`（glibc 动态）与
+`my2sql-rs-0.5.1-x86_64-unknown-linux-musl`（musl 静态单二进制，
 吞吐 64.2 MiB/s@threads=8，见 [docs/bench/p4b.md](docs/bench/p4b.md) ④）+ `SHA256SUMS`。
 
     sha256sum -c SHA256SUMS   # 下载后校验
@@ -61,7 +61,8 @@ P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
 `cargo build --release --target x86_64-unknown-linux-musl`（需 musl-gcc）。
 注意：`repl --uri` 不提供 TLS（差异 26）；发布面 CI 门禁为
 fmt/clippy/test/musl 编译四门，difftest/compat/repl-test/fuzz/shadow 属本地
-六闸体系（「CI 绿 ≠ 六闸绿」，spec D3）。
+六闸体系（「CI 绿 ≠ 六闸绿」，spec D3）。v0.5.1 完整包含 P6「数据恢复面」四任务，
+是 v0.5.0 的功能超集。
 
 ## 快速上手
 
