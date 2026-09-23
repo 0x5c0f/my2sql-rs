@@ -47,10 +47,14 @@ fn _execute_sql_file(
 ) -> bool {
     let status = Command::new("mysql")
         .args([
-            "-h", db_host,
-            "-P", &db_port.to_string(),
-            "-u", db_user,
-            "-p{}", db_password,
+            "-h",
+            db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            db_user,
+            "-p{}",
+            db_password,
             "--batch",
             db_name,
         ])
@@ -70,10 +74,14 @@ fn _get_binlog_position(
 ) -> (String, u32) {
     let output = Command::new("mysql")
         .args([
-            "-h", db_host,
-            "-P", &db_port.to_string(),
-            "-u", db_user,
-            "-p{}", db_password,
+            "-h",
+            db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            db_user,
+            "-p{}",
+            db_password,
             "--batch",
             "-N",
         ])
@@ -109,10 +117,14 @@ fn _create_schema_from_dump(
 ) -> bool {
     let status = Command::new("mysqldump")
         .args([
-            "-h", db_host,
-            "-P", &db_port.to_string(),
-            "-u", db_user,
-            "-p{}", db_password,
+            "-h",
+            db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            db_user,
+            "-p{}",
+            db_password,
             "--no-data",
             source_db,
         ])
@@ -127,10 +139,14 @@ fn _create_schema_from_dump(
     // Create target database and apply schema
     let _ = Command::new("mysql")
         .args([
-            "-h", &db_host,
-            "-P", &db_port.to_string(),
-            "-u", &db_user,
-            "-p{}", &db_password,
+            "-h",
+            &db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            &db_user,
+            "-p{}",
+            &db_password,
             target_db,
         ])
         .current_dir(dump_file.parent().unwrap())
@@ -151,10 +167,14 @@ fn _get_database_checksums(
 ) -> HashMap<String, String> {
     let output = Command::new("mysql")
         .args([
-            "-h", db_host,
-            "-P", &db_port.to_string(),
-            "-u", db_user,
-            "-p{}", db_password,
+            "-h",
+            db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            db_user,
+            "-p{}",
+            db_password,
             "--batch",
             "-N",
             db_name,
@@ -221,26 +241,34 @@ INSERT INTO t_users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
     )
     .unwrap();
 
-    assert!(_execute_sql_file(
-        &db_host,
-        db_port,
-        &db_user,
-        &db_password,
-        test_db,
-        &schema_file
-    ), "Schema creation should succeed");
+    assert!(
+        _execute_sql_file(
+            &db_host,
+            db_port,
+            &db_user,
+            &db_password,
+            test_db,
+            &schema_file
+        ),
+        "Schema creation should succeed"
+    );
 
     // Step 2: Record checksum before "accident"
-    let checksum_before = _get_database_checksums(&db_host, db_port, &db_user, &db_password, test_db);
+    let checksum_before =
+        _get_database_checksums(&db_host, db_port, &db_user, &db_password, test_db);
     println!("Checksum before drop: {:?}", checksum_before);
 
     // Step 3: Simulate DROP DATABASE accident
     let _ = Command::new("mysql")
         .args([
-            "-h", &db_host,
-            "-P", &db_port.to_string(),
-            "-u", &db_user,
-            "-p{}", &db_password,
+            "-h",
+            &db_host,
+            "-P",
+            &db_port.to_string(),
+            "-u",
+            &db_user,
+            "-p{}",
+            &db_password,
         ])
         .arg("-e")
         .arg(format!("DROP DATABASE IF EXISTS {}", test_db))
@@ -284,11 +312,14 @@ INSERT INTO t_users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
         );
 
         // Step 5: Parse recovery rate and verify it's reasonable
-        let summary: serde_json::Value = serde_json::from_str(&stdout).expect("Summary should be valid JSON");
-        let recovery_rate = summary["summary"]["recovery_rate"].as_f64().expect("Should have recovery_rate");
-        
+        let summary: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Summary should be valid JSON");
+        let recovery_rate = summary["summary"]["recovery_rate"]
+            .as_f64()
+            .expect("Should have recovery_rate");
+
         println!("Recovery rate: {:.2}%", recovery_rate);
-        
+
         // For a full dataset replay scenario, we expect high recovery rate (>80%)
         // In real drop-recovery, this would reflect DDL vs DML ratio
         assert!(
@@ -296,7 +327,10 @@ INSERT INTO t_users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
             "Recovery rate should be between 0 and 100"
         );
     } else {
-        eprintln!("No binlog data found at {:?}, skipping actual recovery test", binlog_dir);
+        eprintln!(
+            "No binlog data found at {:?}, skipping actual recovery test",
+            binlog_dir
+        );
     }
 
     // Cleanup
