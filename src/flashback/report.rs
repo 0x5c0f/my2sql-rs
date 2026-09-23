@@ -30,8 +30,7 @@ impl JsonlReporter {
     }
 
     pub fn write(&mut self, event: &SkipEvent) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string(event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let json = serde_json::to_string(event).map_err(std::io::Error::other)?;
         writeln!(self.writer, "{json}")?;
         Ok(())
     }

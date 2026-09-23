@@ -15,7 +15,7 @@ pub mod stats;
 
 #[cfg(test)]
 mod report_integration_tests {
-    use crate::flashback::report::{JsonlReporter, SkipEvent};
+    use crate::flashback::report::SkipEvent;
 
     #[test]
     fn test_jsonl_reporter_format() {

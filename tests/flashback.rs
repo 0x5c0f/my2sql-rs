@@ -152,7 +152,7 @@ fn flashback_e2e_multi_trx_bytes() {
 // P6 T1: Report format validation
 #[test]
 fn test_report_jsonl_format() {
-    use my2sql_rs::flashback::report::{JsonlReporter, SkipEvent};
+    use my2sql_rs::flashback::report::SkipEvent;
 
     let event = SkipEvent {
         timestamp: "2026-09-22T14:30:15Z".to_string(),
