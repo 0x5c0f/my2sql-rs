@@ -18,7 +18,7 @@ fn unit_test_skip_event_serialization() {
     assert!(json.contains("\"binlog\":\"mysql-bin.000150\""));
     assert!(json.contains("\"position\":12345"));
     assert!(json.contains("\"type\":\"Query\""));
-    assert!(json.contains("\"sql\":\"ALTER TABLE t_users ADD COLUMN new_field VARCHAR(100\""));
+    assert!(json.contains("\"sql\":\"ALTER TABLE t_users ADD COLUMN new_field VARCHAR(100)\""));
 }
 
 #[test]
@@ -60,8 +60,8 @@ fn unit_test_jsonl_writer() -> Result<(), Box<dyn std::error::Error>> {
     let lines: Vec<&str> = content.lines().collect();
 
     assert_eq!(lines.len(), 1, "Should have exactly one line");
-    assert!(lines[0].contains("\"binlog\": \"mysql-bin.000150\""));
-    assert!(lines[0].contains("\"position\": 12345"));
+    assert!(lines[0].contains("\"binlog\":\"mysql-bin.000150\""));
+    assert!(lines[0].contains("\"position\":12345"));
 
     std::fs::remove_dir_all(&test_dir)?;
     Ok(())
