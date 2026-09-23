@@ -169,18 +169,6 @@ fn test_report_jsonl_format() {
     assert!(json.contains("\"position\":12345"));
     assert!(json.contains("\"type\":\"Query\""));
 }
-    let out1 = f.dir().join("out1");
-    let mut cfg1 = cfg_for(f.dir(), &out1, true, OnError::SkipBadEvent);
-    cfg1.threads = 1;
-    run_flashback(&cfg1).expect("threads=1 ok");
-    assert_eq!(
-        std::fs::read_to_string(out1.join("flashback.1.sql")).unwrap(),
-        body,
-        "threads=1 直通输出必须与并行路径逐字节一致"
-    );
-
-    std::fs::remove_dir_all(f.dir()).ok();
-}
 
 // ---------- 用例 2：on-error stop → Err + 全清场（并行 + 直通两形态） ----------
 
