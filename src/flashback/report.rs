@@ -30,9 +30,8 @@ impl JsonlReporter {
     }
 
     pub fn write(&mut self, event: &SkipEvent) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string(event).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?;
+        let json = serde_json::to_string(event)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         writeln!(self.writer, "{json}")?;
         Ok(())
     }
@@ -57,7 +56,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&event).expect("should serialize");
-        
+
         // Verify all required fields present (serde compact serialization)
         assert!(json.contains("\"timestamp\":\"2026-09-22T14:30:15Z\""));
         assert!(json.contains("\"binlog\":\"mysql-bin.000150\""));
