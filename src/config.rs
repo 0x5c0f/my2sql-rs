@@ -183,6 +183,9 @@ pub struct FlashbackArgs {
     /// DDL skip events 报告文件路径（JSONL 格式，P6 T1）
     #[arg(long)]
     pub report_file: Option<String>,
+    /// Dry-run mode: count only, no SQL generation (P6 T2)
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -286,6 +289,8 @@ pub struct Config {
     pub heartbeat_secs: u32,
     /// P6 T1：DDL skip events 报告文件路径（JSONL format）
     pub report_file: Option<String>,
+    /// P6 T2：Dry-run mode flag (count only, no SQL generation)
+    pub dry_run: bool,
 }
 
 /// 解析 `--time-zone`：支持 "+08:00"/"-06:00" 数字偏移、UTC、SYSTEM（本机时区）。
@@ -371,6 +376,7 @@ impl Config {
         cfg.keep_trx = !args.no_keep_trx;
         cfg.on_error = args.on_error;
         cfg.report_file = args.report_file.clone();
+        cfg.dry_run = args.dry_run;
         Ok(cfg)
     }
 
@@ -579,6 +585,9 @@ fn build_common(args: &CommonArgs) -> Result<Config, String> {
         insert_batch: None,
         time_zone,
         threads: args.threads,
+        // P6 T1/T2: Flashback exclusive fields (set in validate_flashback)
+        report_file: None,
+        dry_run: false,
         // 默认按 to-sql 口径（P2 T3 注记：robust-continue 不变）；
         // flashback/stats 在各自 validate_* 覆写。
         work_type: WorkType::ToSql,
