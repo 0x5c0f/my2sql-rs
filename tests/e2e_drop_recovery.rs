@@ -63,7 +63,7 @@ fn create_schema_from_dump(
     dump_file: &PathBuf,
 ) -> bool {
     let status = Command::new("mysqldump")
-        .args(&[
+        .args([
             "-h",
             db_host,
             "-P",
@@ -85,7 +85,7 @@ fn create_schema_from_dump(
 
     // Create target database and apply schema (simplified - no stdin for now)
     let _ = Command::new("mysql")
-        .args(&[
+        .args([
             "-h",
             db_host,
             "-P",
@@ -122,7 +122,7 @@ fn test_drop_recovery_checksum_match() {
     // Skip if no container running
     let container_name = "my2sql-dt-8.0";
     let status = Command::new("docker")
-        .args(&[
+        .args([
             "ps",
             "--filter",
             &format!("name={}", container_name),
@@ -171,7 +171,7 @@ fn test_drop_recovery_checksum_match() {
     let output_dir = tmp_dir.join("recovered");
 
     let snapshot = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--release",
             "--",
@@ -277,7 +277,7 @@ fn test_dryrun_summary_format() {
     }
 
     let snapshot = Command::new("cargo")
-        .args(&[
+        .args([
             "run",
             "--release",
             "--",
