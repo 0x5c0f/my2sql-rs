@@ -140,13 +140,13 @@ fn _create_schema_from_dump(
     let _ = Command::new("mysql")
         .args([
             "-h",
-            &db_host,
+            db_host,
             "-P",
             &db_port.to_string(),
             "-u",
-            &db_user,
+            db_user,
             "-p{}",
-            &db_password,
+            db_password,
             target_db,
         ])
         .current_dir(dump_file.parent().unwrap())
@@ -323,7 +323,7 @@ INSERT INTO t_users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
         // For a full dataset replay scenario, we expect high recovery rate (>80%)
         // In real drop-recovery, this would reflect DDL vs DML ratio
         assert!(
-            recovery_rate >= 0.0 && recovery_rate <= 100.0,
+            (0.0..=100.0).contains(&recovery_rate),
             "Recovery rate should be between 0 and 100"
         );
     } else {
