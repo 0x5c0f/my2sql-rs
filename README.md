@@ -24,7 +24,10 @@ P3 spec §0 与下文差异 25）。逐字回归台账（各轮 DoD 对账、
 | 并行 `--threads` | ✅ | 乱序并行解码 + reorder 保序刷出 + 反压；同输入任意 threads 输出字节一致 |
 | 事件/库表过滤（`--db/--table/--ignore-*`、`--dml`、start/stop 窗口） | ✅ | |
 | 输出形态（`--output-dir/--to-stdout/--file-per-table/--add-extra-info/--no-db-prefix/--full-columns` 等） | ✅ | |
-| `flashback`（反向/回滚 SQL，记录原子逆序 + keep-trx 事务脚手架） | ✅ | Go `-work-type rollback` 裁判差分 4 版本全绿（`flashback-{5.6,5.7,8.0,8.4}`）+ `WORK_TYPE=rollback make difftest` + 活库正逆对账（`tools/flashback-reconcile.sh`）；DDL 反向明确不做（D5） |
+| `flashback`（反向/回滚 SQL，记录原子逆序 + keep-trx 事务脚手架） | ✅ | Go `-work-type rollback` 裁判差分 4 版本全绿（`flashback-{5.6,5.7,8.0,8.4}`）+ `WORK_TYPE=rollback make difftest` + 活库正逆对账（`tools/flashback-reconcile.sh`）；DDL 反向明确不做（D5）**P6-T3: --on-error stop|skip-bad-event CLI 暴露** |
+| `--report-file <path>` (DDL Skip JSONL 报告) | ✅ | `flashback --report-file out/skip_events.jsonl` → timestamp/binlog/position/type_/sql JSONL 字段（T1 DoD-1，tests/e2e_drop_recovery.rs::test_report_format_for_skip_events） |
+| `--dry-run` (Flashback dry-run summary preview) | ✅ | 输出 compact JSON：summary.{recovery_rate%,total_transactions,skipped_events} / binlog_range / warnings；DBA 预演决策依据（T2 DoD-1，tests/e2e_drop_recovery.rs::test_dryrun_summary_format） |
+| `stats`（窗口×表 DML 行数 + 大/长事务识别，两报表 + JSONL） | ✅ | `stats-{5.6,8.0}` 冒烟绿（报表 DML 总和 == 同流 to-sql 行数）；上游报表字节面复刻，**不做**裁判差分（spec §3.6，理由见差异 22） |
 | `stats`（窗口×表 DML 行数 + 大/长事务识别，两报表 + JSONL） | ✅ | `stats-{5.6,8.0}` 冒烟绿（报表 DML 总和 == 同流 to-sql 行数）；上游报表字节面复刻，**不做**裁判差分（spec §3.6，理由见差异 22） |
 | repl 模式（伪装 replica 拉流，to-sql 流式形态） | ✅ | 事务边界 checkpoint + `--resume-file` 接续 + 指数退避自动重连 + 心跳探活（超集四件，见差异 23）；**等价性总闸**：repl 与 file 模式同 binlog 段产出逐字节一致；`make repl-test` live 件 13 项全绿（P4a +5.6/5.7 idle 心跳两件）、`make compat` 18 用例（既有 14 + repl×4 版本，逐字见 matrix.md）；**不做**与 Go 裁判差分（上游 repl 不可作裁判，理由见差异 25）；TLS 不提供（差异 26） |
 | DDL 回滚 / `--apply` 直写库 / MariaDB / 8.0.1 default_metadata | ❌ | 明确不做（设计决策 D5） |
@@ -345,6 +348,18 @@ P4a（质量面）追加：
     md5 相同；两家 ENUM 均输出
     **1-based 序号**（裁决 D4 现状），非成员名字符串保真。挂账清单
     「测试债三列形覆盖缺口」由本件销账。
+
+P6「数据恢复面」战役追加（T1-T4 交付）：
+
+29. **on_error 策略显式开关**（T3）：`--on-error stop|skip-bad-event` CLI flag
+    暴露 flashback 错误处理策略；默认 stop（与上游一致），skip-bad-event 容错模式跳
+    过损坏事件继续产出；DDL 跳过 fallback 到 skip-bad-event 逻辑（README 差异 21）
+30. **ddl_skip_report JSONL 档案**（T1）：`--report-file <path>` 记录跳过事件的完整
+    上下文（timestamp/binlog/position/type_/sql），与 stderr 汇总告警互补——便于离
+    线审计与问题复盘；Go 版无对应形态
+31. **dry-run preview mode**（T2）：`--dry-run` 输出 compact JSON summary，仅统计
+    不写盘；summary.{recovery_rate%,total_transactions,skipped_events} + binlog_range
+    + warnings；DBA 预演决策依据；上游 -work-type rollback 无对应物
 
 ## 文档
 

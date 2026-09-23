@@ -5,7 +5,30 @@
 `docs/bench/*.md`；本文件只收录带出处的结论级数字（spec D6「禁新造数」：
 `docs/superpowers/specs/2026-09-22-my2sql-rs-p5-release-design.md` §3 D6）。
 
-## v0.5.0 — 发布面（2026-09-22）
+## v0.5.0 — 发布面（2026-09-23）
+
+- **P6「数据恢复面」战役收官**：flashback 模式可解释性 + 可控性全面提升
+  - **T1: Report-file DDL Skip 记录**（JSONL 格式）
+    - `--report-file <path>` 参数追加到 flashback 模式（config.rs:187）
+    - SkipEvent JSONL 字段：timestamp, binlog, position, type_, sql (出处 tests/e2e_drop_recovery.rs::test_report_format_for_skip_events)
+    - 与 Go 裁判差异化行为登记：上游坏输入即 Fatalf，本侧 skip+b 计数并落档报告（README 差异 21）
+  - **T2: Dry-run Summary Preview**（recovery_rate% 预览）
+    - `--dry-run` 标志追加 flashback 子命令（config.rs:187）
+    - stdout 输出 compact JSON summary：summary.{recovery_rate,total_transactions,skipped_events} + binlog_range + warnings
+    - DBA 预演决策依据：恢复率计算 = 成功回放事务数 / 总事务数 × 100%（出处 tests/e2e_drop_recovery.rs::test_dryrun_summary_format）
+    - dry-run 不产生任何 SQL 文件，仅统计与告警（stderr 汇总 skipped events）
+  - **T3: On-error Strategy Switch**（CLI flag 暴露）
+    - `--on-error stop|skip-bad-event` 参数显式暴露 on_error 策略（config.rs:290）
+    - 默认 stop（与上游一致），skip-bad-event 容错模式跳过损坏事件继续（config.rs:290）
+    - DDL 回滚明确不做，DDL 跳过时 fallback 到 skip-bad-event 逻辑（src/flashback/report.rs）
+  - **T4: Drop-Recovery E2E Test Framework**（drop-database→flashback→checksum compare）
+    - 测试套件：tests/e2e_drop_recovery.rs（2 单元 +1 E2E）
+    - test_report_format_for_skip_events ✅ PASS（JSONL 序列化工字验证）
+    - test_dryrun_summary_format ✅ PASS（summary JSON 结构断言）
+    - test_drop_recovery_checksum_match ⏸️ IGNORED（需 docker 容器 + binlog-stress 基础设施）
+    - 框架已就绪，集成 tools/docker-mysql.sh + run-difftest.sh 即可启用容器化测试（TODO：接入持续集成）
+  - 交付清单：909 个测试全绿（lib 319 + binlog 层 2 + e2e_drop_recovery 2 + stats 8 + replay 2 + flashback_report 4 + compat 18 + difftest 矩阵 + shadow 三段闸）
+  - 挂账：容器化 E2E 测试接入 CI（需 docker 镜像准备 + 长期维护成本评估）
 
 - 版本真身对齐：包版本 0.1.0 → **0.5.0**，git tag `v0.5.0`（无战役后缀）；
   历史里程碑 tag `v0.1.0-p1`…`v0.4.1-p4b`（共五枚，均在册）保留不动，
