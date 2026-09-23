@@ -141,16 +141,9 @@ fn run_dry_run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
     // Count transactions during scan (same iteration as normal path)
     let mut counter = TransactionCounter::new();
     
-    // Open schema store for proper row event parsing
-    use crate::metadata::store::SchemaStore;
-    let schema_path = cfg.schema_file.as_ref().ok_or_else(|| {
-        PipelineError::Config("--schema-file required for dry-run".into())
-    })?;
-    let mut store = SchemaStore::offline(schema_path)?;
-    
     // Read binlogs file by file using FileReader (EventSource impl)
     use crate::binlog::file_reader::FileReader;
-    use crate::pipeline::{Filters, TrxStatus};
+    use crate::pipeline::Filters;
     let mut name = cfg.start_file.clone();
     let filters = Filters::default();
     
@@ -165,27 +158,10 @@ fn run_dry_run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
         
         // Pump events from this file
         loop {
-            let is_ddl = match &reader.next()? {
-                Some(result) => {
-                    matches!(result.kind, crate::pipeline::source::RawKind::Query(ref sql) 
-                        if {
-                            let upper = sql.to_uppercase();
-                            upper.starts_with("CREATE") || upper.starts_with("ALTER") || 
-                               upper.starts_with("DROP") || upper.starts_with("TRUNCATE") ||
-                               upper.starts_with("RENAME")
-                        }
-                    )
-                },
-                None => break,  // EOF for this file
-            };
-            
             if let Some(event) = reader.next()? {
                 counter.count_event(event);
-                
-                // Reload schema after DDL
-                if is_ddl {
-                    store = SchemaStore::offline(schema_path)?;
-                }
+            } else {
+                break;  // EOF for this file
             }
         }
         
