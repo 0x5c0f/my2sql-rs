@@ -1,8 +1,6 @@
-# P5-T3（spec D5，R3 定稿形）：tag v* push → 本机收口链（T4）已先以
-# `gh release create --draft` 建好 v<ver> draft Release；本 workflow 构建
-# 双目标产物并 `gh release upload` 挂入；T4 回验后 undraft。
-# （为何 draft 先行而非 workflow 自建 Release：私有仓 + 控制器需在
-#  undraft 前有本机回验位——最小步骤可取原则，spec D5。）
+# P7 auto-release: tag v* push → workflow creates draft + builds + uploads
+# Changed from P5 design (pre-create draft) to simplify release workflow;
+# now fully automated: checkout → create-draft → build → upload assets.
 name: release
 on:
   push:
@@ -15,9 +13,6 @@ jobs:
     strategy:
       matrix:
         include:
-          # C1：suffix = 完整 triple，使 cp 与 upload glob（均引 matrix.suffix）随动，
-          # 云端资产名逐字 = spec D4 模板 my2sql-rs-<ver>-x86_64-unknown-linux-{gnu,musl}，
-          # 与本机 release-build.sh 产物名同形（原 gnu/musl 短后缀偏离 D4，已修）。
           - target: x86_64-unknown-linux-gnu
             suffix: x86_64-unknown-linux-gnu
           - target: x86_64-unknown-linux-musl
@@ -29,17 +24,22 @@ jobs:
       - name: build
         run: |
           cargo build --release --target ${{ matrix.target }}
-          # 版本提取与 tools/release-build.sh 同源同法（控制器裁定 1 定稿：jq；
-          # ubuntu-latest 预装 jq）。workflow 内无版本字面量（spec D2）。
           VER=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
           [ -n "$VER" ] && [ "$VER" != null ]
           cp "target/${{ matrix.target }}/release/my2sql-rs" \
              "my2sql-rs-${VER}-${{ matrix.suffix }}"
+      - name: Create or verify draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Check if release exists, create draft if not
+          gh release view "${{ github.ref_name }}" &> /dev/null || \
+            gh release create "${{ github.ref_name }}" --draft --title "Release ${{ github.ref_name }}" --notes "Automated release from tag push"
       - name: upload
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${GITHUB_REF_NAME}" \
+          gh release upload "${{ github.ref_name }}" \
             "my2sql-rs-"*-${{ matrix.suffix }} --clobber
   sha:
     needs: build
