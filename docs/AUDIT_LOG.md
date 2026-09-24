@@ -13,6 +13,7 @@
 | 2026-09-24 | my2sql | Single-crate | 1 | 36 | 7 | 0 | 🟡 | Architecture review reveals unwrap() prevalence, CIs failing tests |
 | 2026-09-24 | my2sql-rs | Multi-crate (1 member) | 0 | 2 | 1 | 3 | 🟡 | 二次审计：G3 恢复(364 tests)，MIGRATE-1 因 workspace 存在而 resolved；C1/C2 生产 panic 路径保留 High；S3/C9 重分类 Low |
 | 2026-09-24 | my2sql-rs | Multi-crate (1 member) | 0 | 1 | 3 | 3 | 🟡 | 三次审计（HEAD 978854b，工作区干净）：G1 fmt 失败(tests/e2e.rs:611,643)为唯一 High；C1/C2 依证据下调 Medium（join 捕获线程 panic、output_dir.unwrap 有前置守卫）；G2/G3(364)/G4 绿 |
+| 2026-09-24 | my2sql-rs | Multi-crate (1 member) | 0 | 0 | 3 | 3 | 🟢 | 四次审计（HEAD eba3a68，工作区干净）：G1 修复并独立复验通过（`cargo fmt --check` 退出 0），G1–G4 全绿、G3 仍 364 tests；C1/C2 同严重度复报 Medium；G5 三条构建命令 + S5 未验证 |
 
 ---
 
@@ -477,3 +478,76 @@ my2sql-rs v0.5.0 post-P6 delivery shows excellent code quality, comprehensive te
   panic 会转化为可诊断错误而非静默死亡（`src/flashback/reverse.rs:110-116`）。判定该 gotcha 前须确认是否有 join 兜底。
 - **`ignore_paths` 未跟随 `.gitignore`：** `.qoder/`（811 个 `.rs`）与 `data/`（MySQL 数据目录）使 `total_loc` 从约 2.5 万膨胀到 40 万。
   本项目审计应在 `config.json` 的 `ignore_paths` 补 `.qoder`、`data`、`out`、`reference`、`.superpowers`。
+
+---
+
+## Findings (2026-09-24 — 四次审计：G1 修复复验，健康度回到 🟢)
+
+**被审计树：** HEAD `eba3a68`（2026-09-24 14:08:13 +0800），`git status` 干净（仅未跟踪 `RTEST_GUIDE.md`）。
+与三次审计的差异：`eba3a68` 只改 `tests/e2e.rs`（数组换行展开，无语义变化）与两份审计文档，`src/` 一行未动。
+
+### Resolved
+
+#### G1 — 格式化门禁失败
+- **Status:** RESOLVED ✅（High → 无发现）
+- **Location:** `tests/e2e.rs`（原 611 / 643 行）
+- **Re-verification:** 本轮独立执行 `cargo fmt --check`，退出 0（不采信提交信息自述）
+- **Blast-radius re-check:** G3 复跑退出 0，364 个测试通过，与修复前同数——该文件被 3 个 `real_capture_flashback_*` 真件 e2e 消费，上一轮报告已列为必验项
+
+### Recurring Findings（同严重度复报，未升级）
+
+#### C1 — 生产代码 `unwrap()`
+- **Status:** RECURRING（Medium，与三次审计同严重度）
+- **Location:** `src/flashback/reverse.rs:96,105,118`
+- **Evidence:** `src/` 自上一轮未改动，下调依据不变（`h.join()` 收集 `is_err()`；锁临界区内无 panic 路径）
+- **Residual:** 「锁从不跨 panic 路径持有」不变量未文档化
+
+#### C2 — 运行期 `expect()`
+- **Status:** RECURRING（Medium，同严重度）
+- **Location:** `src/pipeline/mod.rs:588,591,595`、`src/repl/assembly.rs:613`、`src/output.rs:298`
+- **Evidence:** 均为同函数内可自证不变量；`src/` 未改动
+
+#### G5 — 3 条 CI 构建命令未本地验证
+- **Status:** RECURRING（Medium，同严重度）
+- **Location:** musl release build、`cargo check --manifest-path fuzz/Cargo.toml`、release 双目标矩阵 build
+- **Note:** 提交 `eba3a68` 的提交信息称「all gates now pass」，但该自述不覆盖这 3 条；审计按未验证处理
+
+#### S3 — 测试内 `format!()` SQL
+- **Status:** RECURRING（Low，维持降级 High→Low）
+- **Location:** `tests/repl.rs`（7）、`tests/e2e_drop_recovery.rs:274`、`src/pipeline/mod.rs:1362`（`#[cfg(test)]` 内）
+
+#### C9 — `println!`/`eprintln!`
+- **Status:** RECURRING（Low，维持降级 Medium→Low）
+- **Location:** 13 处（`src/main.rs`、`src/config.rs:332`、`src/pipeline/mod.rs:154,652`、benches、fuzz）
+
+#### C5 — `main.rs` 46 行
+- **Status:** RECURRING（Low，维持降级 High→Low）
+- **Location:** `src/main.rs`
+
+### Not Applicable / Not Verified
+
+- **MIGRATE-1：** 不适用（`[workspace]` 存在）
+- **S5：** 跳过（`cargo-audit` 未安装）——连续四轮未验证，属未验证而非通过
+- **C4 / D1–D5 / E1–E6：** 不适用（无 domain role crate、无前端）
+
+### Passed Checks
+
+| ID | Check | Evidence |
+|----|-------|----------|
+| G1 | 格式化门禁 | `cargo fmt --check` 退出 0（本轮修复后首次全绿） |
+| G2 | lint 门禁 | `cargo clippy --all-targets -- -D warnings` 退出 0 |
+| G3 | 测试门禁 | `cargo test --no-fail-fast` 退出 0（364 tests） |
+| G4 | 工具链一致性 | `rustc 1.96.0` = CI 钉定 `1.96.0`，edition 2024 |
+| S1 | 无 `unsafe` | `rg "\bunsafe\b" src/ tests/ benches/` 零命中 |
+| S2 | 无硬编码密钥 | 保守模式扫描零命中 |
+| C7 | 无 `anyhow` | 使用 `thiserror` |
+| C10 | 无 TODO/FIXME/HACK | `src/` 生产路径零命中 |
+| B1 | 依赖方向 | `dep-check.sh` 无禁止方向（单成员） |
+| A1/A2 | workspace 清单 | `[workspace] members=["."] exclude=["fuzz"]` |
+
+### Gotcha Validation
+
+- **提交信息的「all gates now pass」不是门禁证据：** 本轮按 G5 要求重新执行 `cargo fmt --check` / `clippy -D warnings` / `cargo test --no-fail-fast` 三条命令并逐条记录退出码，未采用提交自述。
+  教训：修复提交只会**声称**门禁恢复；审计仍须亲自跑同一命令，且提交信息通常不覆盖 CI 中未本地复现的构建命令（本例 3 条）。
+- **格式化修复触碰真件测试输入时必须复验 G3：** `tests/e2e.rs` 的数组换行改动看似纯空白，但该文件同时是 3 个 `real_capture_flashback_*` e2e 的入参载体。
+  本轮 G3 复跑确认 364 通过；若只看 G1 转绿就宣布关闭，会把「格式化改动是否动到测试语义」这一问题留在未验证状态。
