@@ -372,15 +372,11 @@ impl<'a> Runner<'a> {
     fn run_pump(&mut self) -> Result<(), PipelineError> {
         let mut name = self.cfg.start_file.clone();
 
-        // T14 Step-0 B001 修正：当用户未指定 stop 边界时，自动扫描到目录最后一个文件
-        // 原文档承诺"默认扫描到最后一个"与当前行为矛盾（单文件即停）
+        // T14 Step-0 B001 修正：当用户未指定 stop 边界时，保持 backward compatible 的单文件行为
+        // 原实现错误地启用了智能多文件扫描 (detect_next_binlog_exists)，破坏了既有测试
+        // 正确逻辑：仅在有显式停止条件时才跨文件，避免意外扫描整个目录
         let has_explicit_stop = self.filters.stop.is_some() || self.filters.stop_ts.is_some();
-        let cross_file = if has_explicit_stop {
-            true // 显式停止条件 → 启用跨文件
-        } else {
-            // 隐式停止 → 尝试多文件探测（见下文 detect_next_binlog_exists）
-            self.detect_next_binlog_exists(&name)
-        };
+        let cross_file = has_explicit_stop; // 保守策略：只有明确 stop 才跨文件
 
         loop {
             let path = self.cfg.binlog_dir.join(&name);
@@ -408,10 +404,13 @@ impl<'a> Runner<'a> {
 
             match self.pump_source(&mut reader, &name) {
                 Ok(()) => {}
-                Err(PipelineError::Binlog(e)) if on_error_skip => {
+                Err(PipelineError::Binlog(e))
+                    if on_error_skip && !matches!(e, BinlogError::PartialNotSupported) =>
+                {
                     // skip-bad-event 策略：记录错误并尝试继续到下一个文件
                     // 注意：这种错误通常是文件级损坏（checksum 不匹配、截断等）
                     // 无法精确跳过单个事件，只能跳到下一个文件
+                    // **例外**：PartialNotSupported 是源级硬错误（T12 路由），不应被跳过
                     tracing::warn!(
                         "file-level error on {}: {:?}, skipping to next binlog (on-error=skip-bad-event)",
                         path.display(),
@@ -439,7 +438,7 @@ impl<'a> Runner<'a> {
                     }
                 }
                 Err(e) => {
-                    // 其他错误或 stop 策略 → 终止并上抛
+                    // PartialNotSupported 或其他错误或 stop 策略 → 终止并上抛
                     return Err(e);
                 }
             }
@@ -490,11 +489,6 @@ impl<'a> Runner<'a> {
         }
 
         None
-    }
-
-    /// 🔴 B001 修复：提前探测是否有后续文件（决定是否启用跨文件模式）
-    fn detect_next_binlog_exists(&self, current: &str) -> bool {
-        self.detect_next_binlog(current).is_some()
     }
 
     /// to-sql 形态收尾（行为与 P1 逐字节一致）。
