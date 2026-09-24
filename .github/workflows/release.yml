@@ -1,6 +1,6 @@
-# P7 auto-release: tag v* push → workflow creates draft + builds + uploads
-# Changed from P5 design (pre-create draft) to simplify release workflow;
-# now fully automated: checkout → create-draft → build → upload assets.
+# P7 auto-release: tag v* push → builds + uploads to release
+# Distinguishes between pre-release (vX.Y.Z-prerelease*) and official releases
+# Prerelease tags are marked as pre-release in GitHub Releases
 name: release
 on:
   push:
@@ -28,18 +28,23 @@ jobs:
           [ -n "$VER" ] && [ "$VER" != null ]
           cp "target/${{ matrix.target }}/release/my2sql-rs" \
              "my2sql-rs-${VER}-${{ matrix.suffix }}"
-      - name: Create or verify draft release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Check if release exists, create draft if not
-          gh release view "${{ github.ref_name }}" &> /dev/null || \
-            gh release create "${{ github.ref_name }}" --draft --title "Release ${{ github.ref_name }}" --notes "Automated release from tag push"
-      - name: upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ github.ref_name }}" \
+          TAG="${{ github.ref_name }}"
+          IS_PRERELEASE="false"
+          # Check if tag contains prerelease identifiers
+          if [[ "$TAG" =~ -(alpha|beta|rc|pre) ]]; then
+            IS_PRERELEASE="true"
+          fi
+          # Create release with appropriate flag
+          gh release create "${TAG}" \
+            --title "Release ${TAG}" \
+            ${IS_PRERELEASE && echo "--prerelease"} \
+            --notes "Automated release from tag push: ${TAG}"
+          # Upload artifacts
+          gh release upload "${TAG}" \
             "my2sql-rs-"*-${{ matrix.suffix }} --clobber
   sha:
     needs: build
