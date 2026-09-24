@@ -1,12 +1,10 @@
-# P7 auto-release: tag v* push → builds + uploads to release
+# P7 auto-release: tag v* push → builds + uploads to release (single workflow)
+# Combines CI and release into one job to avoid race conditions with tag creation
 # Distinguishes between pre-release (vX.Y.Z-prerelease*) and official releases
-# Prerelease tags are marked as pre-release in GitHub Releases
 name: release
 on:
   push:
     tags: ['v*']
-permissions:
-  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,23 +31,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.ref_name }}"
-          # Check if tag contains prerelease identifiers
-          if [[ "$TAG" =~ -(alpha|beta|rc|pre) ]]; then
-            gh release create "${TAG}" --prerelease --title "Release ${TAG}" \
-              --notes "Automated pre-release from tag push: ${TAG}"
+          # Check if release already exists (from previous failed attempt)
+          if gh release view "$TAG" &> /dev/null; then
+            echo "Release $TAG already exists, skipping creation"
           else
-            gh release create "${TAG}" --title "Release ${TAG}" \
-              --notes "Automated release from tag push: ${TAG}"
+            # Check if tag contains prerelease identifiers
+            if [[ "$TAG" =~ -(alpha|beta|rc|pre) ]]; then
+              gh release create "${TAG}" --prerelease --title "Release ${TAG}" \
+                --notes "Automated pre-release from tag push: ${TAG}"
+            else
+              gh release create "${TAG}" --title "Release ${TAG}" \
+                --notes "Automated release from tag push: ${TAG}"
+            fi
           fi
           # Upload artifacts
           gh release upload "${TAG}" \
             "my2sql-rs-"*-${{ matrix.suffix }} --clobber
-  sha:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - env: { GH_TOKEN: '${{ github.token }}' }
+      - name: Generate SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release download "$GITHUB_REF_NAME" -p 'my2sql-rs-*' -D /tmp/rel
           ( cd /tmp/rel && sha256sum my2sql-rs-* > SHA256SUMS )
