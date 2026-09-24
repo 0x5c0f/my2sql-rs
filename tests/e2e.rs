@@ -608,7 +608,14 @@ fn real_capture_flashback_minimal_image_hard_errors() {
         "flashback",
         "binlog.000003",
         &out,
-        &["--stop-file", "binlog.000003", "--on-error", "stop", "--threads", "1"],
+        &[
+            "--stop-file",
+            "binlog.000003",
+            "--on-error",
+            "stop",
+            "--threads",
+            "1",
+        ],
     )))
     .expect_err("MINIMAL 镜像 UPDATE 必触发硬规则 b → Stop 整跑 Err（真件证明）");
     let msg = e.to_string();
@@ -640,7 +647,14 @@ fn real_capture_flashback_minimal_image_hard_errors() {
         "flashback",
         "binlog.000003",
         &out3,
-        &["--stop-file", "binlog.000003", "--on-error", "skip-bad-event", "--threads", "1"],
+        &[
+            "--stop-file",
+            "binlog.000003",
+            "--on-error",
+            "skip-bad-event",
+            "--threads",
+            "1",
+        ],
     )))
     .expect("skip 模式不中断整跑");
     assert_eq!(
