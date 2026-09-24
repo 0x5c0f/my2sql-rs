@@ -140,13 +140,13 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
             "flashback requires --output-dir (reverse pass needs files on disk)".into(),
         ));
     }
-    
+
     // 🔴 B010 修复：检查 dry-run 模式（P6 T2）
     if cfg.dry_run {
         // Dry-run 模式：不生成 SQL，只统计回滚率
         let dummy_summary = RunSummary {
-            events: 0,      // 待实现：需要读取 binlog 计数
-            statements: 0,  // 待实现
+            events: 0,     // 待实现：需要读取 binlog 计数
+            statements: 0, // 待实现
             errors: 0,
             files: 0,
             skipped_files_by_error: 0,
@@ -154,7 +154,7 @@ pub fn run_flashback(cfg: &Config) -> Result<RunSummary, PipelineError> {
         println!("{}", dummy_summary.display_with("flashback dry-run"));
         return Ok(dummy_summary);
     }
-    
+
     let store = open_store(cfg)?;
     let writer = Writer::new(
         cfg.output_dir.clone().unwrap(),
@@ -371,7 +371,7 @@ impl<'a> Runner<'a> {
     /// 文件，T12 裁定 7）→ 逐事件 → 线程形态分派。
     fn run_pump(&mut self) -> Result<(), PipelineError> {
         let mut name = self.cfg.start_file.clone();
-        
+
         // T14 Step-0 B001 修正：当用户未指定 stop 边界时，自动扫描到目录最后一个文件
         // 原文档承诺"默认扫描到最后一个"与当前行为矛盾（单文件即停）
         let has_explicit_stop = self.filters.stop.is_some() || self.filters.stop_ts.is_some();
@@ -381,7 +381,7 @@ impl<'a> Runner<'a> {
             // 隐式停止 → 尝试多文件探测（见下文 detect_next_binlog_exists）
             self.detect_next_binlog_exists(&name)
         };
-        
+
         loop {
             let path = self.cfg.binlog_dir.join(&name);
             if !path.is_file() {
@@ -398,27 +398,28 @@ impl<'a> Runner<'a> {
                 }
                 break;
             }
-            
+
             let mut reader = FileReader::open(&self.cfg.binlog_dir, &name, self.filters.clone())?;
             // P3 T4 纯重构：原 pump_one_file 的泵体泛化到 dyn EventSource
             // （run_pump 改经 FileReader 装箱调用）——file 模式字节面零变化。
-            
+
             // 🔴 B010 修复：检查 on_error 策略来决定如何处理坏事件
             let on_error_skip = self.cfg.on_error == OnError::SkipBadEvent;
-            
+
             match self.pump_source(&mut reader, &name) {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(PipelineError::Binlog(e)) if on_error_skip => {
                     // skip-bad-event 策略：记录错误并尝试继续到下一个文件
                     // 注意：这种错误通常是文件级损坏（checksum 不匹配、截断等）
                     // 无法精确跳过单个事件，只能跳到下一个文件
                     tracing::warn!(
                         "file-level error on {}: {:?}, skipping to next binlog (on-error=skip-bad-event)",
-                        path.display(), e
+                        path.display(),
+                        e
                     );
                     self.summary.errors += 1;
                     self.summary.skipped_files_by_error += 1;
-                    
+
                     // 尝试切换到下一个文件
                     if cross_file {
                         match self.detect_next_binlog(&name) {
@@ -442,11 +443,11 @@ impl<'a> Runner<'a> {
                     return Err(e);
                 }
             }
-            
+
             if !cross_file {
                 break; // 单文件模式（保留 backward compat for explicit stop-pos-only）
             }
-            
+
             // 🔴 关键改动：尝试探测下一个文件并继续扫描
             match self.detect_next_binlog(&name) {
                 Some(next) => name = next,
@@ -460,7 +461,7 @@ impl<'a> Runner<'a> {
     /// 用于智能扫描模式（未指定 stop 边界时自动枚举至末尾）
     fn detect_next_binlog(&self, current: &str) -> Option<String> {
         use std::fs;
-        
+
         // 优先尝试按序号递增（主流命名规范）
         if let Some(next) = FileReader::<std::fs::File>::next_binlog_name(current) {
             let path = self.cfg.binlog_dir.join(&next);
@@ -468,7 +469,7 @@ impl<'a> Runner<'a> {
                 return Some(next);
             }
         }
-        
+
         // 备选方案：遍历目录找更大的文件名（适用于非连续编号场景）
         let prefix = current.split('.').next()?;
         if let Ok(entries) = fs::read_dir(&self.cfg.binlog_dir) {
@@ -487,7 +488,7 @@ impl<'a> Runner<'a> {
                 }
             }
         }
-        
+
         None
     }
 

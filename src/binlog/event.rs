@@ -76,8 +76,7 @@ pub fn parse_header(buf: &[u8]) -> Result<EventHeader, BinlogError> {
     };
     // T14 Step-0 修正：NONE+Stop 场景下 Stop 事件恰为 19B 纯头部（无 CRC32），
     // 原 `<= 19` 判定过严导致解析失败（见 BUGS.md B013）。允许 `>= 19` 但需限制上限防 DoS。
-    if header.event_size < EVENT_HEADER_SIZE as u32 
-        || header.event_size > MAX_EVENT_SIZE {
+    if header.event_size < EVENT_HEADER_SIZE as u32 || header.event_size > MAX_EVENT_SIZE {
         return Err(BinlogError::InvalidData(format!(
             "event_size {} out of valid range [{}, {}]",
             header.event_size, EVENT_HEADER_SIZE, MAX_EVENT_SIZE
@@ -172,7 +171,7 @@ mod tests {
     #[test]
     fn event_size_smaller_than_header_is_invalid() {
         // event_size < 19 仍然是非法的（字节数不足头部）
-        let mut b = known_header_bytes(); 
+        let mut b = known_header_bytes();
         b[9..13].copy_from_slice(&18u32.to_le_bytes()); // event_size = 18
         assert!(matches!(parse_header(&b), Err(BinlogError::InvalidData(_))));
     }
@@ -182,9 +181,12 @@ mod tests {
         // T14 Step-0: NONE 格式下 STOP 事件恰 19 字节必须合法（BUGS.md B013 根因修正）
         // 原逻辑 `<= 19` 拒绝零体事件，现已改为 `< 19 || > MAX_EVENT_SIZE`
         let mut ev = vec![0u8; EVENT_HEADER_SIZE];
-        ev[4] = EventType::STOP;  // type=3 (const.go:54)
+        ev[4] = EventType::STOP; // type=3 (const.go:54)
         ev[9..13].copy_from_slice(&19u32.to_le_bytes()); // event_size = 19
-        assert!(parse_header(&ev).is_ok(), "NONE Stop(19B) should pass after B013 fix");
+        assert!(
+            parse_header(&ev).is_ok(),
+            "NONE Stop(19B) should pass after B013 fix"
+        );
     }
 
     #[test]
