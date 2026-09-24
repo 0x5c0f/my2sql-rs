@@ -36,24 +36,16 @@ MySQL binlog 解析与 SQL 还原工具——用 Rust 重写的 Go my2sql 实现
 
 #### 方式一：下载预编译二进制
 
-访问 [GitHub Releases](https://github.com/0x5c0f/my2sql-rs/releases/tag/v0.5.1-p6):
+预编译产物随每个版本发布在 [GitHub Releases](https://github.com/0x5c0f/my2sql-rs/releases) 页面。
+每个版本包含两个 Linux x86_64 目标，以及一份 sha256 校验清单：
 
-```bash
-# Linux x86_64 (推荐现代发行版使用 glibc 版本)
-wget https://github.com/0x5c0f/my2sql-rs/releases/download/v0.5.1-p6/my2sql-rs-0.5.1-x86_64-unknown-linux-gnu
-chmod +x my2sql-rs-0.5.1-x86_64-unknown-linux-gnu
-./my2sql-rs-0.5.1-x86_64-unknown-linux-gnu --help
+- **glibc 动态链接版**（文件名形如 `my2sql-rs-<版本>-x86_64-unknown-linux-gnu`）——适配常规现代发行版，推荐优先选择
+- **musl 静态链接版**（文件名形如 `my2sql-rs-<版本>-x86_64-unknown-linux-musl`）——适配 Alpine、精简 Docker 镜像等无 glibc 环境
+- **`SHA256SUMS`** ——上述两个目标的 sha256 清单，用于校验完整性
 
-# Docker/Alpine 用户可选 musl 静态链接版本
-wget https://github.com/0x5c0f/my2sql-rs/releases/download/v0.5.1-p6/my2sql-rs-0.5.1-x86_64-unknown-linux-musl
-chmod +x my2sql-rs-0.5.1-x86_64-unknown-linux-musl
-./my2sql-rs-0.5.1-x86_64-unknown-linux-musl --help
-```
-
-验证哈希：
-```bash
-sha256sum -c SHA256SUMS
-```
+在 Releases 页面按需选择版本：标有 **Latest** 的为最新正式版，标有 **Pre-release** 的为预发布版本（对应 tag 以 `-pre` 结尾）。
+下载对应目标的二进制后，赋予可执行权限即可直接运行，加 `--help` 查看用法；
+如需校验完整性，下载同一版本附带的 `SHA256SUMS` 一并做 sha256 校验即可。
 
 #### 方式二：源码构建
 

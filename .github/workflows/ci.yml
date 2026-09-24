@@ -53,7 +53,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # toolchain 钉定 1.96.0（与本机证据同款），防 runner 默认 stable 漂移
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -85,7 +85,7 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -107,7 +107,7 @@ jobs:
           # 产物自检：可执行 + 自报版本与包版本一致（spec §117 云端 smoke）
           ./"my2sql-rs-${VER}-${TARGET}" --version | tee /tmp/selfver.txt
           grep -qF "$VER" /tmp/selfver.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: my2sql-rs-*-${{ matrix.target }}
@@ -124,11 +124,11 @@ jobs:
     permissions:
       contents: write # 仅发布面提权（仓库默认 read）
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
