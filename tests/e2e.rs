@@ -546,7 +546,7 @@ fn real_capture_flashback_full_image_and_forward_reconcile() {
         "flashback",
         "binlog.000002",
         &out,
-        &["--threads", "2"],
+        &["--stop-file", "binlog.000002", "--threads", "2"],
     )))
     .expect("FULL 镜像真件 flashback Ok（默认 stop）");
     assert_eq!(
@@ -582,7 +582,7 @@ fn real_capture_flashback_full_image_and_forward_reconcile() {
         "to-sql",
         "binlog.000002",
         &out1,
-        &["--threads", "2"],
+        &["--stop-file", "binlog.000002", "--threads", "2"],
     )))
     .expect("to-sql 真件 Ok");
     let forward = body_stmts(&out1.join("to_sql.2.sql"));
@@ -608,7 +608,7 @@ fn real_capture_flashback_minimal_image_hard_errors() {
         "flashback",
         "binlog.000003",
         &out,
-        &["--on-error", "stop", "--threads", "1"],
+        &["--stop-file", "binlog.000003", "--on-error", "stop", "--threads", "1"],
     )))
     .expect_err("MINIMAL 镜像 UPDATE 必触发硬规则 b → Stop 整跑 Err（真件证明）");
     let msg = e.to_string();
@@ -640,7 +640,7 @@ fn real_capture_flashback_minimal_image_hard_errors() {
         "flashback",
         "binlog.000003",
         &out3,
-        &["--on-error", "skip-bad-event", "--threads", "1"],
+        &["--stop-file", "binlog.000003", "--on-error", "skip-bad-event", "--threads", "1"],
     )))
     .expect("skip 模式不中断整跑");
     assert_eq!(
@@ -662,7 +662,7 @@ fn real_capture_flashback_minimal_image_hard_errors() {
         "to-sql",
         "binlog.000003",
         &out4,
-        &["--threads", "1"],
+        &["--stop-file", "binlog.000003", "--threads", "1"],
     )))
     .expect("to-sql 恒 robust-continue：事件级 Missing 计错不 Err");
     assert_eq!((tsum.statements, tsum.errors), (1, 1));

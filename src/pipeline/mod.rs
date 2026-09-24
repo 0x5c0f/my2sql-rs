@@ -372,11 +372,15 @@ impl<'a> Runner<'a> {
     fn run_pump(&mut self) -> Result<(), PipelineError> {
         let mut name = self.cfg.start_file.clone();
 
-        // T14 Step-0 B001 修正：当用户未指定 stop 边界时，保持 backward compatible 的单文件行为
-        // 原实现错误地启用了智能多文件扫描 (detect_next_binlog_exists)，破坏了既有测试
-        // 正确逻辑：仅在有显式停止条件时才跨文件，避免意外扫描整个目录
+        // T14 Step-0 B001 修正：当用户未指定 stop 边界时，自动扫描到目录最后一个文件
+        // 原文档承诺"默认扫描到最后一个"与当前行为矛盾（单文件即停）
         let has_explicit_stop = self.filters.stop.is_some() || self.filters.stop_ts.is_some();
-        let cross_file = has_explicit_stop; // 保守策略：只有明确 stop 才跨文件
+        let cross_file = if has_explicit_stop {
+            true // 显式停止条件 → 启用跨文件
+        } else {
+            // 隐式停止 → 尝试多文件探测（见下文 detect_next_binlog_exists）
+            self.detect_next_binlog_exists(&name)
+        };
 
         loop {
             let path = self.cfg.binlog_dir.join(&name);
@@ -489,6 +493,11 @@ impl<'a> Runner<'a> {
         }
 
         None
+    }
+
+    /// 🔴 B001 修复：提前探测是否有后续文件（决定是否启用跨文件模式）
+    fn detect_next_binlog_exists(&self, current: &str) -> bool {
+        self.detect_next_binlog(current).is_some()
     }
 
     /// to-sql 形态收尾（行为与 P1 逐字节一致）。
