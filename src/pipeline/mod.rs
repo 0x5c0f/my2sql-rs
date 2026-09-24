@@ -476,11 +476,11 @@ impl<'a> Runner<'a> {
             for entry in entries.flatten() {
                 let filename = entry.file_name().to_string_lossy().to_string();
                 // 跳过 .index 等辅助文件
-                if filename.ends_with(".index") || filename.contains('.') == false {
+                if filename.ends_with(".index") || !filename.contains('.') {
                     continue;
                 }
                 // 比较同前缀且大于当前文件的名称
-                if filename.starts_with(prefix) && filename > current.to_string() {
+                if filename.starts_with(prefix) && *filename > *current {
                     let full_path = entry.path();
                     if full_path.is_file() {
                         return Some(filename);

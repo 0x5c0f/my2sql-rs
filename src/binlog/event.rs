@@ -202,7 +202,7 @@ mod tests {
     fn event_size_too_large_is_rejected() {
         // MAX_EVENT_SIZE=4MB 防护 DoS 攻击
         let mut b = known_header_bytes();
-        b[9..13].copy_from_slice(&((MAX_EVENT_SIZE + 1) as u32).to_le_bytes());
+        b[9..13].copy_from_slice(&(MAX_EVENT_SIZE + 1).to_le_bytes());
         assert!(matches!(parse_header(&b), Err(BinlogError::InvalidData(_))));
     }
 
