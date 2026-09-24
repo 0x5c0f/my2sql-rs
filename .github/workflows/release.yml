@@ -33,15 +33,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.ref_name }}"
-          IS_PRERELEASE="false"
           # Check if tag contains prerelease identifiers
+          IS_PRERELEASE="false"
           if [[ "$TAG" =~ -(alpha|beta|rc|pre) ]]; then
-            IS_PRERELEASE="true"
+            IS_PRERELEASE="--prerelease"
           fi
           # Create release with appropriate flag
           gh release create "${TAG}" \
             --title "Release ${TAG}" \
-            ${IS_PRERELEASE && echo "--prerelease"} \
+            $IS_PRERELEASE \
             --notes "Automated release from tag push: ${TAG}"
           # Upload artifacts
           gh release upload "${TAG}" \
