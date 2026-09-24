@@ -1,22 +1,60 @@
-# my2sql-rs CI 门禁（P5，spec §3 D3 有界决定）：
-#   门 = fmt --check / clippy -D warnings（--all-targets）/ cargo test
-#        --no-fail-fast（live/ignored 件自然跳过）/ musl release 编译门。
-#   不进 CI（逐字沿 spec D3，本地六闸体系为权威门禁，「CI 绿 ≠ 六闸绿」）：
-#   make difftest / compat / repl-test / fuzz-min 真跑 / shadow-test ——
-#   需 docker 多版本 MySQL + Go 裁判 + 长 live 时窗，CI 不承载。
+# my2sql-rs 唯一 CI / 发布工作流（单文件）
+# ─────────────────────────────────────────────────────────────────────────────
+# 本文件由原 ci.yml + release.yml 合并而来：同一 tag 上只允许一条工作流建
+# Release，消除「多工作流 / 多 matrix job 各自建 Release」的次序竞争。
+#
+# 触发与职责：
+#   push main / pull_request   → ci 门禁
+#   push tag v*                → ci 门禁 → 双目标构建 → 发布 Release
+#   workflow_dispatch(tag=…)   → 同上，用于对既有 tag 幂等重跑
+#
+# tag 语义（末尾 -pre = 预发布）：
+#   vX.Y.Z-xxx-pre  → GitHub pre-release（显式不置 Latest）
+#   vX.Y.Z-xxx      → 正式 Release（GitHub 按最新非预发布自动置 Latest）
+#
+# 门禁边界逐字沿用 P5 spec D3（CI 绿 ≠ 本地六闸绿）：
+#   difftest / compat / repl-live / fuzz 真跑 / shadow 不进 CI。
+#
+# 产物命名沿用 P5 spec D4：
+#   my2sql-rs-<ver>-<triple> × {gnu,musl} + 单一 SHA256SUMS
 name: ci
+
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '既有 tag（留空 = 使用所选 ref），例如 v0.5.2-p7-pre'
+        required: false
+        type: string
+
+# 关键修复 1：本仓 default_workflow_permissions=read（GH 默认），发布面若不加
+# permissions 会命中 `403 Resource not accessible by integration`。
+# 顶层最小只读，仅在 publish job 按需提权（PR / fork 仍天然只读）。
+permissions:
+  contents: read
+
+concurrency:
+  # 同一 ref 串行；PR 取消旧跑，tag 发布不取消（避免半成品 Release）
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  GNU_TARGET: x86_64-unknown-linux-gnu
+  MUSL_TARGET: x86_64-unknown-linux-musl
+
 jobs:
+  # ── 门禁：fmt / clippy / test / 双目标编译 ──────────────────────────────────
+  # job id 保持 `ci`，延续既有 check 名与 README badge 语义。
   ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # P5 终审 MAJ-1：toolchain 钉定 = 本机证据跑同款 1.96.0（防 runner
-      # 默认 stable 漂移把 clippy/fmt 搞红，而消红唯一出路是碰 src/——
-      # spec §1 硬边界零豁免，死锁）。
+      # toolchain 钉定 1.96.0（与本机证据同款），防 runner 默认 stable 漂移
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: x86_64-unknown-linux-musl
@@ -30,7 +68,182 @@ jobs:
       - name: test
         run: cargo test --no-fail-fast
       - name: musl release build gate
-        run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: fuzz workspace check（非阻断：cargo-fuzz 面需 nightly，stable 下失败不红）
+        run: cargo build --release --target "${MUSL_TARGET}"
+      - name: fuzz workspace check（非阻断：cargo-fuzz 面需 nightly，失败不红）
         continue-on-error: true
         run: cargo check --manifest-path fuzz/Cargo.toml
+
+  # ── tag 构建：matrix 只写各自 artifact，不触碰 GitHub Release ───────────────
+  # 关键修复 2：旧版两个 matrix job 并发 gh release create → 422
+  # `Release.tag_name already exists`；控制面写操作全部收敛到 publish。
+  build:
+    needs: [ci]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Ensure musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
+          # D2 版本单源：只从 cargo metadata 读，workflow 内不写版本字面量
+          VER=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          [ -n "$VER" ] && [ "$VER" != "null" ]
+          install -m 0755 "target/${TARGET}/release/my2sql-rs" "my2sql-rs-${VER}-${TARGET}"
+          # 产物自检：可执行 + 自报版本与包版本一致（spec §117 云端 smoke）
+          ./"my2sql-rs-${VER}-${TARGET}" --version | tee /tmp/selfver.txt
+          grep -qF "$VER" /tmp/selfver.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: my2sql-rs-*-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 发布：单点写 Release + 单点算 SHA256SUMS ───────────────────────────────
+  # 关键修复 3：旧版在每个 matrix job 里 `gh release download` + sha256sum →
+  # 并行下互相覆盖，产出分片/缺项 SHA256SUMS；现统一在合并后一次算。
+  publish:
+    needs: [build]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 仅发布面提权（仓库默认 read）
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验产物 + 生成单一 SHA256SUMS
+        working-directory: dist
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l
+          VER=""
+          for f in my2sql-rs-*-"${GNU_TARGET}"; do
+            [ -f "$f" ] || continue
+            VER="${f#my2sql-rs-}"; VER="${VER%-"${GNU_TARGET}"}"
+          done
+          if [ -z "$VER" ]; then
+            echo "::error::未找到 ${GNU_TARGET} 产物，无法确定待发布版本"; exit 1
+          fi
+          for t in "$GNU_TARGET" "$MUSL_TARGET"; do
+            [ -f "my2sql-rs-${VER}-${t}" ] || { echo "::error::缺少产物 ${t}"; exit 1; }
+          done
+          # D1：tag 与包版本紧耦合；-pre 是发布通道后缀，不参与包版本比对
+          EXPECT="${TAG#v}"
+          if [ "$VER" != "$EXPECT" ] && [ "$VER" != "${EXPECT%-pre}" ]; then
+            echo "::error::tag ${TAG} 与包版本 ${VER} 不一致（期望 ${EXPECT} 或 ${EXPECT%-pre}）"; exit 1
+          fi
+          echo "发布版本 = ${VER}（tag ${TAG}）"
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+          sha256sum my2sql-rs-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: 组装 Release 正文（取 CHANGELOG 对应节）
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          for v in "$VER" "${TAG#v}"; do
+            # 下方 awk 程序内的 $0 是 awk 语法，不是 shell 展开（SC2016 误报）
+            # shellcheck disable=SC2016
+            awk -v ver="$v" '
+              index($0, "## [" ver "]") == 1 { hit = 1; next }
+              hit && index($0, "## [") == 1 { exit }
+              hit { print }
+            ' CHANGELOG.md > notes.md
+            if grep -q '[^[:space:]]' notes.md; then break; fi
+          done
+          if ! grep -q '[^[:space:]]' notes.md; then
+            printf 'Automated release from tag push: %s\n' "$TAG" > notes.md
+          fi
+          {
+            cat notes.md
+            printf '\n**产物**：my2sql-rs-%s-%s、my2sql-rs-%s-%s、SHA256SUMS（sha256sum -c 校验）\n' \
+              "$VER" "$GNU_TARGET" "$VER" "$MUSL_TARGET"
+          } > notes.tmp
+          mv notes.tmp notes.md
+          cat notes.md
+
+      - name: 发布 Release（-pre ⇒ pre-release）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag 必须以 v 开头，收到「${TAG}」"; exit 1 ;;
+          esac
+          # 防 gh release create 在 tag 缺失时从默认分支新建同名 tag
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::远端不存在 tag ${TAG}"; exit 1
+          fi
+
+          IS_PRE=false
+          case "$TAG" in
+            *-pre) IS_PRE=true ;;
+          esac
+
+          ARGS=(--title "Release ${TAG}" --notes-file notes.md)
+          if [ "$IS_PRE" = true ]; then
+            echo "::notice::tag 末尾 -pre ⇒ 预发布 pre-release（不置 Latest）"
+            ARGS+=(--prerelease --latest=false)
+          else
+            echo "::notice::tag 无 -pre ⇒ 正式发布（GitHub 自动判定 Latest）"
+          fi
+
+          # 幂等：已存在（含 draft）则编辑并发布态，否则新建。
+          # 探测用 `gh release view`：它能看见 draft；REST /releases/tags/<tag>
+          # 对 draft 返回 404，不能当存在性判据（旧版正因此重复建 Release）。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在 ⇒ 幂等更新（--draft=false 转发布态）"
+            gh release edit "$TAG" "${ARGS[@]}" --draft=false
+          else
+            gh release create "$TAG" "${ARGS[@]}"
+          fi
+
+          # 资产覆盖上传（--clobber 保证重跑幂等）
+          gh release upload "$TAG" dist/my2sql-rs-* dist/SHA256SUMS --clobber
+
+      - name: 回验 Release 资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft,isPrerelease,assets \
+            --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)\n" + ([.assets[].name] | sort | join("\n"))'
+          rm -rf /tmp/rel && mkdir -p /tmp/rel
+          gh release download "$TAG" -p 'my2sql-rs-*' -p 'SHA256SUMS' -D /tmp/rel
+          ( cd /tmp/rel && sha256sum -c SHA256SUMS )
+          # release asset 不保留可执行位（下载后为 0644），chmod 后再对“已发布字节”
+          # 做真实 smoke：能跑 + 自报版本 = 待发布版本
+          for f in /tmp/rel/my2sql-rs-*; do
+            chmod +x "$f"
+            out=$("$f" --version)
+            echo "回验 ${f} → ${out}"
+            printf '%s' "$out" | grep -qF "$VER"
+          done
